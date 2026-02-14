@@ -105,6 +105,23 @@ class Settings:
         8: 0,    # boat → Taşıt (deniz taşıtı)
     }
 
+    # VisDrone → TEKNOFEST Sınıf Eşleştirme Tablosu
+    # VisDrone sınıfları:
+    #   0=ignored, 1=pedestrian, 2=people, 3=bicycle, 4=car, 5=van,
+    #   6=truck, 7=tricycle, 8=awning-tricycle, 9=bus, 10=motor, 11=others
+    VISDRONE_TO_TEKNOFEST: dict = {
+        1: 1,     # pedestrian → İnsan
+        2: 1,     # people → İnsan
+        3: 0,     # bicycle → Taşıt
+        4: 0,     # car → Taşıt
+        5: 0,     # van → Taşıt
+        6: 0,     # truck → Taşıt
+        7: 0,     # tricycle → Taşıt
+        8: 0,     # awning-tricycle → Taşıt
+        9: 0,     # bus → Taşıt
+        10: 0,    # motor → Taşıt
+    }
+
     # İniş alanı üzerine nesne kontrolü için kesişim eşiği
     # Şartname: "Herhangi bir nesne varsa iniş için uygun değildir"
     # Bu yüzden eşik 0.0 — herhangi bir kesişim = uygun değil
@@ -150,8 +167,14 @@ class Settings:
     # Debug Çıktı Dizini
     DEBUG_OUTPUT_DIR: str = str(PROJECT_ROOT / "debug_output")
 
-    # Simülasyon Test Görseli
+    # Simülasyon Test Görseli (eski statik mod için)
     SIMULATION_IMAGE_PATH: str = str(PROJECT_ROOT / "bus.jpg")
+
+    # Veri Seti Dizini
+    DATASETS_DIR: str = str(PROJECT_ROOT / "datasets")
+
+    # Simülasyon DET modu: rastgele seçilecek fotoğraf sayısı
+    SIMULATION_DET_SAMPLE_SIZE: int = 100
 
     # =========================================================================
     #  PERFORMANS AYARLARI

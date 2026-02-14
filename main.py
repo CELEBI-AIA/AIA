@@ -3,12 +3,18 @@ TEKNOFEST Havacılıkta Yapay Zeka - Ana Orkestrasyon Dosyası
 ============================================================
 Tüm modülleri bir araya getirir ve ana işlem döngüsünü yönetir.
 
+Çalışma Modları:
+    1. Yarışma Modu (varsayılan):
+       Sunucudan kare alır → tespit → konum → sonuç gönderir.
+
+    2. Otonom Test Modu (--simulate):
+       VisDrone veri setinden kare okur → tespit → konum → renkli log.
+
 İş Akışı (her kare için):
-    1. Sunucudan kare meta verisi al (NetworkManager.get_frame)
-    2. Görüntüyü indir (NetworkManager.download_image)
-    3. Nesne tespiti yap (ObjectDetector.detect)
-    4. Konum kestirimi yap (VisualOdometry.update)
-    5. Sonuçları sunucuya gönder (NetworkManager.send_result)
+    1. Kare al (Sunucu veya DatasetLoader)
+    2. Nesne tespiti yap (ObjectDetector.detect)
+    3. Konum kestirimi yap (VisualOdometry.update)
+    4. Sonuçları raporla (Sunucuya gönder veya terminale bas)
 
 Güvenlik:
     - Global try/except → sistem ASLA çökmez
@@ -16,14 +22,18 @@ Güvenlik:
     - FPS sayacı sürekli konsola basılır
 
 Kullanım:
-    python main.py
+    python main.py                  # Yarışma modu (settings'e göre)
+    python main.py --simulate       # Otonom test modu (VisDrone)
+    python main.py --simulate det   # Sadece DET veri seti (Görev 1)
 """
 
 import os
 import sys
 import time
 import signal
+import argparse
 import traceback
+from collections import Counter
 from typing import Optional
 
 import torch
@@ -35,7 +45,6 @@ if PROJECT_ROOT not in sys.path:
 
 from config.settings import Settings
 from src.utils import Logger, Visualizer
-from src.network import NetworkManager
 from src.detection import ObjectDetector
 from src.localization import VisualOdometry
 
@@ -53,13 +62,19 @@ BANNER = """
 """
 
 
-def print_system_info(log: Logger) -> None:
+def print_system_info(log: Logger, simulate: bool = False) -> None:
     """Sistem bilgilerini konsola basar — başlangıç diagnostiği."""
     print(BANNER)
     log.info(f"Çalışma Dizini  : {PROJECT_ROOT}")
-    log.info(f"Simülasyon Modu : {'AÇIK ✓' if Settings.SIMULATION_MODE else 'KAPALI (YARIŞMA)'}")
+
+    if simulate:
+        log.info("Çalışma Modu    : 🧪 OTONOM TEST (VisDrone)")
+    elif Settings.SIMULATION_MODE:
+        log.info("Simülasyon Modu : AÇIK ✓ (Statik görüntü)")
+    else:
+        log.info("Simülasyon Modu : KAPALI (YARIŞMA)")
+
     log.info(f"Debug Modu      : {'AÇIK' if Settings.DEBUG else 'KAPALI'}")
-    log.info(f"Sunucu          : {Settings.BASE_URL}")
     log.info(f"Model           : {Settings.MODEL_PATH}")
     log.info(f"Cihaz           : {Settings.DEVICE}")
     log.info(f"FP16            : {'AÇIK' if Settings.HALF_PRECISION else 'KAPALI'}")
@@ -113,23 +128,156 @@ class FPSCounter:
 
 
 # =============================================================================
-#  ANA DÖNGÜ
+#  OTONOM TEST DÖNGÜSÜ (VisDrone)
 # =============================================================================
 
-def main() -> None:
+def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
     """
-    Sistemin ana giriş noktası.
+    VisDrone veri seti üzerinde otonom test çalıştırır.
 
-    Tüm modülleri başlatır ve sonsuz döngüde kare işleme pipeline'ını çalıştırır.
-    Global try/except ile asla çökmez — hata olursa loglar ve devam eder.
-    Video sona erdiğinde (veya MAX_FRAMES'e ulaşıldığında) temiz kapanış yapar.
+    Sunucu gerektirmez — DatasetLoader'dan kareler okunur,
+    tespit + odometri yapılır, sonuçlar renkli olarak terminale basılır.
+
+    Args:
+        log: Logger instance.
+        prefer_vid: True → VID (sekans, Görev 2), False → DET (tekil, Görev 1).
     """
-    log = Logger("Main")
+    from src.data_loader import DatasetLoader
 
-    # ======= SİSTEM BİLGİSİ =======
-    print_system_info(log)
+    # --- Modüller ---
+    log.info("Modüller başlatılıyor...")
 
-    # ======= MODÜLLERİ BAŞLAT =======
+    try:
+        loader = DatasetLoader(prefer_vid=prefer_vid)
+        if not loader.is_ready:
+            log.error("Veri seti yüklenemedi — çıkılıyor.")
+            return
+
+        detector = ObjectDetector()
+        odometry = VisualOdometry()
+        fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
+
+        visualizer: Optional[Visualizer] = None
+        if Settings.DEBUG:
+            visualizer = Visualizer()
+
+        log.success("Tüm modüller başarıyla başlatıldı ✓")
+
+    except Exception as e:
+        log.error(f"Modül başlatma hatası: {e}")
+        log.error(f"Stack trace:\n{traceback.format_exc()}")
+        return
+
+    log.success("═" * 50)
+    log.success(f"  OTONOM TEST BAŞLIYOR — {len(loader)} kare işlenecek")
+    log.success("═" * 50)
+
+    # --- Döngü ---
+    running = True
+
+    def signal_handler(sig, frame):
+        nonlocal running
+        running = False
+        log.warn("\nKapatma sinyali alındı — döngü durduruluyor...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    for frame_info in loader:
+        if not running:
+            break
+
+        # Kare limiti
+        if fps_counter.frame_count >= Settings.MAX_FRAMES:
+            log.success(f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES})")
+            break
+
+        try:
+            frame = frame_info["frame"]
+            frame_idx = frame_info["frame_idx"]
+            server_data = frame_info["server_data"]
+            gps_health = frame_info["gps_health"]
+
+            # ---- NESNE TESPİTİ (Görev 1) ----
+            detected_objects = detector.detect(frame)
+
+            # ---- KONUM KESTİRİMİ (Görev 2) ----
+            position = odometry.update(frame, server_data)
+
+            # ---- RENKLİ SONUÇ LOGU ----
+            _print_simulation_result(
+                log, frame_idx, detected_objects, position, gps_health,
+                frame_info["filename"]
+            )
+
+            # ---- DEBUG ÇIKTISI ----
+            if Settings.DEBUG and visualizer is not None:
+                visualizer.draw_detections(
+                    frame, detected_objects,
+                    frame_id=str(frame_idx),
+                    position=position,
+                )
+
+            # ---- FPS ----
+            fps_counter.tick()
+
+        except Exception as e:
+            log.error(f"Kare {frame_info.get('frame_idx', '?')} hatası: {e}")
+            log.error(f"Stack trace:\n{traceback.format_exc()}")
+            continue
+
+    # --- Temiz Kapanış ---
+    _print_summary(log, fps_counter)
+
+
+def _print_simulation_result(
+    log: Logger,
+    frame_idx: int,
+    detected_objects: list,
+    position: dict,
+    gps_health: int,
+    filename: str,
+) -> None:
+    """Simülasyon sonucunu renkli olarak terminale basar."""
+    # Sınıf sayımı
+    cls_counts = Counter(obj["cls"] for obj in detected_objects)
+    tasit = cls_counts.get("0", 0)
+    insan = cls_counts.get("1", 0)
+    uap = cls_counts.get("2", 0)
+    uai = cls_counts.get("3", 0)
+
+    # Konum bilgisi
+    loc_mode = "GPS" if gps_health == 1 else "OF"
+    pos_str = (
+        f"x={position['x']:+.1f}m "
+        f"y={position['y']:+.1f}m "
+        f"z={position['z']:.0f}m"
+    )
+
+    # Renkli log
+    log.success(
+        f"Frame: {frame_idx:04d} | "
+        f"Tespit: {len(detected_objects)} "
+        f"({tasit} Taşıt, {insan} İnsan"
+        f"{f', {uap} UAP' if uap else ''}"
+        f"{f', {uai} UAİ' if uai else ''}) | "
+        f"Konum: {pos_str} ({loc_mode})"
+    )
+
+
+# =============================================================================
+#  YARIŞMA DÖNGÜSÜ (Sunucu)
+# =============================================================================
+
+def run_competition(log: Logger) -> None:
+    """
+    Yarışma/sunucu modunda ana işlem döngüsünü çalıştırır.
+
+    Sunucudan kare alır → tespit → konum → sonuç gönderir.
+    """
+    from src.network import NetworkManager
+
+    # --- Modüller ---
     log.info("Modüller başlatılıyor...")
 
     try:
@@ -138,7 +286,6 @@ def main() -> None:
         odometry = VisualOdometry()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
-        # Debug modunda Visualizer'ı başlat
         visualizer: Optional[Visualizer] = None
         if Settings.DEBUG:
             visualizer = Visualizer()
@@ -150,7 +297,7 @@ def main() -> None:
         log.error("Sistem başlatılamadı — çıkılıyor.")
         return
 
-    # ======= OTURUM BAŞLAT =======
+    # --- Oturum Başlat ---
     if not network.start_session():
         log.error("Sunucu oturumu başlatılamadı!")
         log.warn("Yeniden denenecek...")
@@ -163,18 +310,17 @@ def main() -> None:
     log.success("  SİSTEM HAZIR — İşlem döngüsü başlıyor...")
     log.success("═" * 50)
 
-    # ======= ANA İŞLEM DÖNGÜSÜ =======
+    # --- Döngü ---
     running = True
-    consecutive_none_count = 0  # Ardışık None sayacı (video sonu tespiti)
+    consecutive_none_count = 0
 
-    # Ctrl+C ile temiz kapanış
     def signal_handler(sig, frame):
         nonlocal running
         running = False
         log.warn("\nKapatma sinyali alındı (Ctrl+C) — döngü durduruluyor...")
 
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)  # Docker/systemd uyumu
+    signal.signal(signal.SIGTERM, signal_handler)
 
     while running:
         try:
@@ -198,7 +344,7 @@ def main() -> None:
                 time.sleep(0.5)
                 continue
 
-            consecutive_none_count = 0  # Başarılı çekim → sıfırla
+            consecutive_none_count = 0
             frame_id = frame_data.get("frame_id", "unknown")
 
             # ---- 2) GÖRÜNTÜYÜ İNDİR ----
@@ -249,14 +395,21 @@ def main() -> None:
             break
 
         except Exception as e:
-            # ===== GLOBAL HATA YAKALAMA =====
-            # Sistem ASLA çökmemeli — hata logla, devam et
             log.error(f"İşlem hatası: {e}")
             log.error(f"Stack trace:\n{traceback.format_exc()}")
             log.warn("Sonraki kareye geçiliyor...")
-            time.sleep(0.5)  # Hata döngüsüne girmeyi engelle
+            time.sleep(0.5)
 
-    # ======= TEMİZ KAPANIŞ =======
+    # --- Temiz Kapanış ---
+    _print_summary(log, fps_counter)
+
+
+# =============================================================================
+#  YARDIMCI FONKSİYONLAR
+# =============================================================================
+
+def _print_summary(log: Logger, fps_counter: FPSCounter) -> None:
+    """Oturum sonunda özet bilgileri basar."""
     log.info("─" * 50)
     log.info(f"Toplam işlenen kare: {fps_counter.frame_count}")
     elapsed = time.time() - fps_counter.start_time
@@ -265,12 +418,58 @@ def main() -> None:
         log.info(f"Ortalama FPS: {avg_fps:.2f}")
     log.info(f"Toplam süre: {elapsed:.1f} saniye")
 
-    # GPU belleğini temizle
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         log.info("GPU belleği temizlendi")
 
     log.success("Sistem kapatıldı. Güle güle! 👋")
+
+
+def parse_args() -> argparse.Namespace:
+    """Komut satırı argümanlarını ayrıştırır."""
+    parser = argparse.ArgumentParser(
+        description="TEKNOFEST 2025 — Havacılıkta Yapay Zeka Sistemi",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Örnekler:
+  python main.py                  Yarışma/simülasyon modu (settings.py'ye göre)
+  python main.py --simulate       Otonom test (VisDrone VID — sıralı kareler)
+  python main.py --simulate det   Otonom test (VisDrone DET — tekil fotoğraflar)
+        """,
+    )
+    parser.add_argument(
+        "--simulate",
+        nargs="?",
+        const="vid",
+        default=None,
+        choices=["vid", "det"],
+        help="Otonom test modu: 'vid' (sıralı kareler, Görev 2) veya 'det' (tekil kareler, Görev 1)",
+    )
+    return parser.parse_args()
+
+
+# =============================================================================
+#  ANA GİRİŞ NOKTASI
+# =============================================================================
+
+def main() -> None:
+    """
+    Sistemin ana giriş noktası.
+
+    --simulate argümanı verilmişse otonom test modu,
+    aksi halde yarışma/sunucu modu çalıştırılır.
+    """
+    args = parse_args()
+    log = Logger("Main")
+
+    simulate = args.simulate is not None
+    print_system_info(log, simulate=simulate)
+
+    if simulate:
+        prefer_vid = (args.simulate == "vid")
+        run_simulation(log, prefer_vid=prefer_vid)
+    else:
+        run_competition(log)
 
 
 if __name__ == "__main__":
