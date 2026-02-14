@@ -36,6 +36,8 @@ import traceback
 from collections import Counter
 from typing import Optional
 
+import cv2
+
 import torch
 
 # Proje kök dizinini Python path'e ekle
@@ -131,7 +133,12 @@ class FPSCounter:
 #  OTONOM TEST DÖNGÜSÜ (VisDrone)
 # =============================================================================
 
-def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
+def run_simulation(
+    log: Logger,
+    prefer_vid: bool = True,
+    show: bool = False,
+    save: bool = False,
+) -> None:
     """
     VisDrone veri seti üzerinde otonom test çalıştırır.
 
@@ -141,6 +148,8 @@ def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
     Args:
         log: Logger instance.
         prefer_vid: True → VID (sekans, Görev 2), False → DET (tekil, Görev 1).
+        show: True → cv2.imshow ile canlı görüntüleme.
+        save: True → Her kareyi debug_output/ dizinine kaydet.
     """
     from src.data_loader import DatasetLoader
 
@@ -157,9 +166,12 @@ def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
         odometry = VisualOdometry()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
-        visualizer: Optional[Visualizer] = None
-        if Settings.DEBUG:
-            visualizer = Visualizer()
+        visualizer = Visualizer()
+
+        # Kayıt dizinini hazırla (--save için)
+        if save:
+            os.makedirs(Settings.DEBUG_OUTPUT_DIR, exist_ok=True)
+            log.info(f"Görseller kaydedilecek: {Settings.DEBUG_OUTPUT_DIR}")
 
         log.success("Tüm modüller başarıyla başlatıldı ✓")
 
@@ -210,13 +222,35 @@ def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
                 frame_info["filename"]
             )
 
-            # ---- DEBUG ÇIKTISI ----
-            if Settings.DEBUG and visualizer is not None:
-                visualizer.draw_detections(
+            # ---- GÖRSEL ÇIKTI ----
+            if show or save:
+                annotated = visualizer.draw_detections(
                     frame, detected_objects,
                     frame_id=str(frame_idx),
                     position=position,
                 )
+
+                # Ekstra bilgi: GPS/OF modu ve FPS
+                mode_text = "GPS" if gps_health == 1 else "Optical Flow"
+                cv2.putText(
+                    annotated, f"Mode: {mode_text}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 0) if gps_health else (0, 165, 255), 2,
+                )
+
+                if show:
+                    cv2.imshow("TEKNOFEST - Otonom Test", annotated)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord('q'), 27):  # q veya ESC
+                        log.info("Kullanıcı pencereyi kapattı (q/ESC)")
+                        break
+
+                if save:
+                    save_path = os.path.join(
+                        Settings.DEBUG_OUTPUT_DIR,
+                        f"frame_{frame_idx:04d}.jpg",
+                    )
+                    cv2.imwrite(save_path, annotated)
 
             # ---- FPS ----
             fps_counter.tick()
@@ -227,6 +261,10 @@ def run_simulation(log: Logger, prefer_vid: bool = True) -> None:
             continue
 
     # --- Temiz Kapanış ---
+    if show:
+        cv2.destroyAllWindows()
+    if save:
+        log.success(f"Görseller kaydedildi: {Settings.DEBUG_OUTPUT_DIR}/")
     _print_summary(log, fps_counter)
 
 
@@ -445,6 +483,18 @@ def parse_args() -> argparse.Namespace:
         choices=["vid", "det"],
         help="Otonom test modu: 'vid' (sıralı kareler, Görev 2) veya 'det' (tekil kareler, Görev 1)",
     )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        default=False,
+        help="Tespit sonuçlarını canlı pencerede göster (cv2.imshow)",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        default=False,
+        help="Her kareyi bounding box'larıyla debug_output/ dizinine kaydet",
+    )
     return parser.parse_args()
 
 
@@ -467,7 +517,12 @@ def main() -> None:
 
     if simulate:
         prefer_vid = (args.simulate == "vid")
-        run_simulation(log, prefer_vid=prefer_vid)
+        run_simulation(
+            log,
+            prefer_vid=prefer_vid,
+            show=args.show,
+            save=args.save,
+        )
     else:
         run_competition(log)
 
