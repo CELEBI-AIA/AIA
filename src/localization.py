@@ -217,8 +217,9 @@ class VisualOdometry:
             return
 
         # ------ 2) Başarılı takip edilen noktaları filtrele ------
-        good_old = self._prev_points[status.flatten() == 1]
-        good_new = next_points[status.flatten() == 1]
+        mask = status.flatten() == 1
+        good_old = self._prev_points[mask].reshape(-1, 2)
+        good_new = next_points[mask].reshape(-1, 2)
 
         if len(good_new) < 5:
             self._update_reference_frame(gray)

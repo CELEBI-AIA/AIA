@@ -228,44 +228,46 @@ class DatasetLoader:
         Raises:
             StopIteration: Tüm kareler işlendiğinde.
         """
-        if self._index >= len(self._frames):
-            raise StopIteration
+        # Bozuk görselleri atla — recursive __next__ yerine döngü
+        # (çok sayıda bozuk dosya olursa RecursionError'dan kaçınır)
+        while self._index < len(self._frames):
+            frame_path = self._frames[self._index]
+            frame = cv2.imread(frame_path)
 
-        frame_path = self._frames[self._index]
-        frame = cv2.imread(frame_path)
+            if frame is None:
+                self.log.warn(f"Görüntü okunamadı, atlanıyor: {frame_path}")
+                self._index += 1
+                continue
 
-        if frame is None:
-            self.log.warn(f"Görüntü okunamadı, atlanıyor: {frame_path}")
-            self._index += 1
-            return self.__next__()
+            # GPS sağlığını simüle et
+            # VID: her 50 karede bir GPS kesilsin (odometri testi için)
+            # DET: her zaman GPS sağlıklı (tekil kareler)
+            if self._mode == "vid":
+                # 50 kare GPS sağlıklı, 50 kare GPS kesik — döngüsel
+                gps_health = 1 if (self._index % 100) < 50 else 0
+            else:
+                gps_health = 1
 
-        # GPS sağlığını simüle et
-        # VID: her 50 karede bir GPS kesilsin (odometri testi için)
-        # DET: her zaman GPS sağlıklı (tekil kareler)
-        if self._mode == "vid":
-            # 50 kare GPS sağlıklı, 50 kare GPS kesik — döngüsel
-            gps_health = 1 if (self._index % 100) < 50 else 0
-        else:
-            gps_health = 1
-
-        result: Dict[str, Any] = {
-            "frame": frame,
-            "frame_idx": self._index,
-            "filename": os.path.basename(frame_path),
-            "mode": self._mode,
-            "gps_health": gps_health,
-            # Sunucu formatını taklit et
-            "server_data": {
-                "frame_id": self._index,
+            result: Dict[str, Any] = {
+                "frame": frame,
+                "frame_idx": self._index,
+                "filename": os.path.basename(frame_path),
+                "mode": self._mode,
                 "gps_health": gps_health,
-                "gps_x": 0.0,
-                "gps_y": 0.0,
-                "altitude": Settings.DEFAULT_ALTITUDE,
-            },
-        }
+                # Sunucu formatını taklit et — localization.py beklediği key isimleri
+                "server_data": {
+                    "frame_id": self._index,
+                    "gps_health": gps_health,
+                    "translation_x": 0.0,
+                    "translation_y": 0.0,
+                    "translation_z": Settings.DEFAULT_ALTITUDE,
+                },
+            }
 
-        self._index += 1
-        return result
+            self._index += 1
+            return result
+
+        raise StopIteration
 
     @property
     def mode(self) -> str:

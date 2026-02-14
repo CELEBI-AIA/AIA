@@ -354,10 +354,10 @@ class NetworkManager:
         İlk yüklemeden sonra belleğe cache'ler — her karede
         diskten okuma yapmaz (önemli performans iyileştirmesi).
         """
-        # Cache varsa doğrudan döndür — YOLO ve cvtColor kendi kopyalarını
-        # oluşturur, bu yüzden .copy() gereksiz (bellek+CPU tasarrufu)
+        # Cache varsa kopyasını döndür — Visualizer.draw_detections gibi
+        # metodlar frame'i in-place değiştirebilir, cache bozulmasın
         if self._sim_image_cache is not None:
-            return self._sim_image_cache
+            return self._sim_image_cache.copy()
 
         img_path = Settings.SIMULATION_IMAGE_PATH
         frame = cv2.imread(img_path)
