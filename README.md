@@ -133,6 +133,21 @@ python main.py
 
 `config/settings.py` dosyasında `SIMULATION_MODE = True` olduğundan emin olun.
 
+### 🧪 Otonom Test Modu (VisDrone ile)
+
+VisDrone veri setini kullanarak tam sistem testi yapabilirsiniz (Sunucu gerektirmez):
+
+```bash
+# Görev 2: Sıralı kareler (Odometri testi)
+# datasets/VisDrone2019-VID-val/ içinden rastgele bir sekans seçer
+python main.py --simulate
+
+# Görev 1: Tekil fotoğraflar (Nesne tespiti testi)
+# datasets/VisDrone2019-DET-train/ içinden rastgele 100 fotoğraf seçer
+python main.py --simulate det
+```
+*Not: Bu modda sonuçlar renkli olarak terminale basılır.*
+
 ### Yarışma Modu
 
 ```bash
