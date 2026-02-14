@@ -56,12 +56,12 @@ class Settings:
     MODEL_PATH: str = str(PROJECT_ROOT / "models" / "yolov8m.pt")
 
     # Tespit Güven Eşiği (0.0 - 1.0)
-    # Düşük değer = daha fazla tespit (recall ↑), post-process filtreler noise'u temizler
-    CONFIDENCE_THRESHOLD: float = 0.15
+    # 0.20 = Çatı/Bina gibi yanlış pozitifleri azaltır
+    CONFIDENCE_THRESHOLD: float = 0.20
 
     # NMS IoU Eşiği (Non-Maximum Suppression)
-    # Daha yüksek = daha az bastırma → yakın nesneleri kaybetmez
-    NMS_IOU_THRESHOLD: float = 0.50
+    # Daha düşük (0.35) = daha agresif bastırma → çift tespitleri (kaput/tampon) birleştirir
+    NMS_IOU_THRESHOLD: float = 0.35
 
     # Cihaz Seçimi (cuda: GPU, cpu: İşlemci)
     DEVICE: str = "cuda"
@@ -77,12 +77,12 @@ class Settings:
     # Sınıflar arası NMS — aynı bölgede farklı sınıf çakışmalarını da bastırır
     AGNOSTIC_NMS: bool = True
 
-    # Maksimum tespit sayısı (gereksiz sonuçları keser, hız kazanır)
-    MAX_DETECTIONS: int = 100
+    # Maksimum tespit sayısı (SAHI ile daha fazla sonuç gelir)
+    MAX_DETECTIONS: int = 300
 
     # Test-Time Augmentation (çoklu ölçekte inference → mAP artışı)
-    # DİKKAT: FPS'i ~%50 düşürür. Offline değerlendirme için açılabilir.
-    AUGMENTED_INFERENCE: bool = False
+    # Tepeden görünümde (dikey) ve farklı açılarda tespiti iyileştirir
+    AUGMENTED_INFERENCE: bool = True
 
     # Ön-İşleme: CLAHE Kontrast İyileştirme (drone görüntülerinde
     # karanlık/düşük kontrastlı bölgelerdeki nesneleri ortaya çıkarır)
@@ -91,7 +91,22 @@ class Settings:
     CLAHE_TILE_SIZE: int = 8
 
     # Minimum bbox boyutu (piksel) — altındakiler false positive sayılır
-    MIN_BBOX_SIZE: int = 8
+    # 10px = Uzaktaki insan için alt sınır. Daha küçüğü (kol/bacak) elenir.
+    MIN_BBOX_SIZE: int = 10
+
+    # Maksimum bbox boyutu (piksel) — üstündekiler bina/çatı vs. sayılır
+    # 50m irtifada: Otobüs ~200px. Bina çatısı > 300px.
+    MAX_BBOX_SIZE: int = 300
+
+    # =========================================================================
+    #  SAHI (Slicing Aided Hyper Inference) — Tepeden Görünüm İyileştirmesi
+    # =========================================================================
+    # Görüntüyü örtüşen parçalara böler → her parçada ayrı inference → birleştir
+    # Küçük nesneleri (tepeden araç/insan) dramatik şekilde iyileştirir
+    SAHI_ENABLED: bool = True
+    SAHI_SLICE_SIZE: int = 640       # Her parçanın boyutu (piksel)
+    SAHI_OVERLAP_RATIO: float = 0.35 # Parçalar arası örtüşme (%35) - Kenarları yakalar
+    SAHI_MERGE_IOU: float = 0.35     # Birleştirme NMS IoU eşiği (Çift tespitleri önler)
 
     # Model ısınma tekrar sayısı (ilk kare gecikmesini önler)
     WARMUP_ITERATIONS: int = 3

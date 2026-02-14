@@ -190,82 +190,89 @@ def run_simulation(
     def signal_handler(sig, frame):
         nonlocal running
         running = False
-        log.warn("\nKapatma sinyali alındı — döngü durduruluyor...")
+        print("\n")  # Yeni satır
+        log.warn("Kapatma sinyali alındı — döngü durduruluyor...")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    for frame_info in loader:
-        if not running:
-            break
+    try:
+        for frame_info in loader:
+            if not running:
+                break
 
-        # Kare limiti
-        if fps_counter.frame_count >= Settings.MAX_FRAMES:
-            log.success(f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES})")
-            break
+            # Kare limiti
+            if fps_counter.frame_count >= Settings.MAX_FRAMES:
+                log.success(f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES})")
+                break
 
-        try:
-            frame = frame_info["frame"]
-            frame_idx = frame_info["frame_idx"]
-            server_data = frame_info["server_data"]
-            gps_health = frame_info["gps_health"]
+            try:
+                frame = frame_info["frame"]
+                frame_idx = frame_info["frame_idx"]
+                server_data = frame_info["server_data"]
+                gps_health = frame_info["gps_health"]
 
-            # ---- NESNE TESPİTİ (Görev 1) ----
-            detected_objects = detector.detect(frame)
+                # ---- NESNE TESPİTİ (Görev 1) ----
+                detected_objects = detector.detect(frame)
 
-            # ---- KONUM KESTİRİMİ (Görev 2) ----
-            position = odometry.update(frame, server_data)
+                # ---- KONUM KESTİRİMİ (Görev 2) ----
+                position = odometry.update(frame, server_data)
 
-            # ---- RENKLİ SONUÇ LOGU ----
-            _print_simulation_result(
-                log, frame_idx, detected_objects, position, gps_health,
-                frame_info["filename"]
-            )
-
-            # ---- GÖRSEL ÇIKTI ----
-            if show or save:
-                annotated = visualizer.draw_detections(
-                    frame, detected_objects,
-                    frame_id=str(frame_idx),
-                    position=position,
+                # ---- RENKLİ SONUÇ LOGU ----
+                _print_simulation_result(
+                    log, frame_idx, detected_objects, position, gps_health,
+                    frame_info["filename"]
                 )
 
-                # Ekstra bilgi: GPS/OF modu ve FPS
-                mode_text = "GPS" if gps_health == 1 else "Optical Flow"
-                cv2.putText(
-                    annotated, f"Mode: {mode_text}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 255, 0) if gps_health else (0, 165, 255), 2,
-                )
-
-                if show:
-                    cv2.imshow("TEKNOFEST - Otonom Test", annotated)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord('q'), 27):  # q veya ESC
-                        log.info("Kullanıcı pencereyi kapattı (q/ESC)")
-                        break
-
-                if save:
-                    save_path = os.path.join(
-                        Settings.DEBUG_OUTPUT_DIR,
-                        f"frame_{frame_idx:04d}.jpg",
+                # ---- GÖRSEL ÇIKTI ----
+                if show or save:
+                    annotated = visualizer.draw_detections(
+                        frame, detected_objects,
+                        frame_id=str(frame_idx),
+                        position=position,
                     )
-                    cv2.imwrite(save_path, annotated)
 
-            # ---- FPS ----
-            fps_counter.tick()
+                    # Ekstra bilgi: GPS/OF modu ve FPS
+                    mode_text = "GPS" if gps_health == 1 else "Optical Flow"
+                    cv2.putText(
+                        annotated, f"Mode: {mode_text}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 0) if gps_health else (0, 165, 255), 2,
+                    )
 
-        except Exception as e:
-            log.error(f"Kare {frame_info.get('frame_idx', '?')} hatası: {e}")
-            log.error(f"Stack trace:\n{traceback.format_exc()}")
-            continue
+                    if show:
+                        cv2.imshow("TEKNOFEST - Otonom Test", annotated)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (ord('q'), 27):  # q veya ESC
+                            log.info("Kullanıcı pencereyi kapattı (q/ESC)")
+                            break
 
-    # --- Temiz Kapanış ---
-    if show:
-        cv2.destroyAllWindows()
-    if save:
-        log.success(f"Görseller kaydedildi: {Settings.DEBUG_OUTPUT_DIR}/")
-    _print_summary(log, fps_counter)
+                    if save:
+                        save_path = os.path.join(
+                            Settings.DEBUG_OUTPUT_DIR,
+                            f"frame_{frame_idx:04d}.jpg",
+                        )
+                        cv2.imwrite(save_path, annotated)
+
+                # ---- FPS ----
+                fps_counter.tick()
+
+            except Exception as e:
+                log.error(f"Kare {frame_info.get('frame_idx', '?')} hatası: {e}")
+                log.error(f"Stack trace:\n{traceback.format_exc()}")
+                continue
+
+    finally:
+        # --- Temiz Kapanış ---
+        log.info("Kaynaklar temizleniyor...")
+        if show:
+            cv2.destroyAllWindows()
+            # Bazı sistemlerde pencerenin kapanması için birkaç waitKey gerekir
+            cv2.waitKey(1)
+        if save:
+            log.success(f"Görseller kaydedildi: {Settings.DEBUG_OUTPUT_DIR}/")
+        
+        _print_summary(log, fps_counter)
 
 
 def _print_simulation_result(
@@ -360,86 +367,93 @@ def run_competition(log: Logger) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    while running:
-        try:
-            # ---- KARE LİMİTİ KONTROLÜ ----
-            if fps_counter.frame_count >= Settings.MAX_FRAMES:
-                log.success(
-                    f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES}) — "
-                    f"oturum tamamlandı ✓"
+    try:
+        while running:
+            try:
+                # ---- KARE LİMİTİ KONTROLÜ ----
+                if fps_counter.frame_count >= Settings.MAX_FRAMES:
+                    log.success(
+                        f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES}) — "
+                        f"oturum tamamlandı ✓"
+                    )
+                    break
+
+                # ---- 1) SUNUCUDAN KARE META VERİSİ AL ----
+                frame_data = network.get_frame()
+
+                if frame_data is None:
+                    consecutive_none_count += 1
+                    if consecutive_none_count >= 5:
+                        log.info("Video sona erdi (5 ardışık boş yanıt) — çıkılıyor")
+                        break
+                    log.warn("Kare verisi alınamadı — bekleniyor...")
+                    time.sleep(0.5)
+                    continue
+
+                consecutive_none_count = 0
+                frame_id = frame_data.get("frame_id", "unknown")
+
+                # ---- 2) GÖRÜNTÜYÜ İNDİR ----
+                frame = network.download_image(frame_data)
+
+                if frame is None:
+                    log.warn(f"Kare {frame_id}: Görüntü indirilemedi — atlanıyor")
+                    continue
+
+                # ---- 3) NESNE TESPİTİ (GÖREV 1) ----
+                detected_objects = detector.detect(frame)
+
+                # ---- 4) KONUM KESTİRİMİ (GÖREV 2) ----
+                position = odometry.update(frame, frame_data)
+
+                # TEKNOFEST formatına dönüştür
+                detected_translation = {
+                    "translation_x": position["x"],
+                    "translation_y": position["y"],
+                    "translation_z": position["z"],
+                }
+
+                # ---- 5) SONUÇLARI GÖNDER ----
+                success = network.send_result(
+                    frame_id, detected_objects, detected_translation
                 )
+
+                if not success:
+                    log.warn(f"Kare {frame_id}: Sonuç gönderilemedi!")
+
+                # ---- 6) DEBUG ÇIKTISI ----
+                if Settings.DEBUG and visualizer is not None:
+                    visualizer.draw_detections(
+                        frame, detected_objects,
+                        frame_id=str(frame_id),
+                        position=position,
+                    )
+
+                # ---- 7) FPS GÜNCELLE ----
+                fps_counter.tick()
+
+                # ---- 8) DÖNGÜ ARASI BEKLEME ----
+                if Settings.LOOP_DELAY > 0:
+                    time.sleep(Settings.LOOP_DELAY)
+
+            except KeyboardInterrupt:
+                log.warn("Kullanıcı tarafından durduruldu (KeyboardInterrupt)")
                 break
 
-            # ---- 1) SUNUCUDAN KARE META VERİSİ AL ----
-            frame_data = network.get_frame()
-
-            if frame_data is None:
-                consecutive_none_count += 1
-                if consecutive_none_count >= 5:
-                    log.info("Video sona erdi (5 ardışık boş yanıt) — çıkılıyor")
-                    break
-                log.warn("Kare verisi alınamadı — bekleniyor...")
+            except Exception as e:
+                log.error(f"İşlem hatası: {e}")
+                log.error(f"Stack trace:\n{traceback.format_exc()}")
+                log.warn("Sonraki kareye geçiliyor...")
                 time.sleep(0.5)
-                continue
 
-            consecutive_none_count = 0
-            frame_id = frame_data.get("frame_id", "unknown")
-
-            # ---- 2) GÖRÜNTÜYÜ İNDİR ----
-            frame = network.download_image(frame_data)
-
-            if frame is None:
-                log.warn(f"Kare {frame_id}: Görüntü indirilemedi — atlanıyor")
-                continue
-
-            # ---- 3) NESNE TESPİTİ (GÖREV 1) ----
-            detected_objects = detector.detect(frame)
-
-            # ---- 4) KONUM KESTİRİMİ (GÖREV 2) ----
-            position = odometry.update(frame, frame_data)
-
-            # TEKNOFEST formatına dönüştür
-            detected_translation = {
-                "translation_x": position["x"],
-                "translation_y": position["y"],
-                "translation_z": position["z"],
-            }
-
-            # ---- 5) SONUÇLARI GÖNDER ----
-            success = network.send_result(
-                frame_id, detected_objects, detected_translation
-            )
-
-            if not success:
-                log.warn(f"Kare {frame_id}: Sonuç gönderilemedi!")
-
-            # ---- 6) DEBUG ÇIKTISI ----
-            if Settings.DEBUG and visualizer is not None:
-                visualizer.draw_detections(
-                    frame, detected_objects,
-                    frame_id=str(frame_id),
-                    position=position,
-                )
-
-            # ---- 7) FPS GÜNCELLE ----
-            fps_counter.tick()
-
-            # ---- 8) DÖNGÜ ARASI BEKLEME ----
-            if Settings.LOOP_DELAY > 0:
-                time.sleep(Settings.LOOP_DELAY)
-
-        except KeyboardInterrupt:
-            log.warn("Kullanıcı tarafından durduruldu (KeyboardInterrupt)")
-            break
-
-        except Exception as e:
-            log.error(f"İşlem hatası: {e}")
-            log.error(f"Stack trace:\n{traceback.format_exc()}")
-            log.warn("Sonraki kareye geçiliyor...")
-            time.sleep(0.5)
-
-    # --- Temiz Kapanış ---
-    _print_summary(log, fps_counter)
+    finally:
+        # --- Temiz Kapanış ---
+        log.info("Kaynaklar temizleniyor...")
+        if Settings.DEBUG and visualizer is not None:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        
+        _print_summary(log, fps_counter)
 
 
 # =============================================================================

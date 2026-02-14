@@ -134,80 +134,28 @@ class ObjectDetector:
         """
         Bir video karesinde nesne tespiti yapar ve sonuçları TEKNOFEST formatında döndürür.
 
-        İşlem Sırası:
-            1. YOLOv8 ile inference (FP16 opsiyonel)
-            2. COCO → TEKNOFEST sınıf dönüşümü
-            3. İniş Uygunluğu (Landing Status) hesaplaması
-            4. TEKNOFEST JSON formatında sonuç üretimi
+        SAHI aktifse:
+            1. Full-frame inference (büyük nesneler)
+            2. Sliced inference (küçük nesneler — tepeden görünüm)
+            3. NMS ile birleştirme
 
         Args:
             frame: BGR formatlı OpenCV görüntüsü (numpy array).
 
         Returns:
-            Tespit edilen nesnelerin listesi. Her nesne dict formatında:
-            {
-                "cls": "0",            # Sınıf ID (string)
-                "landing_status": "-1", # İniş durumu
-                "top_left_x": 100,     # Sol üst X (piksel)
-                "top_left_y": 200,     # Sol üst Y (piksel)
-                "bottom_right_x": 300, # Sağ alt X (piksel)
-                "bottom_right_y": 400, # Sağ alt Y (piksel)
-                "confidence": 0.85     # Güven skoru (dahili, sunucuya gönderilmez)
-            }
+            Tespit edilen nesnelerin listesi (TEKNOFEST formatında dict'ler).
         """
         try:
             # ---- 0) Ön-İşleme (CLAHE + Sharpening) ----
             processed = self._preprocess(frame)
 
-            # ---- 1) YOLOv8 Inference (TTA opsiyonel) ----
-            with torch.no_grad():
-                results = self.model.predict(
-                    source=processed,
-                    imgsz=Settings.INFERENCE_SIZE,
-                    conf=Settings.CONFIDENCE_THRESHOLD,
-                    iou=Settings.NMS_IOU_THRESHOLD,
-                    device=self.device,
-                    verbose=False,
-                    save=False,
-                    half=self._use_half,
-                    agnostic_nms=Settings.AGNOSTIC_NMS,
-                    max_det=Settings.MAX_DETECTIONS,
-                    augment=Settings.AUGMENTED_INFERENCE,
-                )
+            # ---- 1) Inference (SAHI veya Standard) ----
+            if Settings.SAHI_ENABLED:
+                raw_detections = self._sahi_detect(processed)
+            else:
+                raw_detections = self._standard_inference(processed)
 
-            # ---- 2) COCO → TEKNOFEST Dönüşümü ----
-            raw_detections: List[Dict] = []
-            for result in results:
-                if result.boxes is None:
-                    continue
-
-                for box in result.boxes:
-                    coco_id: int = int(box.cls[0].item())
-                    conf: float = float(box.conf[0].item())
-                    coords = box.xyxy[0].tolist()
-                    x1: float = float(coords[0])
-                    y1: float = float(coords[1])
-                    x2: float = float(coords[2])
-                    y2: float = float(coords[3])
-
-                    # COCO → TEKNOFEST eşleştirme
-                    tf_id = Settings.COCO_TO_TEKNOFEST.get(coco_id, -1)
-                    if tf_id == -1:
-                        # Yarışma dışı nesne — atla
-                        continue
-
-                    raw_detections.append({
-                        "cls_int": tf_id,
-                        "cls": str(tf_id),
-                        "confidence": int(conf * 10000) / 10000,  # 4 ondalık
-                        "top_left_x": int(x1),
-                        "top_left_y": int(y1),
-                        "bottom_right_x": int(x2),
-                        "bottom_right_y": int(y2),
-                        "bbox": (x1, y1, x2, y2),  # dahili hesaplama için
-                    })
-
-            # ---- 2b) Post-Processing Filtreleri ----
+            # ---- 2) Post-Processing Filtreleri ----
             raw_detections = self._post_filter(raw_detections)
 
             # ---- 3) İniş Uygunluğu Hesaplaması ----
@@ -226,10 +174,10 @@ class ObjectDetector:
                     "top_left_y": det["top_left_y"],
                     "bottom_right_x": det["bottom_right_x"],
                     "bottom_right_y": det["bottom_right_y"],
-                    "confidence": det["confidence"],  # debug için tutuyoruz
+                    "confidence": det["confidence"],
                 })
 
-            # Debug log — tek geçişte sınıf sayımı (Counter ile)
+            # Debug log
             if Settings.DEBUG:
                 cls_counts = Counter(d["cls"] for d in output)
                 self.log.debug(
@@ -253,8 +201,301 @@ class ObjectDetector:
 
         except Exception as e:
             self.log.error(f"Tespit hatası: {e}")
-            # Sistem çökmemeli — boş liste döndür
             return []
+
+    # =========================================================================
+    #  STANDARD INFERENCE (Tek Geçiş)
+    # =========================================================================
+
+    def _standard_inference(self, frame: np.ndarray) -> List[Dict]:
+        """Standart tam-kare inference — büyük nesneler için."""
+        with torch.no_grad():
+            results = self.model.predict(
+                source=frame,
+                imgsz=Settings.INFERENCE_SIZE,
+                conf=Settings.CONFIDENCE_THRESHOLD,
+                iou=Settings.NMS_IOU_THRESHOLD,
+                device=self.device,
+                verbose=False,
+                save=False,
+                half=self._use_half,
+                agnostic_nms=Settings.AGNOSTIC_NMS,
+                max_det=Settings.MAX_DETECTIONS,
+                augment=Settings.AUGMENTED_INFERENCE,
+            )
+        return self._parse_results(results)
+
+    # =========================================================================
+    #  SAHI — Slicing Aided Hyper Inference
+    # =========================================================================
+
+    def _sahi_detect(self, frame: np.ndarray) -> List[Dict]:
+        """
+        SAHI: Tam-kare + parçalı inference → NMS ile birleştirme.
+
+        Neden gerekli:
+            Drone 50m'den çekerken araçlar ~30px, insanlar ~15px.
+            1280px inference'ta bile çok küçükler.
+            640×640 parçalara bölünce, aynı araç ~120px olur → tespit edilir.
+
+        Strateji:
+            1) Full-frame @ INFERENCE_SIZE → büyük nesneleri yakalar
+            2) Sliced @ SAHI_SLICE_SIZE → küçük nesneleri yakalar
+            3) Tüm sonuçları NMS ile birleştir → duplikasyonu önle
+        """
+        all_detections: List[Dict] = []
+
+        # ---- 1) Full-frame inference (büyük nesneler) ----
+        full_dets = self._standard_inference(frame)
+        all_detections.extend(full_dets)
+
+        # ---- 2) Sliced inference (küçük nesneler) ----
+        slice_dets = self._sliced_inference(frame)
+        all_detections.extend(slice_dets)
+
+        # ---- 3) NMS ile birleştirme (duplikasyonu önle) ----
+        if len(all_detections) > 0:
+            all_detections = self._merge_detections_nms(all_detections)
+
+        return all_detections
+
+    def _sliced_inference(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Görüntüyü örtüşen parçalara böler ve her parçada inference yapar.
+
+        Koordinatlar orijinal görüntü koordinatlarına geri dönüştürülür.
+        """
+        h, w = frame.shape[:2]
+        slice_size = Settings.SAHI_SLICE_SIZE
+        overlap = Settings.SAHI_OVERLAP_RATIO
+        step = int(slice_size * (1 - overlap))
+
+        all_slice_dets: List[Dict] = []
+
+        with torch.no_grad():
+            for y_start in range(0, h, step):
+                for x_start in range(0, w, step):
+                    # Parça sınırlarını hesapla
+                    x_end = min(x_start + slice_size, w)
+                    y_end = min(y_start + slice_size, h)
+
+                    # Çok küçük kenar parçalarını atla
+                    if (x_end - x_start) < slice_size // 2 or \
+                       (y_end - y_start) < slice_size // 2:
+                        continue
+
+                    # Parçayı kes
+                    tile = frame[y_start:y_end, x_start:x_end]
+
+                    # Inference (parça boyutunda, tile'ın kendi boyutu)
+                    results = self.model.predict(
+                        source=tile,
+                        imgsz=slice_size,
+                        conf=Settings.CONFIDENCE_THRESHOLD,
+                        iou=Settings.NMS_IOU_THRESHOLD,
+                        device=self.device,
+                        verbose=False,
+                        save=False,
+                        half=self._use_half,
+                        agnostic_nms=Settings.AGNOSTIC_NMS,
+                        max_det=Settings.MAX_DETECTIONS,
+                    )
+
+                    # Koordinatları orijinal frame'e dönüştür
+                    tile_dets = self._parse_results(results)
+                    for det in tile_dets:
+                        det["top_left_x"] += x_start
+                        det["top_left_y"] += y_start
+                        det["bottom_right_x"] += x_start
+                        det["bottom_right_y"] += y_start
+                        det["bbox"] = (
+                            det["top_left_x"],
+                            det["top_left_y"],
+                            det["bottom_right_x"],
+                            det["bottom_right_y"],
+                        )
+                    all_slice_dets.extend(tile_dets)
+
+        return all_slice_dets
+
+    # =========================================================================
+    #  YARDIMCI METODLAR
+    # =========================================================================
+
+    def _parse_results(self, results) -> List[Dict]:
+        """YOLO sonuçlarını COCO→TEKNOFEST dönüşümü ile parse eder."""
+        detections: List[Dict] = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                coco_id = int(box.cls[0].item())
+                conf = float(box.conf[0].item())
+                coords = box.xyxy[0].tolist()
+                x1, y1, x2, y2 = (
+                    float(coords[0]), float(coords[1]),
+                    float(coords[2]), float(coords[3]),
+                )
+
+                tf_id = Settings.COCO_TO_TEKNOFEST.get(coco_id, -1)
+                if tf_id == -1:
+                    continue
+
+                detections.append({
+                    "cls_int": tf_id,
+                    "cls": str(tf_id),
+                    "confidence": int(conf * 10000) / 10000,
+                    "top_left_x": int(x1),
+                    "top_left_y": int(y1),
+                    "bottom_right_x": int(x2),
+                    "bottom_right_y": int(y2),
+                    "bbox": (x1, y1, x2, y2),
+                })
+        return detections
+
+    @staticmethod
+    def _merge_detections_nms(detections: List[Dict]) -> List[Dict]:
+        """
+        Birden fazla kaynaktan gelen tespitleri NMS ile birleştirir.
+
+        Full-frame ve sliced sonuçlarda aynı nesne birden fazla kez
+        tespit edilebilir. Bu metod IoU tabanlı NMS ile duplikasyonları kaldırır.
+        En yüksek confidence'lı tespit korunur.
+        """
+        if not detections:
+            return detections
+
+        # NumPy array'lere dönüştür (NMS için)
+        boxes = np.array([d["bbox"] for d in detections], dtype=np.float32)
+        scores = np.array([d["confidence"] for d in detections], dtype=np.float32)
+
+        # Sınıf bazlı NMS (farklı sınıflar birbirini bastırmasın)
+        class_ids = np.array([d["cls_int"] for d in detections], dtype=np.int32)
+        unique_classes = np.unique(class_ids)
+
+        keep_indices: List[int] = []
+        for cls_id in unique_classes:
+            cls_mask = class_ids == cls_id
+            cls_indices = np.where(cls_mask)[0]
+
+            if len(cls_indices) == 0:
+                continue
+
+            cls_boxes = boxes[cls_indices]
+            cls_scores = scores[cls_indices]
+
+            # Greedy NMS
+            nms_keep = ObjectDetector._nms_greedy(
+                cls_boxes, cls_scores, Settings.SAHI_MERGE_IOU
+            )
+            # NMS sonrası indeksleri güncelle
+            nms_indices = cls_indices[nms_keep]
+            keep_indices.extend(nms_indices.tolist())
+
+        nms_results = [detections[i] for i in keep_indices]
+
+        # 2. Adım: Containment Suppression (İç içe geçen kutuları temizle)
+        # Örn: Bacak (küçük kutu) Vücut (büyük kutu) içindeyse, küçüğü sil
+        return ObjectDetector._suppress_contained(nms_results)
+
+    @staticmethod
+    def _suppress_contained(detections: List[Dict], threshold: float = 0.85) -> List[Dict]:
+        """
+        Bir kutu diğerinin içindeyse (veya büyük oranda örtüşüyorsa) küçüğü siler.
+        Standart NMS'in aksine, IoU yerine 'Intersection over Small Area' kullanır.
+        """
+        if not detections:
+            return []
+
+        # Alanlarına göre büyükten küçüğe sırala
+        detections.sort(key=lambda x: (x["bbox"][2]-x["bbox"][0]) * (x["bbox"][3]-x["bbox"][1]), reverse=True)
+        
+        keep = []
+        is_suppressed = [False] * len(detections)
+
+        for i in range(len(detections)):
+            if is_suppressed[i]:
+                continue
+            
+            box_a = detections[i]["bbox"]
+            area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+            keep.append(detections[i])
+
+            for j in range(i + 1, len(detections)):
+                if is_suppressed[j]:
+                    continue
+                
+                # Sadece aynı sınıfları kontrol et (İnsan içindeki İnsanı sil, Araç içindeki İnsanı silme)
+                if detections[i]["cls_int"] != detections[j]["cls_int"]:
+                    continue
+
+                box_b = detections[j]["bbox"]
+                
+                # Kesişim alanı
+                inter_x1 = max(box_a[0], box_b[0])
+                inter_y1 = max(box_a[1], box_b[1])
+                inter_x2 = min(box_a[2], box_b[2])
+                inter_y2 = min(box_a[3], box_b[3])
+                
+                inter_w = max(0.0, inter_x2 - inter_x1)
+                inter_h = max(0.0, inter_y2 - inter_y1)
+                inter_area = inter_w * inter_h
+                
+                if inter_area == 0:
+                    continue
+
+                # Küçük kutunun alanı (box_b çünkü sıralı gidiyoruz, j >= i, ama alan büyükten küçüğe)
+                # DİKKAT: Sıralama Büyük -> Küçük. Yani i Büyük, j Küçük.
+                area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+                
+                # IOS hesapla: Kesişim / Küçük Alan
+                ios = inter_area / area_b if area_b > 0 else 0
+
+                if ios > threshold:
+                    is_suppressed[j] = True  # Küçüğü bastır
+
+        return keep
+
+    @staticmethod
+    def _nms_greedy(
+        boxes: np.ndarray, scores: np.ndarray, iou_threshold: float
+    ) -> List[int]:
+        """Greedy NMS implementasyonu (sınıf-agnostik)."""
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+
+        order = scores.argsort()[::-1]
+        keep: List[int] = []
+
+        while order.size > 0:
+            i = order[0]
+            keep.append(int(i))
+
+            if order.size == 1:
+                break
+
+            # IoU hesapla
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+
+            inter_w = np.maximum(0.0, xx2 - xx1)
+            inter_h = np.maximum(0.0, yy2 - yy1)
+            intersection = inter_w * inter_h
+
+            union = areas[i] + areas[order[1:]] - intersection
+            iou = intersection / np.maximum(union, 1e-6)
+
+            # IoU düşük olanları koru
+            remaining = np.where(iou <= iou_threshold)[0]
+            order = order[remaining + 1]
+
+        return keep
+
     # =========================================================================
     #  ÖN-İŞLEME (PREPROCESSING)
     # =========================================================================
@@ -326,6 +567,11 @@ class ObjectDetector:
 
             # Minimum boyut kontrolü
             if w < min_size or h < min_size:
+                continue
+
+            # Maksimum boyut kontrolü (Binaları/çatıları elemek için)
+            # 50m irtifada 300px'den büyük bir şey araç olamaz (Otobüs bile ~200px)
+            if w > Settings.MAX_BBOX_SIZE or h > Settings.MAX_BBOX_SIZE:
                 continue
 
             # Aşırı aspect ratio kontrolü (> 6:1)

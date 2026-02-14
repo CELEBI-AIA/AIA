@@ -258,8 +258,10 @@ class DatasetLoader:
                 "server_data": {
                     "frame_id": self._index,
                     "gps_health": gps_health,
-                    "translation_x": 0.0,
-                    "translation_y": 0.0,
+                    # Telemetri simülasyonu (hareket varmış gibi)
+                    # Drone hızı: X ekseninde 0.5m/kare (~3.7 m/s), Y ekseninde 0.1m/kare
+                    "translation_x": float(self._index * 0.5),
+                    "translation_y": float(self._index * 0.1),
                     "translation_z": Settings.DEFAULT_ALTITUDE,
                 },
             }
