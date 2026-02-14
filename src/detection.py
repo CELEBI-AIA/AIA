@@ -20,6 +20,7 @@ import os
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -87,6 +88,19 @@ class ObjectDetector:
         # Warmup — ilk kare gecikmesini önle
         self._warmup()
 
+        # CLAHE nesnesi (ön-işleme için)
+        if Settings.CLAHE_ENABLED:
+            self._clahe = cv2.createCLAHE(
+                clipLimit=Settings.CLAHE_CLIP_LIMIT,
+                tileGridSize=(
+                    Settings.CLAHE_TILE_SIZE,
+                    Settings.CLAHE_TILE_SIZE,
+                ),
+            )
+            self.log.info("CLAHE kontrast iyileştirme aktif ✓")
+        else:
+            self._clahe = None
+
     def _warmup(self) -> None:
         """
         Model ısınması — GPU belleğini hazırlar ve ilk kare gecikmesini önler.
@@ -142,10 +156,13 @@ class ObjectDetector:
             }
         """
         try:
-            # ---- 1) YOLOv8 Inference ----
+            # ---- 0) Ön-İşleme (CLAHE + Sharpening) ----
+            processed = self._preprocess(frame)
+
+            # ---- 1) YOLOv8 Inference (TTA opsiyonel) ----
             with torch.no_grad():
                 results = self.model.predict(
-                    source=frame,
+                    source=processed,
                     imgsz=Settings.INFERENCE_SIZE,
                     conf=Settings.CONFIDENCE_THRESHOLD,
                     iou=Settings.NMS_IOU_THRESHOLD,
@@ -155,6 +172,7 @@ class ObjectDetector:
                     half=self._use_half,
                     agnostic_nms=Settings.AGNOSTIC_NMS,
                     max_det=Settings.MAX_DETECTIONS,
+                    augment=Settings.AUGMENTED_INFERENCE,
                 )
 
             # ---- 2) COCO → TEKNOFEST Dönüşümü ----
@@ -188,6 +206,9 @@ class ObjectDetector:
                         "bottom_right_y": int(y2),
                         "bbox": (x1, y1, x2, y2),  # dahili hesaplama için
                     })
+
+            # ---- 2b) Post-Processing Filtreleri ----
+            raw_detections = self._post_filter(raw_detections)
 
             # ---- 3) İniş Uygunluğu Hesaplaması ----
             frame_h, frame_w = frame.shape[:2]
@@ -234,6 +255,87 @@ class ObjectDetector:
             self.log.error(f"Tespit hatası: {e}")
             # Sistem çökmemeli — boş liste döndür
             return []
+    # =========================================================================
+    #  ÖN-İŞLEME (PREPROCESSING)
+    # =========================================================================
+
+    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Drone görüntülerini tespit öncesi iyileştirir.
+
+        İşlemler:
+            1. CLAHE: Adaptif kontrast iyileştirme (LAB renk uzayında L kanalına)
+               → karanlık/gölgeli bölgelerdeki insanları ortaya çıkarır
+            2. Sharpening: Hafif keskinleştirme (unsharp mask)
+               → uzaktaki küçük nesnelerin kenarlarını belirginleştirir
+
+        Args:
+            frame: BGR formatlı OpenCV görüntüsü.
+
+        Returns:
+            İyileştirilmiş BGR görüntüsü.
+        """
+        result = frame
+
+        # ---- CLAHE Kontrast İyileştirme ----
+        if self._clahe is not None:
+            # LAB renk uzayına çevir (L = parlaklık kanayı)
+            lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+
+            # Sadece L (parlaklık) kanalına CLAHE uygula
+            l_enhanced = self._clahe.apply(l_channel)
+
+            # Kanalları birleştir ve BGR'ye dön
+            lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+            result = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+        # ---- Hafif Sharpening (Unsharp Mask) ----
+        # Gaussian bulanıklaştır → orijinalden çıkar → ekle
+        blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=2.0)
+        result = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
+
+        return result
+
+    # =========================================================================
+    #  POST-PROCESSING FİLTRELERİ
+    # =========================================================================
+
+    @staticmethod
+    def _post_filter(detections: List[Dict]) -> List[Dict]:
+        """
+        False positive'leri azaltmak için tespit sonrası filtreler.
+
+        Filtreler:
+            1. Minimum bbox boyutu: Çok küçük tespitler (< MIN_BBOX_SIZE px) → kaldır
+            2. Aşırı aspect ratio: 6:1'den fazla uzun/geniş → kaldır (artefakt)
+
+        Args:
+            detections: Ham tespit listesi.
+
+        Returns:
+            Filtrelenmiş tespit listesi.
+        """
+        filtered: List[Dict] = []
+        min_size = Settings.MIN_BBOX_SIZE
+
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            w = x2 - x1
+            h = y2 - y1
+
+            # Minimum boyut kontrolü
+            if w < min_size or h < min_size:
+                continue
+
+            # Aşırı aspect ratio kontrolü (> 6:1)
+            aspect = max(w, h) / max(min(w, h), 1)
+            if aspect > 6.0:
+                continue
+
+            filtered.append(det)
+
+        return filtered
 
     # =========================================================================
     #  İNİŞ UYGUNLUĞU (LANDING STATUS) MANTIĞI

@@ -51,16 +51,17 @@ class Settings:
     # =========================================================================
 
     # YOLOv8 Model Dosyası (yerel diskten yüklenir - OFFLINE MODE)
-    # yolov8s = Small model (11.2M param, mAP50: 44.9)
-    # yolov8n'den ~%20 daha doğru, hala 200+ FPS (FP16)
-    MODEL_PATH: str = str(PROJECT_ROOT / "models" / "yolov8s.pt")
+    # yolov8m = Medium model (25.9M param, mAP50: 50.2)
+    # s modelden ~%12 daha doğru — yarışma hızı (7.5 FPS) buna izin verir
+    MODEL_PATH: str = str(PROJECT_ROOT / "models" / "yolov8m.pt")
 
     # Tespit Güven Eşiği (0.0 - 1.0)
-    # yolov8s daha güvenilir sonuçlar verir → 0.20 yeterli
-    CONFIDENCE_THRESHOLD: float = 0.20
+    # Düşük değer = daha fazla tespit (recall ↑), post-process filtreler noise'u temizler
+    CONFIDENCE_THRESHOLD: float = 0.15
 
     # NMS IoU Eşiği (Non-Maximum Suppression)
-    NMS_IOU_THRESHOLD: float = 0.45
+    # Daha yüksek = daha az bastırma → yakın nesneleri kaybetmez
+    NMS_IOU_THRESHOLD: float = 0.50
 
     # Cihaz Seçimi (cuda: GPU, cpu: İşlemci)
     DEVICE: str = "cuda"
@@ -69,14 +70,28 @@ class Settings:
     HALF_PRECISION: bool = True
 
     # Inference Çözünürlüğü (piksel)
-    # yolov8s@640 > yolov8n@1280 (hem doğruluk hem hız)
-    INFERENCE_SIZE: int = 640
+    # 1280 = drone görüntüleri için en iyi (uzaktaki insanlar/araçlar)
+    # Yarışma offline — gerçek zamanlı hız kısıtı yok, kalite öncelikli
+    INFERENCE_SIZE: int = 1280
 
     # Sınıflar arası NMS — aynı bölgede farklı sınıf çakışmalarını da bastırır
     AGNOSTIC_NMS: bool = True
 
     # Maksimum tespit sayısı (gereksiz sonuçları keser, hız kazanır)
-    MAX_DETECTIONS: int = 50
+    MAX_DETECTIONS: int = 100
+
+    # Test-Time Augmentation (çoklu ölçekte inference → mAP artışı)
+    # DİKKAT: FPS'i ~%50 düşürür. Offline değerlendirme için açılabilir.
+    AUGMENTED_INFERENCE: bool = False
+
+    # Ön-İşleme: CLAHE Kontrast İyileştirme (drone görüntülerinde
+    # karanlık/düşük kontrastlı bölgelerdeki nesneleri ortaya çıkarır)
+    CLAHE_ENABLED: bool = True
+    CLAHE_CLIP_LIMIT: float = 2.0
+    CLAHE_TILE_SIZE: int = 8
+
+    # Minimum bbox boyutu (piksel) — altındakiler false positive sayılır
+    MIN_BBOX_SIZE: int = 8
 
     # Model ısınma tekrar sayısı (ilk kare gecikmesini önler)
     WARMUP_ITERATIONS: int = 3
