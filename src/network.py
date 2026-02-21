@@ -35,10 +35,18 @@ class NetworkManager:
 
     Args:
         base_url: Sunucu adresi (varsayılan: Settings.BASE_URL)
+        simulation_mode: Simülasyon davranışı. None ise Settings.SIMULATION_MODE kullanılır.
     """
 
-    def __init__(self, base_url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        simulation_mode: Optional[bool] = None,
+    ) -> None:
         self.base_url = base_url or Settings.BASE_URL
+        self.simulation_mode = (
+            Settings.SIMULATION_MODE if simulation_mode is None else simulation_mode
+        )
         self.log = Logger("Network")
         self.session = requests.Session()
         self._frame_counter: int = 0
@@ -60,7 +68,7 @@ class NetworkManager:
         Returns:
             Bağlantı başarılı ise True, değilse False.
         """
-        if Settings.SIMULATION_MODE:
+        if self.simulation_mode:
             self.log.success(
                 f"[SİMÜLASYON] Oturum başlatıldı → {self.base_url}"
             )
@@ -110,7 +118,7 @@ class NetworkManager:
         Returns:
             Kare verisi dict veya hata durumunda None.
         """
-        if Settings.SIMULATION_MODE:
+        if self.simulation_mode:
             return self._get_simulation_frame()
 
         url = f"{self.base_url}{Settings.ENDPOINT_NEXT_FRAME}"
@@ -177,7 +185,7 @@ class NetworkManager:
         Returns:
             BGR formatlı numpy görüntü dizisi veya hata durumunda None.
         """
-        if Settings.SIMULATION_MODE:
+        if self.simulation_mode:
             return self._load_simulation_image()
 
         # Görüntü URL'sini oluştur
@@ -284,7 +292,7 @@ class NetworkManager:
         # JSON logla
         log_json_to_disk(payload, direction="outgoing", tag=f"result_{frame_id}")
 
-        if Settings.SIMULATION_MODE:
+        if self.simulation_mode:
             self.log.success(
                 f"[SİMÜLASYON] Sonuç gönderildi → Frame: {frame_id} | "
                 f"Nesne: {len(clean_objects)} adet"

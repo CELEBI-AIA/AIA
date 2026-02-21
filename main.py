@@ -326,7 +326,9 @@ def run_competition(log: Logger) -> None:
     log.info("Modüller başlatılıyor...")
 
     try:
-        network = NetworkManager()
+        # Yarışma modu seçildiyse, Settings.SIMULATION_MODE yanlışlıkla True olsa bile
+        # ağ katmanı gerçek sunucu modunda çalışmalıdır.
+        network = NetworkManager(simulation_mode=False)
         detector = ObjectDetector()
         odometry = VisualOdometry()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
