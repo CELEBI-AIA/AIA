@@ -50,6 +50,7 @@ class NetworkManager:
         self.log = Logger("Network")
         self.session = requests.Session()
         self._frame_counter: int = 0
+        self._result_counter: int = 0
 
         # Simülasyon görseli cache (her seferinde diskten okumamak için)
         self._sim_image_cache: Optional[np.ndarray] = None
@@ -135,8 +136,13 @@ class NetworkManager:
                         self.log.warn("Geçersiz kare verisi alındı, atlanıyor")
                         return None
 
-                    # Gelen veriyi logla
-                    log_json_to_disk(data, direction="incoming", tag=f"frame_{self._frame_counter}")
+                    # Gelen veriyi logla (örneklemeli)
+                    if self._should_log_json(self._frame_counter):
+                        log_json_to_disk(
+                            data,
+                            direction="incoming",
+                            tag=f"frame_{self._frame_counter}",
+                        )
                     self._frame_counter += 1
 
                     return data
@@ -290,8 +296,10 @@ class NetworkManager:
             "detected_translations": [detected_translation],
         }
 
-        # JSON logla
-        log_json_to_disk(payload, direction="outgoing", tag=f"result_{frame_id}")
+        # JSON logla (örneklemeli)
+        if self._should_log_json(self._result_counter):
+            log_json_to_disk(payload, direction="outgoing", tag=f"result_{frame_id}")
+        self._result_counter += 1
 
         if self.simulation_mode:
             self.log.success(
@@ -396,3 +404,10 @@ class NetworkManager:
                 self.log.warn(f"Eksik alan: '{field}' kare verisinde bulunamadı")
                 return False
         return True
+
+    @staticmethod
+    def _should_log_json(counter: int) -> bool:
+        if not Settings.ENABLE_JSON_LOGGING:
+            return False
+        interval = max(1, int(Settings.JSON_LOG_EVERY_N_FRAMES))
+        return counter % interval == 0

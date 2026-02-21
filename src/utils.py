@@ -140,6 +140,7 @@ class Visualizer:
         detections: List[Dict],
         frame_id: str = "unknown",
         position: Optional[Dict] = None,
+        save_to_disk: bool = True,
     ) -> np.ndarray:
         """
         Görüntü üzerine tespit sonuçlarını çizer ve belirli aralıklarla diske kaydeder.
@@ -199,11 +200,12 @@ class Visualizer:
             )
 
         # Diske kaydet — sadece belirli aralıklarla (I/O darboğazı önleme)
-        self._save_counter += 1
-        if self._save_counter % Settings.DEBUG_SAVE_INTERVAL == 0:
-            save_path = os.path.join(Settings.DEBUG_OUTPUT_DIR, f"{frame_id}.jpg")
-            cv2.imwrite(save_path, annotated)
-            self.log.debug(f"Debug görsel kaydedildi: {save_path}")
+        if save_to_disk:
+            self._save_counter += 1
+            if self._save_counter % Settings.DEBUG_SAVE_INTERVAL == 0:
+                save_path = os.path.join(Settings.DEBUG_OUTPUT_DIR, f"{frame_id}.jpg")
+                cv2.imwrite(save_path, annotated)
+                self.log.debug(f"Debug görsel kaydedildi: {save_path}")
 
         return annotated
 

@@ -235,6 +235,10 @@ class Settings:
     # Debug görsel kaydetme aralığı (her N karede diske yaz)
     DEBUG_SAVE_INTERVAL: int = 50
 
+    # JSON log performans ayarları
+    ENABLE_JSON_LOGGING: bool = True
+    JSON_LOG_EVERY_N_FRAMES: int = 10
+
     # Taşıt hareketlilik kestirimi (movement_status) parametreleri
     MOVEMENT_WINDOW_FRAMES: int = 24
     MOVEMENT_MIN_HISTORY: int = 6

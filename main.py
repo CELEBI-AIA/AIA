@@ -233,6 +233,7 @@ def run_simulation(
                         frame, detected_objects,
                         frame_id=str(frame_idx),
                         position=position,
+                        save_to_disk=not save,
                     )
 
                     # Ekstra bilgi: GPS/OF modu ve FPS
