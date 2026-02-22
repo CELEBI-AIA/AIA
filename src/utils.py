@@ -13,6 +13,7 @@ Kullanım:
 
 import os
 import json
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
@@ -230,12 +231,44 @@ def log_json_to_disk(
     try:
         os.makedirs(Settings.LOG_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{timestamp}_{direction}_{tag}.json"
+        safe_direction = _sanitize_log_component(direction)
+        safe_tag = _sanitize_log_component(tag)
+        filename = f"{timestamp}_{safe_direction}_{safe_tag}.json"
         filepath = os.path.join(Settings.LOG_DIR, filename)
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
+        _prune_old_logs(Settings.LOG_DIR)
+
+    except Exception as exc:
+        # Loglama hatası sistemi durdurmamalı, ancak görünür olmalı.
+        Logger("Logger").warn(f"JSON log write failed: {exc}")
+
+
+def _sanitize_log_component(value: Any) -> str:
+    text = str(value)
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", text)
+    return sanitized[:80] if sanitized else "general"
+
+
+def _prune_old_logs(log_dir: str) -> None:
+    max_files = max(1, int(Settings.LOG_MAX_FILES))
+    try:
+        files = [
+            os.path.join(log_dir, name)
+            for name in os.listdir(log_dir)
+            if name.lower().endswith(".json")
+        ]
     except Exception:
-        # Loglama hatası sistemi durdurmamalı
-        pass
+        return
+
+    if len(files) <= max_files:
+        return
+
+    files.sort(key=lambda path: os.path.getmtime(path))
+    for old_file in files[: len(files) - max_files]:
+        try:
+            os.remove(old_file)
+        except Exception:
+            continue

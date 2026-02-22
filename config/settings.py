@@ -9,7 +9,6 @@ Kullanım:
     print(Settings.BASE_URL)
 """
 
-import os
 from pathlib import Path
 
 
@@ -81,8 +80,8 @@ class Settings:
     MAX_DETECTIONS: int = 300
 
     # Test-Time Augmentation (çoklu ölçekte inference → mAP artışı)
-    # Tepeden görünümde (dikey) ve farklı açılarda tespiti iyileştirir
-    AUGMENTED_INFERENCE: bool = True
+    # Deterministiklik için yarışma profilinde kapatılır.
+    AUGMENTED_INFERENCE: bool = False
 
     # Ön-İşleme: CLAHE Kontrast İyileştirme (drone görüntülerinde
     # karanlık/düşük kontrastlı bölgelerdeki nesneleri ortaya çıkarır)
@@ -240,6 +239,11 @@ class Settings:
     # JSON log performans ayarları
     ENABLE_JSON_LOGGING: bool = True
     JSON_LOG_EVERY_N_FRAMES: int = 10
+    LOG_MAX_FILES: int = 2000
+
+    # Deterministik çalışma profili (startup'ta override edilebilir)
+    DETERMINISM_SEED: int = 42
+    DETERMINISM_CPU_THREADS: int = 1
 
     # Taşıt hareketlilik kestirimi (movement_status) parametreleri
     MOVEMENT_WINDOW_FRAMES: int = 24

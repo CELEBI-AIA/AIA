@@ -1,60 +1,30 @@
 """
 TEKNOFEST Havacılıkta Yapay Zeka - Ana Orkestrasyon Dosyası
 ============================================================
-Tüm modülleri bir araya getirir ve ana işlem döngüsünü yönetir.
-
-Çalışma Modları:
-    1. Yarışma Modu (varsayılan):
-       Sunucudan kare alır → tespit → konum → sonuç gönderir.
-
-    2. Otonom Test Modu (--simulate):
-       VisDrone veri setinden kare okur → tespit → konum → renkli log.
-
-İş Akışı (her kare için):
-    1. Kare al (Sunucu veya DatasetLoader)
-    2. Nesne tespiti yap (ObjectDetector.detect)
-    3. Konum kestirimi yap (VisualOdometry.update)
-    4. Sonuçları raporla (Sunucuya gönder veya terminale bas)
-
-Güvenlik:
-    - Global try/except → sistem ASLA çökmez
-    - Her modül kendi hatalarını yakalar
-    - FPS sayacı sürekli konsola basılır
-
-Kullanım:
-    python main.py                  # Yarışma modu (settings'e göre)
-    python main.py --simulate       # Otonom test modu (VisDrone)
-    python main.py --simulate det   # Sadece DET veri seti (Görev 1)
 """
 
+import argparse
 import os
+import signal
 import sys
 import time
-import signal
-import argparse
 import traceback
 from collections import Counter
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 import cv2
-
 import torch
 
-# Proje kök dizinini Python path'e ekle
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config.settings import Settings
-from src.utils import Logger, Visualizer
 from src.detection import ObjectDetector
 from src.localization import VisualOdometry
 from src.movement import MovementEstimator
-
-
-# =============================================================================
-#  SİSTEM BANNER'I
-# =============================================================================
+from src.runtime_profile import apply_runtime_profile
+from src.utils import Logger, Visualizer
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -66,41 +36,24 @@ BANNER = """
 
 
 def print_system_info(log: Logger, simulate: bool = False) -> None:
-    """Sistem bilgilerini konsola basar — başlangıç diagnostiği."""
     print(BANNER)
-    log.info(f"Çalışma Dizini  : {PROJECT_ROOT}")
-
-    if simulate:
-        log.info("Çalışma Modu    : 🧪 OTONOM TEST (VisDrone)")
-    elif Settings.SIMULATION_MODE:
-        log.info("Simülasyon Modu : AÇIK ✓ (Statik görüntü)")
-    else:
-        log.info("Simülasyon Modu : KAPALI (YARIŞMA)")
-
-    log.info(f"Debug Modu      : {'AÇIK' if Settings.DEBUG else 'KAPALI'}")
-    log.info(f"Model           : {Settings.MODEL_PATH}")
-    log.info(f"Cihaz           : {Settings.DEVICE}")
-    log.info(f"FP16            : {'AÇIK' if Settings.HALF_PRECISION else 'KAPALI'}")
+    log.info(f"Working Directory : {PROJECT_ROOT}")
+    log.info(f"Mode             : {'SIMULATION' if simulate else 'COMPETITION'}")
+    log.info(f"Debug            : {'ON' if Settings.DEBUG else 'OFF'}")
+    log.info(f"Model            : {Settings.MODEL_PATH}")
+    log.info(f"Device           : {Settings.DEVICE}")
+    log.info(f"FP16             : {'ON' if Settings.HALF_PRECISION else 'OFF'}")
+    log.info(f"TTA              : {'ON' if Settings.AUGMENTED_INFERENCE else 'OFF'}")
 
     if torch.cuda.is_available():
-        log.success(f"GPU             : {torch.cuda.get_device_name(0)}")
+        log.success(f"GPU              : {torch.cuda.get_device_name(0)}")
         mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        log.success(f"GPU Bellek      : {mem_total:.1f} GB")
+        log.success(f"GPU Memory       : {mem_total:.1f} GB")
     else:
-        log.warn("GPU             : BULUNAMADI — CPU modunda çalışılacak")
+        log.warn("GPU              : NOT FOUND, running on CPU")
 
-
-# =============================================================================
-#  FPS SAYACI
-# =============================================================================
 
 class FPSCounter:
-    """
-    Gerçek zamanlı FPS (Frame Per Second) hesaplayıcı.
-
-    Belirli aralıklarla konsola ortalama FPS değerini basar.
-    """
-
     def __init__(self, report_interval: int = 10) -> None:
         self.report_interval = report_interval
         self.frame_count: int = 0
@@ -108,31 +61,16 @@ class FPSCounter:
         self.log = Logger("FPS")
 
     def tick(self) -> Optional[float]:
-        """
-        Bir kare işlendiğini bildirir.
-
-        Her report_interval karede bir FPS değerini konsola basar.
-
-        Returns:
-            Raporlama anında FPS değeri, aksi halde None.
-        """
         self.frame_count += 1
-
         if self.frame_count % self.report_interval == 0:
             elapsed = time.time() - self.start_time
             fps = self.frame_count / elapsed if elapsed > 0 else 0
             self.log.info(
-                f"Kare: {self.frame_count} | "
-                f"FPS: {fps:.2f} | "
-                f"Süre: {elapsed:.1f}s"
+                f"Frame: {self.frame_count} | FPS: {fps:.2f} | Elapsed: {elapsed:.1f}s"
             )
             return fps
         return None
 
-
-# =============================================================================
-#  OTONOM TEST DÖNGÜSÜ (VisDrone)
-# =============================================================================
 
 def run_simulation(
     log: Logger,
@@ -140,27 +78,14 @@ def run_simulation(
     show: bool = False,
     save: bool = False,
 ) -> None:
-    """
-    VisDrone veri seti üzerinde otonom test çalıştırır.
-
-    Sunucu gerektirmez — DatasetLoader'dan kareler okunur,
-    tespit + odometri yapılır, sonuçlar renkli olarak terminale basılır.
-
-    Args:
-        log: Logger instance.
-        prefer_vid: True → VID (sekans, Görev 2), False → DET (tekil, Görev 1).
-        show: True → cv2.imshow ile canlı görüntüleme.
-        save: True → Her kareyi debug_output/ dizinine kaydet.
-    """
     from src.data_loader import DatasetLoader
 
-    # --- Modüller ---
-    log.info("Modüller başlatılıyor...")
+    log.info("Initializing modules...")
 
     try:
         loader = DatasetLoader(prefer_vid=prefer_vid)
         if not loader.is_ready:
-            log.error("Veri seti yüklenemedi — çıkılıyor.")
+            log.error("Dataset loading failed, exiting.")
             return
 
         detector = ObjectDetector()
@@ -169,31 +94,23 @@ def run_simulation(
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
         visualizer = Visualizer()
-
-        # Kayıt dizinini hazırla (--save için)
         if save:
             os.makedirs(Settings.DEBUG_OUTPUT_DIR, exist_ok=True)
-            log.info(f"Görseller kaydedilecek: {Settings.DEBUG_OUTPUT_DIR}")
+            log.info(f"Saving frames to: {Settings.DEBUG_OUTPUT_DIR}")
 
-        log.success("Tüm modüller başarıyla başlatıldı ✓")
+        log.success("All modules initialized ✓")
 
-    except Exception as e:
-        log.error(f"Modül başlatma hatası: {e}")
+    except Exception as exc:
+        log.error(f"Initialization error: {exc}")
         log.error(f"Stack trace:\n{traceback.format_exc()}")
         return
 
-    log.success("═" * 50)
-    log.success(f"  OTONOM TEST BAŞLIYOR — {len(loader)} kare işlenecek")
-    log.success("═" * 50)
-
-    # --- Döngü ---
     running = True
 
     def signal_handler(sig, frame):
         nonlocal running
         running = False
-        print("\n")  # Yeni satır
-        log.warn("Kapatma sinyali alındı — döngü durduruluyor...")
+        log.warn("Shutdown signal received, stopping loop...")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -203,9 +120,8 @@ def run_simulation(
             if not running:
                 break
 
-            # Kare limiti
             if fps_counter.frame_count >= Settings.MAX_FRAMES:
-                log.success(f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES})")
+                log.success(f"Max frame limit reached ({Settings.MAX_FRAMES})")
                 break
 
             try:
@@ -214,41 +130,37 @@ def run_simulation(
                 server_data = frame_info["server_data"]
                 gps_health = frame_info["gps_health"]
 
-                # ---- NESNE TESPİTİ (Görev 1) ----
                 detected_objects = detector.detect(frame)
                 detected_objects = movement.annotate(detected_objects)
-
-                # ---- KONUM KESTİRİMİ (Görev 2) ----
                 position = odometry.update(frame, server_data)
 
-                # ---- RENKLİ SONUÇ LOGU ----
-                _print_simulation_result(
-                    log, frame_idx, detected_objects, position, gps_health,
-                    frame_info["filename"]
-                )
+                _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
 
-                # ---- GÖRSEL ÇIKTI ----
                 if show or save:
                     annotated = visualizer.draw_detections(
-                        frame, detected_objects,
+                        frame,
+                        detected_objects,
                         frame_id=str(frame_idx),
                         position=position,
                         save_to_disk=not save,
                     )
 
-                    # Ekstra bilgi: GPS/OF modu ve FPS
                     mode_text = "GPS" if gps_health == 1 else "Optical Flow"
                     cv2.putText(
-                        annotated, f"Mode: {mode_text}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 255, 0) if gps_health else (0, 165, 255), 2,
+                        annotated,
+                        f"Mode: {mode_text}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0) if gps_health else (0, 165, 255),
+                        2,
                     )
 
                     if show:
-                        cv2.imshow("TEKNOFEST - Otonom Test", annotated)
+                        cv2.imshow("TEKNOFEST - Simulation", annotated)
                         key = cv2.waitKey(1) & 0xFF
-                        if key in (ord('q'), 27):  # q veya ESC
-                            log.info("Kullanıcı pencereyi kapattı (q/ESC)")
+                        if key in (ord("q"), 27):
+                            log.info("Window closed by user (q/ESC)")
                             break
 
                     if save:
@@ -258,24 +170,21 @@ def run_simulation(
                         )
                         cv2.imwrite(save_path, annotated)
 
-                # ---- FPS ----
                 fps_counter.tick()
 
-            except Exception as e:
-                log.error(f"Kare {frame_info.get('frame_idx', '?')} hatası: {e}")
+            except Exception as exc:
+                log.error(f"Frame {frame_info.get('frame_idx', '?')} error: {exc}")
                 log.error(f"Stack trace:\n{traceback.format_exc()}")
                 continue
 
     finally:
-        # --- Temiz Kapanış ---
-        log.info("Kaynaklar temizleniyor...")
+        log.info("Cleaning resources...")
         if show:
             cv2.destroyAllWindows()
-            # Bazı sistemlerde pencerenin kapanması için birkaç waitKey gerekir
             cv2.waitKey(1)
         if save:
-            log.success(f"Görseller kaydedildi: {Settings.DEBUG_OUTPUT_DIR}/")
-        
+            log.success(f"Frames saved: {Settings.DEBUG_OUTPUT_DIR}/")
+
         _print_summary(log, fps_counter)
 
 
@@ -285,17 +194,13 @@ def _print_simulation_result(
     detected_objects: list,
     position: dict,
     gps_health: int,
-    filename: str,
 ) -> None:
-    """Simülasyon sonucunu renkli olarak terminale basar."""
-    # Sınıf sayımı
     cls_counts = Counter(obj["cls"] for obj in detected_objects)
     tasit = cls_counts.get("0", 0)
     insan = cls_counts.get("1", 0)
     uap = cls_counts.get("2", 0)
     uai = cls_counts.get("3", 0)
 
-    # Konum bilgisi
     loc_mode = "GPS" if gps_health == 1 else "OF"
     pos_str = (
         f"x={position['x']:+.1f}m "
@@ -303,68 +208,45 @@ def _print_simulation_result(
         f"z={position['z']:.0f}m"
     )
 
-    # Renkli log
     log.success(
         f"Frame: {frame_idx:04d} | "
-        f"Tespit: {len(detected_objects)} "
-        f"({tasit} Taşıt, {insan} İnsan"
+        f"Det: {len(detected_objects)} "
+        f"({tasit} Vehicle, {insan} Human"
         f"{f', {uap} UAP' if uap else ''}"
-        f"{f', {uai} UAİ' if uai else ''}) | "
-        f"Konum: {pos_str} ({loc_mode})"
+        f"{f', {uai} UAI' if uai else ''}) | "
+        f"Pos: {pos_str} ({loc_mode})"
     )
 
 
-# =============================================================================
-#  YARIŞMA DÖNGÜSÜ (Sunucu)
-# =============================================================================
-
 def run_competition(log: Logger) -> None:
-    """
-    Yarışma/sunucu modunda ana işlem döngüsünü çalıştırır.
+    from src.network import FrameFetchStatus, NetworkManager
 
-    Sunucudan kare alır → tespit → konum → sonuç gönderir.
-    """
-    from src.network import NetworkManager
-
-    # --- Modüller ---
-    log.info("Modüller başlatılıyor...")
+    log.info("Initializing modules...")
 
     try:
-        # Yarışma modu seçildiyse, Settings.SIMULATION_MODE yanlışlıkla True olsa bile
-        # ağ katmanı gerçek sunucu modunda çalışmalıdır.
         network = NetworkManager(simulation_mode=False)
         detector = ObjectDetector()
         odometry = VisualOdometry()
         movement = MovementEstimator()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
-        visualizer: Optional[Visualizer] = None
-        if Settings.DEBUG:
-            visualizer = Visualizer()
+        visualizer: Optional[Visualizer] = Visualizer() if Settings.DEBUG else None
 
-        log.success("Tüm modüller başarıyla başlatıldı ✓")
+        log.success("All modules initialized ✓")
 
-    except Exception as e:
-        log.error(f"Modül başlatma hatası: {e}")
-        log.error("Sistem başlatılamadı — çıkılıyor.")
+    except Exception as exc:
+        log.error(f"Initialization error: {exc}")
+        log.error("System startup failed, exiting.")
         return
 
-    # --- Oturum Başlat ---
     if not network.start_session():
-        log.error("Sunucu oturumu başlatılamadı!")
-        log.warn("Yeniden denenecek...")
-        time.sleep(Settings.RETRY_DELAY)
-        if not network.start_session():
-            log.error("İkinci deneme de başarısız — çıkılıyor.")
-            return
+        log.error("Server session start failed")
+        return
 
-    log.success("═" * 50)
-    log.success("  SİSTEM HAZIR — İşlem döngüsü başlıyor...")
-    log.success("═" * 50)
-
-    # --- Döngü ---
     running = True
-    consecutive_none_count = 0
+    transient_failures = 0
+    transient_budget = max(10, Settings.MAX_RETRIES * 5)
+
     kpi_counters: Dict[str, int] = {
         "send_ok": 0,
         "send_fail": 0,
@@ -375,7 +257,7 @@ def run_competition(log: Logger) -> None:
     def signal_handler(sig, frame):
         nonlocal running
         running = False
-        log.warn("\nKapatma sinyali alındı (Ctrl+C) — döngü durduruluyor...")
+        log.warn("Shutdown signal received (Ctrl+C)")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -383,83 +265,90 @@ def run_competition(log: Logger) -> None:
     try:
         while running:
             try:
-                # ---- KARE LİMİTİ KONTROLÜ ----
                 if fps_counter.frame_count >= Settings.MAX_FRAMES:
                     log.success(
-                        f"Maksimum kare sayısına ulaşıldı ({Settings.MAX_FRAMES}) — "
-                        f"oturum tamamlandı ✓"
+                        f"Max frame count reached ({Settings.MAX_FRAMES}), session complete"
                     )
                     break
 
-                # ---- 1) SUNUCUDAN KARE META VERİSİ AL ----
-                frame_data = network.get_frame()
+                fetch_result = network.get_frame()
 
-                if frame_data is None:
-                    consecutive_none_count += 1
-                    if consecutive_none_count >= 5:
-                        log.info("Video sona erdi (5 ardışık boş yanıt) — çıkılıyor")
+                if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
+                    log.info("End of stream confirmed by server (204)")
+                    break
+
+                if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
+                    transient_failures += 1
+                    delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4)))
+                    log.warn(
+                        f"Transient frame fetch failure {transient_failures}/{transient_budget}; "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    if transient_failures >= transient_budget:
+                        log.error("Transient failure budget exceeded, aborting session")
                         break
-                    log.warn("Kare verisi alınamadı — bekleniyor...")
-                    time.sleep(0.5)
+                    time.sleep(delay)
                     continue
 
-                consecutive_none_count = 0
+                if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
+                    log.error(
+                        f"Fatal frame fetch error: {fetch_result.error_type} "
+                        f"(http={fetch_result.http_status})"
+                    )
+                    break
+
+                frame_data = fetch_result.frame_data or {}
+                transient_failures = 0
+
                 frame_id = frame_data.get("frame_id", "unknown")
-
-                # ---- 2) GÖRÜNTÜYÜ İNDİR ----
                 frame = network.download_image(frame_data)
-
                 if frame is None:
-                    log.warn(f"Kare {frame_id}: Görüntü indirilemedi — atlanıyor")
+                    log.warn(f"Frame {frame_id}: image download failed, skipping")
                     continue
 
-                # ---- 3) NESNE TESPİTİ (GÖREV 1) ----
                 detected_objects = detector.detect(frame)
                 detected_objects = movement.annotate(detected_objects)
 
-                # ---- 4) KONUM KESTİRİMİ (GÖREV 2) ----
                 position = odometry.update(frame, frame_data)
-
-                # TEKNOFEST formatına dönüştür
                 detected_translation = {
                     "translation_x": position["x"],
                     "translation_y": position["y"],
                     "translation_z": position["z"],
                 }
 
-                # ---- 5) SONUÇLARI GÖNDER ----
                 success = network.send_result(
-                    frame_id, detected_objects, detected_translation
+                    frame_id,
+                    detected_objects,
+                    detected_translation,
+                    frame_shape=frame.shape,
                 )
+
                 if success:
                     kpi_counters["send_ok"] += 1
                 else:
                     kpi_counters["send_fail"] += 1
-
-                if not success:
-                    log.warn(f"Kare {frame_id}: Sonuç gönderilemedi!")
+                    log.warn(f"Frame {frame_id}: result send failed")
 
                 try:
                     gps_health = int(float(frame_data.get("gps_health", 0)))
                 except (TypeError, ValueError):
                     gps_health = 0
+
                 if gps_health == 1:
                     kpi_counters["mode_gps"] += 1
                 else:
                     kpi_counters["mode_of"] += 1
 
-                # ---- 6) DEBUG ÇIKTISI ----
                 if Settings.DEBUG and visualizer is not None:
                     visualizer.draw_detections(
-                        frame, detected_objects,
+                        frame,
+                        detected_objects,
                         frame_id=str(frame_id),
                         position=position,
                     )
 
-                # ---- 7) FPS GÜNCELLE ----
                 fps_counter.tick()
 
-                # ---- 8) YARIŞMA KPI SATIRI (interval bazlı) ----
                 interval = max(1, int(Settings.COMPETITION_RESULT_LOG_INTERVAL))
                 if fps_counter.frame_count % interval == 0:
                     _print_competition_result(
@@ -471,33 +360,25 @@ def run_competition(log: Logger) -> None:
                         position=position,
                     )
 
-                # ---- 9) DÖNGÜ ARASI BEKLEME ----
                 if Settings.LOOP_DELAY > 0:
                     time.sleep(Settings.LOOP_DELAY)
 
             except KeyboardInterrupt:
-                log.warn("Kullanıcı tarafından durduruldu (KeyboardInterrupt)")
+                log.warn("Interrupted by user")
                 break
-
-            except Exception as e:
-                log.error(f"İşlem hatası: {e}")
+            except Exception as exc:
+                log.error(f"Runtime error: {exc}")
                 log.error(f"Stack trace:\n{traceback.format_exc()}")
-                log.warn("Sonraki kareye geçiliyor...")
                 time.sleep(0.5)
 
     finally:
-        # --- Temiz Kapanış ---
-        log.info("Kaynaklar temizleniyor...")
+        log.info("Cleaning resources...")
         if Settings.DEBUG and visualizer is not None:
             cv2.destroyAllWindows()
             cv2.waitKey(1)
-        
+
         _print_summary(log, fps_counter, kpi_counters=kpi_counters)
 
-
-# =============================================================================
-#  YARDIMCI FONKSİYONLAR
-# =============================================================================
 
 def _print_competition_result(
     log: Logger,
@@ -507,15 +388,12 @@ def _print_competition_result(
     frame_data: dict,
     position: dict,
 ) -> None:
-    """Yarışma modu için tek satırlık kompakt KPI çıktısı basar."""
-    # gps_health eksik/bozuk olduğunda OF varsay
     try:
         gps_health = int(float(frame_data.get("gps_health", 0)))
     except (TypeError, ValueError):
         gps_health = 0
     mode = "GPS" if gps_health == 1 else "OF"
 
-    # position alanları eksik/bozuk olduğunda 0.0 varsay
     def _safe_float(val) -> float:
         try:
             return float(val)
@@ -539,42 +417,31 @@ def _print_summary(
     fps_counter: FPSCounter,
     kpi_counters: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Oturum sonunda özet bilgileri basar."""
-    log.info("─" * 50)
-    log.info(f"Toplam işlenen kare: {fps_counter.frame_count}")
+    log.info("-" * 50)
+    log.info(f"Total processed frames: {fps_counter.frame_count}")
     elapsed = time.time() - fps_counter.start_time
     if elapsed > 0:
         avg_fps = fps_counter.frame_count / elapsed
-        log.info(f"Ortalama FPS: {avg_fps:.2f}")
-    log.info(f"Toplam süre: {elapsed:.1f} saniye")
+        log.info(f"Average FPS: {avg_fps:.2f}")
+    log.info(f"Total elapsed: {elapsed:.1f}s")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        log.info("GPU belleği temizlendi")
+        log.info("GPU cache cleared")
 
     if kpi_counters is not None:
         log.info(
-            "KPI Sayaçları: "
+            "KPI: "
             f"Send OK={kpi_counters.get('send_ok', 0)} | "
             f"Send FAIL={kpi_counters.get('send_fail', 0)} | "
             f"Mode GPS={kpi_counters.get('mode_gps', 0)} | "
             f"Mode OF={kpi_counters.get('mode_of', 0)}"
         )
 
-    log.success("Sistem kapatıldı. Güle güle! 👋")
+    log.success("System shutdown complete")
 
 
 def _ask_choice(prompt: str, options: dict) -> str:
-    """
-    Kullanıcıdan geçerli bir seçim ister.
-
-    Args:
-        prompt: Kullanıcıya gösterilecek soru.
-        options: {tuş: açıklama} sözlüğü.
-
-    Returns:
-        Seçilen tuş (string).
-    """
     print()
     print(prompt)
     for key, desc in options.items():
@@ -582,47 +449,38 @@ def _ask_choice(prompt: str, options: dict) -> str:
     print()
 
     while True:
-        choice = input("  Seçiminiz: ").strip()
+        choice = input("  Selection: ").strip()
         if choice in options:
             return choice
-        print(f"  ⚠ Geçersiz seçim! Lütfen {', '.join(options.keys())} girin.")
+        print(f"  Invalid selection, choose one of: {', '.join(options.keys())}")
 
 
 def show_interactive_menu() -> dict:
-    """
-    Başlangıç menüsünü gösterir ve kullanıcı tercihlerini toplar.
+    print("\n" + "=" * 56)
+    print("  RUN MODE SELECTION")
+    print("=" * 56)
 
-    Returns:
-        Dict: mode, prefer_vid, show, save anahtarları.
-    """
-    print("\n" + "═" * 56)
-    print("  🎯  ÇALIŞMA MODU SEÇİMİ")
-    print("═" * 56)
-
-    # 1) Mod seçimi
     mode = _ask_choice(
-        "  Hangi modda çalıştırmak istiyorsunuz?",
+        "  Choose run mode:",
         {
-            "1": "🏆  Yarışma Modu (sunucu bağlantısı)",
-            "2": "🎬  Otonom Test — VID (sıralı kareler, Görev 2)",
-            "3": "📸  Otonom Test — DET (tekil fotoğraflar, Görev 1)",
+            "1": "Competition (server)",
+            "2": "Simulation VID (sequential frames)",
+            "3": "Simulation DET (single images)",
         },
     )
 
     if mode == "1":
         return {"mode": "competition", "prefer_vid": True, "show": False, "save": False}
 
-    prefer_vid = (mode == "2")
+    prefer_vid = mode == "2"
 
-    # 2) Görsel çıktı seçimi
-    print("\n" + "─" * 56)
     output = _ask_choice(
-        "  Sonuçları nasıl görmek istiyorsunuz?",
+        "  How do you want outputs?",
         {
-            "1": "📊  Sadece terminal çıktısı (en hızlı)",
-            "2": "🖥️   Canlı pencerede göster (cv2.imshow)",
-            "3": "💾  Kareleri diske kaydet (debug_output/)",
-            "4": "🖥️💾 Hem pencerede göster hem kaydet",
+            "1": "Terminal only",
+            "2": "Show window",
+            "3": "Save images",
+            "4": "Show window + Save images",
         },
     )
 
@@ -632,27 +490,64 @@ def show_interactive_menu() -> dict:
     return {"mode": "simulate", "prefer_vid": prefer_vid, "show": show, "save": save}
 
 
-# =============================================================================
-#  ANA GİRİŞ NOKTASI
-# =============================================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TEKNOFEST AIA Runtime")
+    parser.add_argument(
+        "--mode",
+        choices=["competition", "simulate_vid", "simulate_det"],
+        default="competition",
+        help="Run mode (default: competition)",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Enable interactive menu flow",
+    )
+    parser.add_argument(
+        "--deterministic-profile",
+        choices=["off", "balanced", "max"],
+        default="balanced",
+        help="Runtime determinism profile",
+    )
+    parser.add_argument("--show", action="store_true", help="Show simulation window")
+    parser.add_argument("--save", action="store_true", help="Save simulation images")
+    return parser.parse_args()
+
 
 def main() -> None:
-    """
-    Sistemin ana giriş noktası.
-
-    Kullanıcıya interaktif menü sunar — seçimlere göre
-    yarışma veya otonom test modu başlatılır.
-    """
     log = Logger("Main")
+    args = parse_args()
 
-    # Banner
+    apply_runtime_profile(args.deterministic_profile)
+
     print(BANNER)
 
-    # İnteraktif menü
-    choices = show_interactive_menu()
+    if args.interactive:
+        choices = show_interactive_menu()
+    else:
+        if args.mode == "competition":
+            choices = {
+                "mode": "competition",
+                "prefer_vid": True,
+                "show": False,
+                "save": False,
+            }
+        elif args.mode == "simulate_vid":
+            choices = {
+                "mode": "simulate",
+                "prefer_vid": True,
+                "show": args.show,
+                "save": args.save,
+            }
+        else:
+            choices = {
+                "mode": "simulate",
+                "prefer_vid": False,
+                "show": args.show,
+                "save": args.save,
+            }
 
-    # Sistem bilgisi
-    simulate = (choices["mode"] == "simulate")
+    simulate = choices["mode"] == "simulate"
     print_system_info(log, simulate=simulate)
 
     if simulate:
