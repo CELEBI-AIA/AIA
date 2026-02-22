@@ -122,52 +122,38 @@ mkdir -p models
 
 ## 💻 Kullanım
 
-### Simülasyon Modu (Test)
-
-Sunucu bağlantısı olmadan, yerel bir görüntü ile test:
+### Varsayılan (Yarışma Modu, Non-Interactive)
 
 ```bash
-# 1. Simülasyon görselini hazırla
-cp test_image.jpg sim_data/test_frame.jpg
-
-# 2. Simülasyon modunda çalıştır
 python main.py
 ```
 
-`config/settings.py` dosyasında `SIMULATION_MODE = True` olduğundan emin olun.
-
-### 🧪 Otonom Test Modu (VisDrone ile)
-
-VisDrone veri setini kullanarak tam sistem testi yapabilirsiniz (Sunucu gerektirmez):
+### CLI-First Modlar
 
 ```bash
-# Görev 2: Sıralı kareler (Odometri testi)
-# datasets/VisDrone2019-VID-val/ içinden rastgele bir sekans seçer
-python main.py --simulate
+# Yarışma modu
+python main.py --mode competition --deterministic-profile balanced
 
-# Görev 1: Tekil fotoğraflar (Nesne tespiti testi)
-# datasets/VisDrone2019-DET-train/ içinden rastgele 100 fotoğraf seçer
-python main.py --simulate det
+# Otonom test (VID)
+python main.py --mode simulate_vid --show
+
+# Otonom test (DET)
+python main.py --mode simulate_det --save
+
+# Eski menüyü kullanmak isterseniz
+python main.py --interactive
 ```
-*Not: Bu modda sonuçlar renkli olarak terminale basılır.*
 
-### Yarışma Modu
-
-```bash
-# 1. settings.py'yi güncelle
-#    SIMULATION_MODE = False
-#    SERVER_URL = "http://<yarışma-sunucu-ip>:5000"
-#    TEAM_NAME = "<takım-adınız>"
-
-# 2. Sistemi başlat
-python main.py
-```
+Desteklenen deterministik profiller:
+- `off`
+- `balanced` (önerilen, varsayılan)
+- `max`
 
 ### Çıktı Formatı (Sunucuya Gönderilen JSON)
 
 ```json
 {
-  "frame": "http://server/frame/123",
+  "frame": 123,
   "detected_objects": [
     {
       "cls": "0",
@@ -190,16 +176,20 @@ python main.py
 
 ---
 
+Not: Runtime gönderimi strict-minimal şema uygular; `movement_status` alanı sunucu payload'ına eklenmez.
+
 ## ⚙️ Yapılandırma
 
 Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak yönetilir:
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
-| `SIMULATION_MODE` | `True` | Test modu (sunucu bağlantısız) |
+| `SIMULATION_MODE` | `True` | Legacy simülasyon bayrağı (runtime CLI-first çalışır) |
 | `DEBUG` | `True` | Detaylı log + görsel çıktı |
-| `CONFIDENCE_THRESHOLD` | `0.25` | Minimum tespit güven eşiği |
+| `CONFIDENCE_THRESHOLD` | `0.20` | Minimum tespit güven eşiği |
 | `HALF_PRECISION` | `True` | FP16 hızlandırma (CUDA) |
+| `AUGMENTED_INFERENCE` | `False` | Deterministiklik için TTA kapalı |
+| `DETERMINISM_SEED` | `42` | Tekrarlanabilirlik için global seed |
 | `WARMUP_ITERATIONS` | `3` | Model ısınma tekrarı |
 | `MAX_FRAMES` | `2250` | Yarışma karesi limiti |
 
@@ -257,6 +247,10 @@ Sistem çıktılarının tekrarlanabilir olması için aşağıdaki kurallar zor
 5. **Frame-Index Tabanlı Karar Kuralları:**
    - Adaptasyonlar wall-clock süreye göre değil, frame index/pencere kuralına göre yapılmalıdır.
    - Bu yaklaşım farklı donanımlarda aynı karar davranışını korur.
+
+6. **Runtime Profil Kullanımı:**
+   - Yarışma için `--deterministic-profile balanced` önerilir.
+   - `balanced`: seed + deterministic backend + TTA kapalı, FP16 açık kalır.
 
 ---
 

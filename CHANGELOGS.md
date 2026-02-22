@@ -54,3 +54,13 @@
 
 ## 0.0.13 - 2026-02-22
 - Added `CODEBASE_STATE_REPORT.md` with a structured, timestamped technical audit of current architecture, implementation status, determinism profile, performance characteristics, and competition compliance risks.
+
+## 0.0.14 - 2026-02-22
+- Hardened competition networking with explicit frame fetch states (`OK`, `END_OF_STREAM`, `TRANSIENT_ERROR`, `FATAL_ERROR`) and updated loop behavior to avoid premature session termination on transient failures.
+- Fixed result submission retry behavior: non-200 responses no longer short-circuit retries; failures now retry up to `MAX_RETRIES` with clearer diagnostics.
+- Added strict-minimal payload builder in `src/network.py` and removed `movement_status` from outbound competition JSON; added per-frame bbox normalization/clamp and field/type validation before send.
+- Added deterministic runtime profiles via `src/runtime_profile.py` and wired startup bootstrap in `main.py` (`--deterministic-profile off|balanced|max`), with balanced defaults disabling TTA while keeping FP16 enabled.
+- Refactored startup flow to CLI-first execution (`--mode competition|simulate_vid|simulate_det`) with optional legacy menu via `--interactive`.
+- Strengthened JSON logging integrity in `src/utils.py` with safe filename sanitization, log retention pruning, and visible warning logs for write failures.
+- Pinned runtime dependencies in `requirements.txt` to fixed versions for reproducibility.
+- Updated README usage and configuration sections to document CLI-first startup, deterministic profiles, and strict payload behavior.
