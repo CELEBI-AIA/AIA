@@ -33,3 +33,6 @@
 - Added explicit memory cleanup in `src/movement.py` by clearing track history before stale track deletion.
 - Hardened incoming frame validation in `src/network.py` with defensive type sanitization for `gps_health`, `translation_*`, and `altitude` fields.
 - Added safe fallbacks for null/unknown/invalid telemetry values to improve runtime resilience under noisy server payloads.
+
+## 0.0.09 - 2026-02-22
+- Updated terminal banner year in `main.py` from 2025 to 2026 for consistency with project documentation.
