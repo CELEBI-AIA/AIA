@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Lint (syntax-focused)
+        run: |
+          # Block only for syntax/name errors
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Compile check
+        run: |
+          python -m compileall -q .

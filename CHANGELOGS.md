@@ -45,3 +45,9 @@
 ## 0.0.11 - 2026-02-22
 - Added end-of-session KPI counters in competition mode summary: `Send OK`, `Send FAIL`, `Mode GPS`, and `Mode OF`.
 - Wired competition loop to accumulate send-status and localization-mode totals without changing existing warning/error behavior.
+
+## 0.0.12 - 2026-02-22
+- Added GitHub Actions workflow at `.github/workflows/ci.yml` to run an automated quality gate on `push` and `pull_request` to `main`.
+- CI now performs syntax-focused `flake8` checks (`E9,F63,F7,F82`) to fail fast on parse/name-critical issues.
+- Added `python -m compileall -q .` compile pass to detect syntax regressions early without executing runtime code.
+- Kept pipeline dependency-light (no heavy ML package install) to reduce CI duration and avoid false negatives from GPU stack setup.
