@@ -36,3 +36,12 @@
 
 ## 0.0.09 - 2026-02-22
 - Updated terminal banner year in `main.py` from 2025 to 2026 for consistency with project documentation.
+
+## 0.0.10 - 2026-02-22
+- Added interval-based compact KPI result line in competition mode (`main.py`) for better operator visibility beyond warning/error logs.
+- Introduced `COMPETITION_RESULT_LOG_INTERVAL` setting (default: `10`) to control how often frame-level KPI lines are printed.
+- KPI output now includes frame id, object count, send status, GPS/OF mode, and x/y/z with safe fallbacks for missing telemetry.
+
+## 0.0.11 - 2026-02-22
+- Added end-of-session KPI counters in competition mode summary: `Send OK`, `Send FAIL`, `Mode GPS`, and `Mode OF`.
+- Wired competition loop to accumulate send-status and localization-mode totals without changing existing warning/error behavior.

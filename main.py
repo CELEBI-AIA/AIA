@@ -34,7 +34,7 @@ import signal
 import argparse
 import traceback
 from collections import Counter
-from typing import Optional
+from typing import Optional, Dict
 
 import cv2
 
@@ -365,6 +365,12 @@ def run_competition(log: Logger) -> None:
     # --- Döngü ---
     running = True
     consecutive_none_count = 0
+    kpi_counters: Dict[str, int] = {
+        "send_ok": 0,
+        "send_fail": 0,
+        "mode_gps": 0,
+        "mode_of": 0,
+    }
 
     def signal_handler(sig, frame):
         nonlocal running
@@ -425,9 +431,22 @@ def run_competition(log: Logger) -> None:
                 success = network.send_result(
                     frame_id, detected_objects, detected_translation
                 )
+                if success:
+                    kpi_counters["send_ok"] += 1
+                else:
+                    kpi_counters["send_fail"] += 1
 
                 if not success:
                     log.warn(f"Kare {frame_id}: Sonuç gönderilemedi!")
+
+                try:
+                    gps_health = int(float(frame_data.get("gps_health", 0)))
+                except (TypeError, ValueError):
+                    gps_health = 0
+                if gps_health == 1:
+                    kpi_counters["mode_gps"] += 1
+                else:
+                    kpi_counters["mode_of"] += 1
 
                 # ---- 6) DEBUG ÇIKTISI ----
                 if Settings.DEBUG and visualizer is not None:
@@ -440,7 +459,19 @@ def run_competition(log: Logger) -> None:
                 # ---- 7) FPS GÜNCELLE ----
                 fps_counter.tick()
 
-                # ---- 8) DÖNGÜ ARASI BEKLEME ----
+                # ---- 8) YARIŞMA KPI SATIRI (interval bazlı) ----
+                interval = max(1, int(Settings.COMPETITION_RESULT_LOG_INTERVAL))
+                if fps_counter.frame_count % interval == 0:
+                    _print_competition_result(
+                        log=log,
+                        frame_id=frame_id,
+                        detected_objects=detected_objects,
+                        success=success,
+                        frame_data=frame_data,
+                        position=position,
+                    )
+
+                # ---- 9) DÖNGÜ ARASI BEKLEME ----
                 if Settings.LOOP_DELAY > 0:
                     time.sleep(Settings.LOOP_DELAY)
 
@@ -461,14 +492,53 @@ def run_competition(log: Logger) -> None:
             cv2.destroyAllWindows()
             cv2.waitKey(1)
         
-        _print_summary(log, fps_counter)
+        _print_summary(log, fps_counter, kpi_counters=kpi_counters)
 
 
 # =============================================================================
 #  YARDIMCI FONKSİYONLAR
 # =============================================================================
 
-def _print_summary(log: Logger, fps_counter: FPSCounter) -> None:
+def _print_competition_result(
+    log: Logger,
+    frame_id,
+    detected_objects: list,
+    success: bool,
+    frame_data: dict,
+    position: dict,
+) -> None:
+    """Yarışma modu için tek satırlık kompakt KPI çıktısı basar."""
+    # gps_health eksik/bozuk olduğunda OF varsay
+    try:
+        gps_health = int(float(frame_data.get("gps_health", 0)))
+    except (TypeError, ValueError):
+        gps_health = 0
+    mode = "GPS" if gps_health == 1 else "OF"
+
+    # position alanları eksik/bozuk olduğunda 0.0 varsay
+    def _safe_float(val) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    x = _safe_float(position.get("x", 0.0))
+    y = _safe_float(position.get("y", 0.0))
+    z = _safe_float(position.get("z", 0.0))
+
+    send_status = "OK" if success else "FAIL"
+    log.info(
+        f"Frame: {frame_id} | Obj: {len(detected_objects)} | "
+        f"Send: {send_status} | Mode: {mode} | "
+        f"Pos: x={x:+.1f} y={y:+.1f} z={z:.1f}"
+    )
+
+
+def _print_summary(
+    log: Logger,
+    fps_counter: FPSCounter,
+    kpi_counters: Optional[Dict[str, int]] = None,
+) -> None:
     """Oturum sonunda özet bilgileri basar."""
     log.info("─" * 50)
     log.info(f"Toplam işlenen kare: {fps_counter.frame_count}")
@@ -481,6 +551,15 @@ def _print_summary(log: Logger, fps_counter: FPSCounter) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         log.info("GPU belleği temizlendi")
+
+    if kpi_counters is not None:
+        log.info(
+            "KPI Sayaçları: "
+            f"Send OK={kpi_counters.get('send_ok', 0)} | "
+            f"Send FAIL={kpi_counters.get('send_fail', 0)} | "
+            f"Mode GPS={kpi_counters.get('mode_gps', 0)} | "
+            f"Mode OF={kpi_counters.get('mode_of', 0)}"
+        )
 
     log.success("Sistem kapatıldı. Güle güle! 👋")
 

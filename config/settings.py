@@ -225,6 +225,8 @@ class Settings:
 
     # FPS Raporlama Aralığı (her N karede bir)
     FPS_REPORT_INTERVAL: int = 10
+    # Yarışma modunda kısa KPI sonuç satırı log aralığı (her N karede bir)
+    COMPETITION_RESULT_LOG_INTERVAL: int = 10
 
     # Ana Döngü Bekleme Süresi (saniye) - 0 = maksimum hız
     LOOP_DELAY: float = 0.0
