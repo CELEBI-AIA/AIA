@@ -64,3 +64,6 @@
 - Strengthened JSON logging integrity in `src/utils.py` with safe filename sanitization, log retention pruning, and visible warning logs for write failures.
 - Pinned runtime dependencies in `requirements.txt` to fixed versions for reproducibility.
 - Updated README usage and configuration sections to document CLI-first startup, deterministic profiles, and strict payload behavior.
+
+## 0.0.15 - 2026-02-22
+- Refreshed `CODEBASE_STATE_REPORT.md` to reflect latest runtime architecture updates, including determinism profiles, fetch-state based networking, strict-minimal payload behavior, pinned dependencies, and revised technical maturity/risk assessment.

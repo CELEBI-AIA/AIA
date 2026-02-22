@@ -1,232 +1,190 @@
 ==================================================
 PROJECT STATE REPORT
-Generated At: 2026-02-22 18:25:37 +03
+Generated At: 2026-02-22 18:37:52 +03
 ==================================================
 
 1) Project Identity
-- Project name (detectable): HavaciliktaYapayZeka (runtime module: `AIA`, training module: `AIA-training`).
-- Primary purpose: TEKNOFEST Havacilikta Yapay Zeka competition pipeline for (a) per-frame object detection + landing suitability output and (b) GPS-loss position estimation.
-- Competition/task alignment: Code targets TEKNOFEST Task-1 (object detection + landing status) and Task-2 (position estimation), with local simulation and server-loop execution paths.
-- Main problem it solves: Real-time frame-by-frame inference and result submission under offline competition constraints.
+- Project name (detectable): AIA (repository under `HavaciliktaYapayZeka/AIA`).
+- Primary purpose: TEKNOFEST competition runtime for per-frame object detection, landing suitability signaling, and position estimation under GPS degradation.
+- Competition/task alignment: Targets Task-1 (object classes + landing suitability) and Task-2 (position estimation) with server-connected competition mode and offline simulation modes.
+- Main problem it solves: Consumes ordered frames, runs local inference/estimation, and returns structured JSON results in a constrained offline-like environment.
 
 2) Repository Overview
 - Directory structure summary:
-  - `AIA/`: runtime/inference and competition loop.
-  - `AIA-training/`: model/data preparation and training pipelines.
-  - Root: orchestration-level metadata (`CHANGELOGS.md`) and now this state report.
-- Core modules (`AIA/src`):
-  - `detection.py`: YOLO inference, preprocessing, post-filtering, landing suitability decision.
-  - `movement.py`: lightweight vehicle movement status tracking.
-  - `localization.py`: hybrid GPS + optical-flow position estimation.
-  - `network.py`: frame retrieval, image download, result POST, retries, payload sanitation.
-  - `data_loader.py`: VisDrone-based local simulation iterator.
-  - `utils.py`: logging, debug visualization, JSON logging.
+  - `main.py`: runtime entry point and loop orchestration.
+  - `src/`: detection, localization, network, movement, runtime profile, utilities.
+  - `config/`: centralized settings + task3 params document.
+  - `requirements.txt`: now pinned dependency versions.
+  - `CODEBASE_STATE_REPORT.md`: current engineering state report.
+- Core modules:
+  - `src/detection.py`: YOLO-based detection, SAHI slicing, landing suitability rules.
+  - `src/movement.py`: centroid-history movement labeling (internal runtime use).
+  - `src/localization.py`: GPS + optical-flow hybrid odometry.
+  - `src/network.py`: fetch-state model, retries, payload building, bbox clamping.
+  - `src/runtime_profile.py`: determinism/runtime profile bootstrap.
+  - `src/utils.py`: logging, visualizer, JSON log persistence/rotation.
 - Entry points:
-  - `AIA/main.py`: main runtime launcher (interactive menu).
-  - `AIA-training/uav_training/train.py`: UAV detection training.
-  - `AIA-training/gps_training/train.py`: Siamese GPS-delta training.
+  - `main.py` (CLI-first): `--mode competition|simulate_vid|simulate_det`, optional `--interactive`.
 - Config files:
-  - `AIA/config/settings.py`: central runtime configuration.
-  - `AIA/config/task3_params.yaml`: task-3 thresholds (currently not consumed by runtime code).
-  - `AIA-training/uav_training/config.py` and `AIA-training/gps_training/config.py`: training configs.
+  - `config/settings.py` (single runtime config source).
+  - `config/task3_params.yaml` (threshold file, not integrated into active runtime flow).
 - Model files:
-  - Runtime expects `AIA/models/yolov8m.pt`.
-  - Training scripts default to Ultralytics checkpoints (`yolo11m.pt`) and save artifacts under `AIA-training/artifacts/...`.
+  - Runtime expects local `models/yolov8m.pt` path.
 - Utilities:
-  - Data audit/build scripts (`AIA-training/uav_training/audit.py`, `build_dataset.py`).
-  - GPS dataset audit (`AIA-training/gps_training/audit_gps.py`).
+  - `Visualizer`, sampled JSON logging, and bounded log-pruning in utility layer.
 
 3) System Architecture (Current Implementation)
 - Actual implemented architecture:
-  - Monolithic orchestrator (`main.py`) invoking modular components for network, detection, movement, localization, visualization.
-  - Synchronous pull-process-push loop in competition mode.
-  - Separate offline training stack not coupled at runtime.
+  - Single-process synchronous pipeline coordinated by `main.py`.
+  - Competition loop now uses explicit frame-fetch state machine (`OK`, `END_OF_STREAM`, `TRANSIENT_ERROR`, `FATAL_ERROR`).
 - Data flow from input to output:
-  1. `NetworkManager.get_frame()` pulls frame metadata.
-  2. `NetworkManager.download_image()` downloads/decode frame.
-  3. `ObjectDetector.detect()` runs preprocessing, inference (standard or SAHI), filtering, landing logic.
-  4. `MovementEstimator.annotate()` adds `movement_status` for vehicle detections.
-  5. `VisualOdometry.update()` computes current translation estimate.
-  6. `NetworkManager.send_result()` emits sanitized JSON payload.
+  1. Startup applies runtime profile via `apply_runtime_profile()`.
+  2. `NetworkManager.get_frame()` retrieves metadata with typed status.
+  3. `download_image()` obtains and decodes frame bytes.
+  4. `ObjectDetector.detect()` performs preprocess -> inference -> filtering -> landing-state assignment.
+  5. `MovementEstimator.annotate()` tags movement internally.
+  6. `VisualOdometry.update()` updates translation estimate.
+  7. `send_result()` builds strict-minimal payload and POSTs with retry.
 - Detection pipeline:
   - CLAHE + unsharp preprocessing.
-  - YOLO predict on full frame and optional tiled SAHI inference.
-  - Class-wise custom NMS + containment suppression.
-  - Min/max bbox and aspect-ratio filters.
-  - COCO-to-competition class remap.
+  - Full-frame + optional sliced inference (SAHI), then NMS/containment suppression.
+  - Post-filters for bbox size/aspect.
 - Tracking/motion logic:
-  - Center-point nearest-neighbor matching with distance gating.
-  - Fixed history window, missed-frame aging, displacement threshold for movement state.
+  - Per-vehicle center tracking with nearest-match gating and history displacement threshold.
 - Landing suitability logic:
-  - For UAP/UAI classes only: edge-touch rejection + obstacle overlap check (`intersection/landing_area`).
-  - Vehicles/humans set `landing_status = -1`.
+  - Vehicles/humans -> `-1`.
+  - UAP/UAI -> edge-touch and overlap-based suitability (`0` or `1`).
 - Position estimation logic:
-  - GPS healthy: trust telemetry (`translation_x/y/z`) directly.
-  - GPS unhealthy: Lucas-Kanade optical flow over Shi-Tomasi features; median pixel displacement -> meter conversion via focal length and altitude.
+  - GPS healthy: direct telemetry update.
+  - GPS unhealthy: Lucas-Kanade optical flow with feature refresh policy.
 - JSON output generation:
-  - Sends `frame`, `detected_objects` (without confidence), `detected_translations` list.
-  - Includes `movement_status` in each object.
+  - Strict-minimal payload builder enforces field types and clamps bboxes to frame bounds.
+  - Outbound payload intentionally excludes `movement_status`.
 - Server communication flow:
-  - Session check (`GET base_url`) -> repeated `GET /next_frame` + image download -> `POST /submit_result`.
-  - Retry with timeout and fixed delay.
+  - Session handshake -> frame loop -> robust transient/fatal handling -> bounded backoff on transient errors.
 
 4) Implemented Features (What Actually Exists)
-- Object detection:
-  - Implemented: YOLO inference, SAHI slicing option, post-filters, class remapping.
-  - Critical gap: current mapping logic cannot produce class `2`/`3` (UAP/UAI) from model outputs as coded.
+- Object detection: Implemented (YOLO + SAHI + post-filters).
 - Motion classification:
-  - Implemented for class `0` only via track history displacement.
-  - No temporal confidence model; binary threshold-based status.
-- Landing logic:
-  - Implemented algorithmically.
-  - Functionally blocked if UAP/UAI classes are never emitted.
-- Position estimation:
-  - Implemented hybrid GPS + optical flow.
-  - No camera intrinsics calibration loader; uses static focal fallback.
-- Tracking:
-  - Implemented lightweight tracker for movement labeling only.
-  - No persistent object IDs in output payload.
+  - Implemented internally for vehicle tracks.
+  - Not transmitted to server payload in current strict output contract.
+- Landing logic: Implemented in detector post-processing path.
+- Position estimation: Implemented (GPS + optical flow hybrid).
+- Tracking: Implemented lightweight tracker (movement-only concern).
 - Error handling:
-  - Broad try/except around module init and frame loop.
-  - Network and detection failures generally fail-soft.
+  - Improved in network layer via typed fetch states and transient budget handling.
+  - Broad exception guards remain in runtime loop.
 - Logging:
-  - Implemented console logger with levels and sampled JSON disk logging.
-- Config management:
-  - Runtime centralized in `settings.py`.
-  - Multiple hardcoded constants still present in modules (e.g., edge margin, ratio thresholds).
+  - Structured leveled logger.
+  - JSON logs with file-name sanitization and retention pruning (`LOG_MAX_FILES`).
+- Config management: Centralized in `settings.py`; runtime profile mutates selected settings at startup.
 - Determinism control:
-  - Partially implemented; no global seed policy in runtime.
+  - Newly implemented profile-based control (`off`, `balanced`, `max`).
+  - Seeds set for Python/NumPy/Torch; deterministic backend flags applied; TTA forced off in deterministic profiles.
 - Offline safeguards:
-  - Runtime model path is local-only and no cloud API calls are used.
-  - Network layer still allows arbitrary `BASE_URL`; no explicit enforcement that target is local/offline subnet.
+  - Local model loading and no cloud SDK dependencies in runtime path.
+  - No hard allowlist enforcing local-only host targets.
 
 Implementation status summary:
-- Fully implemented: synchronous runtime loop, network retries, core inference loop, optical-flow fallback, payload emission.
-- Partially implemented: movement classification robustness, determinism controls, compliance hardening.
-- Missing or effectively non-functional: reliable UAP/UAI production path in current class mapping logic.
+- Fully implemented: CLI-first startup, resilient fetch-state network loop, strict payload sanitation/clamp, deterministic profile bootstrap.
+- Partially implemented: comprehensive determinism (FP16 still on in balanced profile), explicit offline endpoint enforcement.
+- Missing/effectively constrained: explicit pipeline producing UAP/UAI classes remains dependent on model/class map capability (no dedicated UAP/UAI detector path).
 
 5) Determinism & Reproducibility Status
 - Seed usage:
-  - Runtime: no fixed seeds for Python/NumPy/Torch.
-  - DatasetLoader uses random sequence/image selection without deterministic seed.
+  - Implemented in `runtime_profile.py` (`PYTHONHASHSEED`, `random`, `numpy`, `torch`, `torch.cuda`).
 - Random components:
-  - Random selection in simulation datasets.
-  - Training data sampling/oversampling paths use random operations.
+  - Simulation dataset selection still uses randomness (seeded when deterministic profiles are active).
 - Multithreading risks:
-  - Runtime largely single-threaded, low race risk.
-  - Training dataloaders use multiple workers; order and timing can vary.
+  - Runtime mostly single-thread loop; CPU thread count now configurable (`DETERMINISM_CPU_THREADS`).
 - GPU nondeterminism risks:
-  - Runtime uses CUDA + FP16; potential non-deterministic kernels.
-  - GPS training explicitly enables `torch.backends.cudnn.benchmark = True`.
-  - UAV training config sets `deterministic=False`.
+  - `torch.use_deterministic_algorithms(True, warn_only=True)` and `cudnn.deterministic=True`, `benchmark=False` are set in deterministic profiles.
+  - Balanced profile keeps FP16 enabled, leaving residual numeric variance risk.
 - Order sensitivity risks:
-  - Tracking assignment and NMS depend on sorted candidate order and floating comparisons.
+  - NMS and candidate sorting remain floating-point/order sensitive in edge ties.
 - Floating point stability risks:
-  - FP16 inference and mixed precision training increase minor run-to-run drift.
-  - Repeated position integration in optical flow accumulates numeric error.
+  - Optical flow integration drift and FP16 rounding remain potential variation sources.
 
-Assessment: determinism is not controlled to competition-audit-grade standards.
+Assessment: determinism posture materially improved versus prior state, but not absolute in balanced profile.
 
 6) Performance Characteristics (Based on Code)
-- Frame processing structure:
-  - Strict serial chain (fetch -> decode -> detect -> movement -> localization -> submit).
-- Per-frame computation flow:
-  - High cost at detection stage, especially with SAHI tiled inference.
+- Frame processing structure: strict serial processing per frame.
+- Per-frame computation flow: detector dominates compute; SAHI magnifies cost by tiled passes.
 - Memory handling approach:
-  - Periodic `torch.cuda.empty_cache()` in runtime.
-  - Simulation image cache and optional frame cache in GPS dataset training.
+  - Periodic CUDA cache emptying in detection.
+  - Image caching in simulation path.
 - Potential bottlenecks:
-  - SAHI nested tile loop with per-tile model invocation.
-  - Synchronous HTTP/image operations block compute.
-  - Debug visualization and disk writes can degrade throughput.
+  - SAHI tile inference loops.
+  - Blocking HTTP and decode operations.
+  - Debug visualization and log I/O when enabled.
 - Blocking operations:
-  - All network I/O, image decode, and POST are blocking.
+  - All network calls remain synchronous.
 - I/O strategy:
-  - In-memory decode path is efficient.
-  - Sampled JSON logging mitigates but does not eliminate file I/O overhead.
+  - In-memory decode; sampled JSON logs; pruning avoids unbounded log growth.
 - Scalability risks:
-  - Architecture scales vertically only; no batching, pipelining, or async stages.
-  - 4K inputs + SAHI + high detection limits can collapse frame rate on weaker hardware.
+  - No async pipelining or batching.
+  - High-resolution + SAHI + constrained hardware can lower usable FPS.
 
 7) Competition Compliance Check
 - Class ID mapping correctness:
-  - Partial/incorrect at runtime level.
-  - Vehicle/human mapping exists, but UAP/UAI output path is not represented in the active mapping table; this is a competition-critical defect.
+  - Vehicle/human mappings present and active.
+  - UAP/UAI production remains unresolved at model mapping level in current detector implementation (no direct COCO mapping entries for cls 2/3).
 - Landing suitability rule correctness:
-  - Logic aligns with rule intent (edge exclusion + any overlap invalidates suitability).
-  - Effective only when UAP/UAI detections exist.
+  - Implemented logic matches stated rule semantics (edge completeness + overlap invalidation).
 - Motion classification logic correctness:
-  - Implemented for vehicles only; consistent with payload extension but rule source for this field is not clearly bound in provided spec excerpt.
+  - Implemented internally; currently not part of outbound payload by design.
 - JSON format compliance:
-  - Mostly compliant with expected structure (`frame`, object array, translation list).
-  - Optional fields (`id`, `user`) from spec excerpt are not sent.
+  - Strict-minimal payload shape is enforced consistently.
+  - Field set now narrower than previous extended payloads (intentional simplification).
 - Offline compliance (internet usage detection):
-  - No explicit external internet calls in runtime code.
-  - No built-in guard preventing accidental public endpoints in `BASE_URL`.
+  - No external APIs in code path.
+  - No runtime guard that rejects non-local internet base URLs.
 - Hardcoded assumptions:
-  - Static focal length, default altitude fallback, fixed edge margin, and fixed thresholds.
-  - Assumed telemetry key names (`translation_*`, `gps_health`).
+  - Static focal length fallback and threshold constants remain.
 
 8) Code Quality Assessment
-- Modularity:
-  - Good module split in runtime (`detection`, `network`, `localization`, `movement`, `utils`).
-- Separation of concerns:
-  - Generally good, but `main.py` is large and contains orchestration + UX/menu + KPI formatting.
-- Config centralization:
-  - Strong central config usage in runtime.
-  - Some constants remain embedded in methods.
-- Magic numbers:
-  - Present in multiple places (e.g., edge margin 5, min tracked points 10/5, aspect ratio 6.0).
-- Dependency hygiene:
-  - Reasonable direct dependencies; no lockfile pinning for strict reproducibility.
-- Readability:
-  - High inline documentation and clear method naming.
+- Modularity: Good separation across runtime modules.
+- Separation of concerns: Improved after adding `runtime_profile.py` and stricter `network.py` responsibilities.
+- Config centralization: Strong; most runtime knobs in `settings.py`.
+- Magic numbers: Still present in detection/localization thresholds and margins.
+- Dependency hygiene: Improved via pinned `requirements.txt`.
+- Readability: High; descriptive naming and substantial inline documentation.
 - Technical debt zones:
-  - Runtime/docs mismatch (README shows argparse usage; code uses interactive menu).
-  - Dead configuration (`task3_params.yaml`) not integrated.
-  - Training and runtime conventions diverge (YOLO versions, naming, determinism posture).
+  - README and implementation can still drift (historical evidence).
+  - Task-3 param file remains documented but not wired into runtime execution.
 
 9) Risk Zones
 - Architectural risks:
-  - Single-thread serial pipeline vulnerable to latency spikes.
-  - Heavy dependence on one detector path for all downstream decisions.
+  - Serial pipeline cannot mask network latency or inference jitter.
 - Runtime risks:
-  - Broad exception handling can mask recurring data-quality failures.
-  - Potential silent degradation when detections return empty list.
+  - Broad exception swallowing may reduce failure visibility under recurring bad inputs.
 - Performance risks:
-  - SAHI on high-resolution frames may exceed practical per-frame budget.
-  - Debug I/O can block real-time behavior if enabled during competition.
+  - SAHI + high image size can exceed practical competition throughput margins.
 - Determinism risks:
-  - No seeded runtime, mixed precision, and non-deterministic CUDA settings.
+  - Balanced profile still allows FP16-induced minor variation.
 - Competition failure risks:
-  - Inability to emit UAP/UAI classes from current mapping logic.
-  - Possible mismatch with required payload fields depending on final server contract.
+  - If UAP/UAI classes are not generated by model/mapping, landing scoring capability remains structurally limited.
 
 10) Missing Components
 - To be production-ready:
-  - Structured health metrics/export (latency percentiles, failure categories).
-  - Strong validation contracts and schema checks for inbound/outbound JSON.
-  - Automated tests for core logic (class mapping, landing decisions, odometry transitions).
-  - Asynchronous/pipelined architecture for predictable throughput.
+  - Automated integration tests for fetch states, payload schema, bbox clamp, and odometry transitions.
+  - Runtime observability metrics (latency histograms, per-stage timings, error cardinality).
 - To be competition-ready:
-  - Correct and verified UAP/UAI detection/class mapping path.
-  - End-to-end contract tests against official competition server emulator.
-  - Deterministic run profile and controlled fallback behaviors.
-  - Explicit offline guardrails (endpoint allowlist/local subnet enforcement).
+  - Verified end-to-end UAP/UAI class output path on target competition datasets/videos.
+  - Contract test harness against official server behavior and payload acceptance edge cases.
+  - Optional endpoint policy guard for offline-only host targets.
 - To be research-grade:
-  - Reproducible experiment management (fixed seeds, env capture, versioned datasets).
-  - Quantitative benchmarking suite (accuracy, drift, robustness under perturbations).
-  - Ablation studies for SAHI, preprocessing, and motion thresholds.
+  - Formal reproducibility manifest (exact CUDA/cuDNN/driver/runtime hashes) and benchmark suite.
 
 11) Technical Maturity Score
-- Architecture maturity: 6/10
-- Determinism safety: 3/10
-- Performance optimization: 6/10
-- Competition robustness: 4/10
-- Maintainability: 7/10
+- Architecture maturity: 7/10
+- Determinism safety: 6/10
+- Performance optimization: 7/10
+- Competition robustness: 5/10
+- Maintainability: 8/10
 
 12) Summary Verdict
-- Stability: Moderately stable under expected happy-path runtime conditions.
-- Fragility: Fragile under compliance-critical scenarios and edge-case data quality.
-- Competition readiness: Not competition-ready in current state.
-- Biggest weakness: Competition-critical class output alignment (UAP/UAI path) is not operationally guaranteed by implemented mapping logic; this undermines landing-status functionality and scoring potential.
+- Is this system stable? Moderately stable for controlled runs; improved resilience under transient network failures.
+- Is it fragile? Less fragile than previous revision, but still sensitive to detector/model capability limits and synchronous bottlenecks.
+- Is it competition-ready? Partially; core loop quality improved, but class-output completeness for UAP/UAI remains the decisive risk.
+- Biggest weakness: Competition-critical detection coverage mismatch risk (especially UAP/UAI output path), which directly impacts landing suitability scoring potential.
