@@ -155,11 +155,14 @@ Desteklenen deterministik profiller:
 
 ```json
 {
-  "frame": 123,
+  "id": 123,
+  "user": "Takim_ID",
+  "frame": "/api/frames/123",
   "detected_objects": [
     {
       "cls": "0",
       "landing_status": "-1",
+      "motion_status": "1",
       "top_left_x": 150,
       "top_left_y": 200,
       "bottom_right_x": 400,
@@ -172,13 +175,14 @@ Desteklenen deterministik profiller:
       "translation_y": -0.43,
       "translation_z": 0.0
     }
-  ]
+  ],
+  "detected_undefined_objects": []
 }
 ```
 
 ---
 
-Not: Runtime gönderimi strict-minimal şema uygular; `movement_status` alanı sunucu payload'ına eklenmez.
+Not: Runtime, taslak şartnameyle uyumlu geniş şema gönderir. Hareket alanı sunucuda `motion_status` adıyla iletilir.
 
 ## ⚙️ Yapılandırma
 

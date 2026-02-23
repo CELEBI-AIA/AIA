@@ -67,3 +67,28 @@
 
 ## 0.0.15 - 2026-02-22
 - Refreshed `CODEBASE_STATE_REPORT.md` to reflect latest runtime architecture updates, including determinism profiles, fetch-state based networking, strict-minimal payload behavior, pinned dependencies, and revised technical maturity/risk assessment.
+
+## 0.0.16 - 2026-02-23
+- Added a formal specification compliance report at `AIA/sartname/UYUMLULUK_RAPORU_2026-02-23.md` by cross-checking `teknofest_context.md` and TEKNOFEST 2026 technical specification PDF (V1.0, 21.02.2026).
+- Documented itemized compliance status (`Uyumlu/Kısmi Uyum/Uyumsuz`), prioritized risks (P0/P1/P2), and concrete closure actions for Task-3, payload schema alignment, motion status naming, and offline policy guard.
+
+## 0.0.17 - 2026-02-23
+- Removed `AIA/sartname/UYUMLULUK_RAPORU_2026-02-23.md` on user request and switched compliance reporting to inline chat delivery.
+
+## 0.0.18 - 2026-02-23
+- Updated outbound result payload in `src/network.py` from strict-minimal to a specification-aligned schema including top-level `id`, `user`, `frame`, `detected_objects`, `detected_translations`, and `detected_undefined_objects`.
+- Added per-object `motion_status` field (mapped from internal `movement_status` with safe fallback `-1`) to align Task-1 movement reporting with şartname terminology.
+- Passed live frame metadata from `main.py` to payload builder so `id/user/frame` can be populated from server-provided fields when available.
+- Updated `README.md` JSON example and notes to reflect the expanded payload schema.
+
+## 0.0.19 - 2026-02-23
+- Synced `CODEBASE_STATE_REPORT.md` with the current outbound JSON contract so documentation now matches runtime behavior (`id`, `user`, `frame`, per-object `motion_status`, and `detected_undefined_objects`).
+- Removed stale strict-minimal payload statements from the live state report to keep codebase-wide JSON schema references consistent.
+
+## 0.0.20 - 2026-02-23
+- Closed `movement_status` vs `motion_status` integration risk by dual-writing motion labels in `src/movement.py` and accepting both keys in `src/network.py` payload serialization.
+- Kept outbound API field name as `motion_status` while preserving backward compatibility for internal consumers still using `movement_status`.
+
+## 0.0.21 - 2026-02-23
+- Aligned frame metadata handling with TEKNOFEST technical-spec field names in `src/network.py` by normalizing `frame_id` from `frame_id/id/url/frame`, `frame_url` from `image_url`, and `gps_health` from `gps_health_status`.
+- Updated simulation frame metadata to include specification-style keys (`id`, `url`, `image_url`, `session`, `gps_health_status`) while preserving existing internal compatibility keys.

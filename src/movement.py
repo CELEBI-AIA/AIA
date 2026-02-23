@@ -36,6 +36,7 @@ class MovementEstimator:
                 vehicles.append((idx, det))
             else:
                 det["movement_status"] = "-1"
+                det["motion_status"] = "-1"
 
         if not vehicles:
             self._age_tracks(set())
@@ -53,7 +54,9 @@ class MovementEstimator:
             track = self._tracks[track_id]
             track.history.append(centers[idx])
             track.missed = 0
-            det["movement_status"] = self._status(track.history)
+            status = self._status(track.history)
+            det["movement_status"] = status
+            det["motion_status"] = status
 
         return detections
 

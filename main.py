@@ -320,6 +320,7 @@ def run_competition(log: Logger) -> None:
                     frame_id,
                     detected_objects,
                     detected_translation,
+                    frame_data=frame_data,
                     frame_shape=frame.shape,
                 )
 

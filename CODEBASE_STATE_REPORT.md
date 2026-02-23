@@ -44,7 +44,7 @@ Generated At: 2026-02-22 18:37:52 +03
   4. `ObjectDetector.detect()` performs preprocess -> inference -> filtering -> landing-state assignment.
   5. `MovementEstimator.annotate()` tags movement internally.
   6. `VisualOdometry.update()` updates translation estimate.
-  7. `send_result()` builds strict-minimal payload and POSTs with retry.
+  7. `send_result()` builds specification-aligned payload and POSTs with retry.
 - Detection pipeline:
   - CLAHE + unsharp preprocessing.
   - Full-frame + optional sliced inference (SAHI), then NMS/containment suppression.
@@ -58,8 +58,8 @@ Generated At: 2026-02-22 18:37:52 +03
   - GPS healthy: direct telemetry update.
   - GPS unhealthy: Lucas-Kanade optical flow with feature refresh policy.
 - JSON output generation:
-  - Strict-minimal payload builder enforces field types and clamps bboxes to frame bounds.
-  - Outbound payload intentionally excludes `movement_status`.
+  - Payload builder enforces field types and clamps bboxes to frame bounds.
+  - Outbound payload includes top-level `id`, `user`, `frame`, per-object `motion_status`, and `detected_undefined_objects`.
 - Server communication flow:
   - Session handshake -> frame loop -> robust transient/fatal handling -> bounded backoff on transient errors.
 
@@ -67,7 +67,7 @@ Generated At: 2026-02-22 18:37:52 +03
 - Object detection: Implemented (YOLO + SAHI + post-filters).
 - Motion classification:
   - Implemented internally for vehicle tracks.
-  - Not transmitted to server payload in current strict output contract.
+  - Transmitted to server payload as per-object `motion_status` (`-1/0/1`).
 - Landing logic: Implemented in detector post-processing path.
 - Position estimation: Implemented (GPS + optical flow hybrid).
 - Tracking: Implemented lightweight tracker (movement-only concern).
@@ -86,7 +86,7 @@ Generated At: 2026-02-22 18:37:52 +03
   - No hard allowlist enforcing local-only host targets.
 
 Implementation status summary:
-- Fully implemented: CLI-first startup, resilient fetch-state network loop, strict payload sanitation/clamp, deterministic profile bootstrap.
+- Fully implemented: CLI-first startup, resilient fetch-state network loop, specification-aligned payload sanitation/clamp, deterministic profile bootstrap.
 - Partially implemented: comprehensive determinism (FP16 still on in balanced profile), explicit offline endpoint enforcement.
 - Missing/effectively constrained: explicit pipeline producing UAP/UAI classes remains dependent on model/class map capability (no dedicated UAP/UAI detector path).
 
@@ -134,8 +134,8 @@ Assessment: determinism posture materially improved versus prior state, but not 
 - Motion classification logic correctness:
   - Implemented internally; currently not part of outbound payload by design.
 - JSON format compliance:
-  - Strict-minimal payload shape is enforced consistently.
-  - Field set now narrower than previous extended payloads (intentional simplification).
+  - Specification-aligned payload shape is enforced consistently (`id/user/frame/detected_objects/detected_translations/detected_undefined_objects`).
+  - Per-object movement signal is emitted as `motion_status`.
 - Offline compliance (internet usage detection):
   - No external APIs in code path.
   - No runtime guard that rejects non-local internet base URLs.

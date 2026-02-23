@@ -207,13 +207,15 @@ class NetworkManager:
         frame_id: Any,
         detected_objects: List[Dict],
         detected_translation: Dict[str, float],
+        frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
     ) -> bool:
-        """Tespit ve konum sonuçlarını strict-minimal JSON ile gönderir."""
+        """Tespit ve konum sonuçlarını TEKNOFEST taslak şemasına uyumlu JSON ile gönderir."""
         payload = self.build_competition_payload(
             frame_id=frame_id,
             detected_objects=detected_objects,
             detected_translation=detected_translation,
+            frame_data=frame_data,
             frame_shape=frame_shape,
         )
 
@@ -266,9 +268,11 @@ class NetworkManager:
         frame_id: Any,
         detected_objects: List[Dict],
         detected_translation: Dict[str, float],
+        frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
     ) -> Dict[str, Any]:
-        """Strict-minimal TEKNOFEST payload builder with type safety and bbox clamp."""
+        """TEKNOFEST taslak şemasına uyumlu payload builder."""
+        frame_data = frame_data or {}
         frame_h = frame_w = None
         if frame_shape and len(frame_shape) >= 2:
             frame_h = int(frame_shape[0])
@@ -278,10 +282,13 @@ class NetworkManager:
         for obj in detected_objects:
             cls = str(obj.get("cls", ""))
             landing = str(obj.get("landing_status", "-1"))
+            motion = str(obj.get("motion_status", obj.get("movement_status", "-1")))
             if cls not in {"0", "1", "2", "3"}:
                 continue
             if landing not in {"-1", "0", "1"}:
                 landing = "-1"
+            if motion not in {"-1", "0", "1"}:
+                motion = "-1"
 
             x1 = NetworkManager._safe_int(obj.get("top_left_x", 0))
             y1 = NetworkManager._safe_int(obj.get("top_left_y", 0))
@@ -297,6 +304,7 @@ class NetworkManager:
                 {
                     "cls": cls,
                     "landing_status": landing,
+                    "motion_status": motion,
                     "top_left_x": x1,
                     "top_left_y": y1,
                     "bottom_right_x": x2,
@@ -308,8 +316,14 @@ class NetworkManager:
         ty = NetworkManager._safe_float(detected_translation.get("translation_y", 0.0))
         tz = NetworkManager._safe_float(detected_translation.get("translation_z", 0.0))
 
+        payload_id = frame_data.get("id", frame_id)
+        payload_user = frame_data.get("user", Settings.TEAM_NAME)
+        payload_frame = frame_data.get("url", frame_data.get("frame", frame_id))
+
         return {
-            "frame": frame_id,
+            "id": payload_id,
+            "user": payload_user,
+            "frame": payload_frame,
             "detected_objects": clean_objects,
             "detected_translations": [
                 {
@@ -318,18 +332,24 @@ class NetworkManager:
                     "translation_z": tz,
                 }
             ],
+            "detected_undefined_objects": [],
         }
 
     def _get_simulation_frame(self) -> Dict[str, Any]:
         frame_id = self._frame_counter
         self._frame_counter += 1
         return {
+            "id": frame_id,
+            "url": f"/simulation/frames/{frame_id}",
+            "image_url": Settings.SIMULATION_IMAGE_PATH,
+            "session": "/simulation/session/1",
             "frame_url": Settings.SIMULATION_IMAGE_PATH,
             "frame_id": frame_id,
             "video_name": "simulation_video",
             "translation_x": 0.0,
             "translation_y": 0.0,
             "translation_z": 50.0,
+            "gps_health_status": 1,
             "gps_health": 1,
         }
 
@@ -352,11 +372,30 @@ class NetworkManager:
             self.log.warn("Frame metadata is not dict")
             return False
 
-        if "frame_id" not in data or data["frame_id"] is None:
-            self.log.warn("Missing required field: frame_id")
-            return False
+        # Şartname taslak alanları: id, url, image_url, ... + yarışma günü değişebilecek varyasyonlar.
+        # Uyum için frame_id'yi ortak dahili anahtar olarak normalize ediyoruz.
+        frame_id = data.get("frame_id")
+        if frame_id is None:
+            frame_id = data.get("id")
+        if frame_id is None:
+            frame_id = data.get("url")
+        if frame_id is None:
+            frame_id = data.get("frame")
 
-        health_val = data.get("gps_health", 0)
+        if frame_id is None:
+            self.log.warn("Missing required frame identifier (frame_id/id/url/frame)")
+            return False
+        data["frame_id"] = frame_id
+
+        # Görsel URL alanlarını normalize et
+        if not data.get("frame_url") and data.get("image_url"):
+            data["frame_url"] = data.get("image_url")
+        if not data.get("image_url") and data.get("frame_url"):
+            data["image_url"] = data.get("frame_url")
+
+        health_val = data.get("gps_health")
+        if health_val is None:
+            health_val = data.get("gps_health_status", 0)
         try:
             if health_val is None or str(health_val).strip().lower() in {
                 "unknown",
@@ -370,6 +409,7 @@ class NetworkManager:
         except (ValueError, TypeError):
             self.log.warn(f"Corrupt gps_health value: {health_val!r}, forcing 0")
             data["gps_health"] = 0
+        data["gps_health_status"] = data["gps_health"]
 
         for key in ["translation_x", "translation_y", "translation_z", "altitude"]:
             if key in data:
