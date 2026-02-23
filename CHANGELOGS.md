@@ -92,3 +92,18 @@
 ## 0.0.21 - 2026-02-23
 - Aligned frame metadata handling with TEKNOFEST technical-spec field names in `src/network.py` by normalizing `frame_id` from `frame_id/id/url/frame`, `frame_url` from `image_url`, and `gps_health` from `gps_health_status`.
 - Updated simulation frame metadata to include specification-style keys (`id`, `url`, `image_url`, `session`, `gps_health_status`) while preserving existing internal compatibility keys.
+
+## 0.0.22 - 2026-02-23
+- Refreshed `CODEBASE_STATE_REPORT.md` generation timestamp to match the latest codebase scan.
+- Fixed stale compliance wording in state report: motion classification is now documented as outbound via per-object `motion_status`.
+- Updated state report test/risk posture to reflect current reality: existing motion-compensation unit tests are acknowledged while broader integration coverage remains pending.
+
+## 0.0.22 - 2026-02-23
+- Implemented camera-motion compensation in `src/movement.py` using global median optical flow and cumulative camera-shift subtraction for `motion_status` stability under panning motion.
+- Extended `MovementEstimator.annotate` signature to `annotate(detections, frame=None)` with backward-compatible fallback when frame is omitted.
+- Integrated motion compensation into both simulation and competition loops by passing `frame` from `main.py`.
+- Added rider suppression in `src/detection.py` to remove `person` detections overlapping with two-wheeler vehicles (bicycle/motorcycle/motor) based on overlap or IoU thresholds.
+- Preserved source class lineage via `source_cls_id` in detection parsing to support two-wheeler-specific suppression decisions.
+- Added configuration controls in `config/settings.py` for motion compensation and rider suppression thresholds/flags.
+- Updated `README.md` with new configuration tables, motion-comp behavior, and scooter approximation note.
+- Added lightweight unit tests in `tests/test_movement_compensation.py` and `tests/test_rider_suppression.py` covering planned motion and rider suppression scenarios with dependency-aware skips.
