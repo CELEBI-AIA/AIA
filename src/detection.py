@@ -70,7 +70,7 @@ class ObjectDetector:
             if not os.path.exists(Settings.MODEL_PATH):
                 raise FileNotFoundError(
                     f"Model dosyası bulunamadı: {Settings.MODEL_PATH}\n"
-                    f"  → 'models/' dizinine yolov8n.pt dosyasını kopyalayın."
+                    f"  → 'models/' dizinine {os.path.basename(Settings.MODEL_PATH)} dosyasını kopyalayın."
                 )
             self.model = YOLO(Settings.MODEL_PATH)
             self.model.to(self.device)

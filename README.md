@@ -43,31 +43,33 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 ## 🏗️ Mimari
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    main.py                          │
-│              (Ana Orkestrasyon)                      │
-│   FPS sayacı • Graceful shutdown • Hata yönetimi    │
-└────────────┬────────────┬────────────┬──────────────┘
-             │            │            │
-     ┌───────▼──────┐  ┌──▼──────┐  ┌─▼─────────────┐
-     │  network.py  │  │detection│  │ localization   │
-     │              │  │  .py    │  │    .py         │
-     │ HTTP istek   │  │ YOLOv8  │  │ GPS + Optik   │
-     │ Retry logic  │  │ FP16    │  │ Akış hibrit   │
-     │ Simülasyon   │  │ İniş    │  │ Lucas-Kanade  │
-     │ JSON log     │  │ durumu  │  │ Odometri      │
-     └──────┬───────┘  └────┬────┘  └───────┬───────┘
-            │               │               │
-     ┌──────▼───────────────▼───────────────▼───────┐
-     │              config/settings.py               │
-     │   Merkezi yapılandırma • Sınıf eşleştirme    │
-     │   Kamera parametreleri • Ağ ayarları          │
-     └──────────────────┬───────────────────────────┘
-                        │
-     ┌──────────────────▼───────────────────────────┐
-     │              src/utils.py                     │
-     │   Renkli Logger • Visualizer • JSON log      │
-     └──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         main.py                                      │
+│  FPS sayacı • Graceful shutdown • Hata yönetimi                       │
+│  Bootstrap: runtime_profile.py | Sim: data_loader.py                 │
+└────┬────────────┬────────────┬────────────┬──────────────────────────┘
+     │            │            │            │
+┌────▼────┐  ┌────▼────┐  ┌────▼────┐  ┌────▼────────────┐
+│network │  │detection│  │movement │  │ localization     │
+│  .py   │  │  .py    │  │  .py    │  │    .py           │
+│ HTTP   │  │ YOLOv8  │  │ Temporal│  │ GPS + Optik      │
+│ Retry  │  │ FP16    │  │ karar   │  │ Akış hibrit     │
+│ JSON   │  │ İniş    │  │ movement│  │ Lucas-Kanade     │
+│ log    │  │ durumu  │  │ status  │  │ Odometri         │
+└────┬───┘  └────┬────┘  └────┬────┘  └────────┬────────┘
+     │           │             │                 │
+     └───────────┴─────────────┴─────────────────┘
+                          │
+     ┌────────────────────▼─────────────────────────────┐
+     │              config/settings.py                    │
+     │   Merkezi yapılandırma • Sınıf eşleştirme          │
+     │   Kamera parametreleri • Ağ ayarları               │
+     └────────────────────┬──────────────────────────────┘
+                          │
+     ┌────────────────────▼──────────────────────────────┐
+     │              src/utils.py                          │
+     │   Renkli Logger • Visualizer • JSON log            │
+     └───────────────────────────────────────────────────┘
 ```
 
 ---
@@ -76,7 +78,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 
 | Özellik | Detay |
 |---------|-------|
-| **Model** | YOLOv8n (Ultralytics) — COCO → TEKNOFEST sınıf eşleştirmesi |
+| **Model** | YOLOv8m (Ultralytics) — COCO → TEKNOFEST sınıf eşleştirmesi |
 | **Hız** | FP16 half-precision + model warmup → **~33 FPS** (RTX 3060) |
 | **İniş Tespiti** | Intersection-over-area + kenar temas kontrolü |
 | **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış |
@@ -113,9 +115,9 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 
 # 5. Model dosyasını indir (eğer yoksa)
-# YOLOv8n modeli models/ dizinine yerleştirilmeli
+# YOLOv8m modeli models/ dizinine yerleştirilmeli
 mkdir -p models
-# https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt
+# https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8m.pt
 ```
 
 ---
@@ -182,16 +184,67 @@ Not: Runtime gönderimi strict-minimal şema uygular; `movement_status` alanı s
 
 Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak yönetilir:
 
+### Genel / Çalışma Modları
+
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
 | `SIMULATION_MODE` | `True` | Legacy simülasyon bayrağı (runtime CLI-first çalışır) |
 | `DEBUG` | `True` | Detaylı log + görsel çıktı |
-| `CONFIDENCE_THRESHOLD` | `0.20` | Minimum tespit güven eşiği |
-| `HALF_PRECISION` | `True` | FP16 hızlandırma (CUDA) |
-| `AUGMENTED_INFERENCE` | `False` | Deterministiklik için TTA kapalı |
-| `DETERMINISM_SEED` | `42` | Tekrarlanabilirlik için global seed |
-| `WARMUP_ITERATIONS` | `3` | Model ısınma tekrarı |
 | `MAX_FRAMES` | `2250` | Yarışma karesi limiti |
+
+### Model Ayarları
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `CONFIDENCE_THRESHOLD` | `0.20` | Minimum tespit güven eşiği |
+| `NMS_IOU_THRESHOLD` | `0.35` | NMS IoU eşiği (çift tespit bastırma) |
+| `INFERENCE_SIZE` | `1280` | Inference çözünürlüğü (piksel) |
+| `HALF_PRECISION` | `True` | FP16 hızlandırma (CUDA) |
+| `AGNOSTIC_NMS` | `True` | Sınıflar arası NMS (farklı sınıf çakışmalarını bastırır) |
+| `MAX_DETECTIONS` | `300` | Maksimum tespit sayısı (SAHI ile artar) |
+| `AUGMENTED_INFERENCE` | `False` | TTA — deterministiklik için kapalı |
+| `WARMUP_ITERATIONS` | `3` | Model ısınma tekrarı |
+
+### CLAHE (Ön-İşleme)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `CLAHE_ENABLED` | `True` | Kontrast iyileştirme (karanlık bölgeler) |
+| `CLAHE_CLIP_LIMIT` | `2.0` | CLAHE kontrast sınırı |
+| `CLAHE_TILE_SIZE` | `8` | CLAHE tile boyutu (piksel) |
+
+### SAHI (Slicing Aided Hyper Inference)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `SAHI_ENABLED` | `True` | Parçalı inference (küçük nesneler için) |
+| `SAHI_SLICE_SIZE` | `640` | Parça boyutu (piksel) |
+| `SAHI_OVERLAP_RATIO` | `0.35` | Parçalar arası örtüşme oranı |
+| `SAHI_MERGE_IOU` | `0.35` | Birleştirme NMS IoU eşiği |
+
+### Bbox Filtreleri
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `MIN_BBOX_SIZE` | `10` | Minimum bbox boyutu (px) — altındakiler elenir |
+| `MAX_BBOX_SIZE` | `300` | Maksimum bbox boyutu (px) — bina/çatı filtreleme |
+
+### Movement (Temporal Karar — Görev 1)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `MOVEMENT_WINDOW_FRAMES` | `24` | Temporal pencere boyutu |
+| `MOVEMENT_MIN_HISTORY` | `6` | Karar için minimum geçmiş frame sayısı |
+| `MOVEMENT_THRESHOLD_PX` | `12.0` | Hareket eşiği (piksel) |
+| `MOVEMENT_MATCH_DISTANCE_PX` | `80.0` | Frame arası bbox eşleştirme mesafesi |
+| `MOVEMENT_MAX_MISSED_FRAMES` | `8` | Takip kaybı toleransı |
+
+### Deterministiklik
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `DETERMINISM_SEED` | `42` | Tekrarlanabilirlik için global seed |
+| `DETERMINISM_CPU_THREADS` | `1` | CPU thread sabitleme |
 
 ---
 
@@ -271,12 +324,15 @@ HavaciliktaYZ/
 ├── src/
 │   ├── __init__.py
 │   ├── detection.py        # YOLOv8 nesne tespiti + iniş durumu
-│   ├── network.py          # Sunucu iletişimi + retry + simülasyon
-│   ├── localization.py     # GPS + optik akış pozisyon kestirimi
-│   └── utils.py            # Logger, Visualizer, yardımcı araçlar
+│   ├── movement.py        # Temporal karar mantığı (movement_status)
+│   ├── data_loader.py     # Simülasyon veri yükleme (VID/DET)
+│   ├── runtime_profile.py # Deterministik profil uygulaması
+│   ├── network.py         # Sunucu iletişimi + retry + simülasyon
+│   ├── localization.py    # GPS + optik akış pozisyon kestirimi
+│   └── utils.py           # Logger, Visualizer, yardımcı araçlar
 │
 ├── models/
-│   └── yolov8n.pt          # YOLOv8 nano modeli (Git'e dahil değil)
+│   └── yolov8m.pt          # YOLOv8 medium modeli (Git'e dahil değil)
 │
 ├── sim_data/
 │   └── test_frame.jpg      # Simülasyon test görseli
