@@ -17,6 +17,7 @@ Kullanım:
 """
 
 import os
+import unicodedata
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
@@ -33,7 +34,7 @@ class ObjectDetector:
     """
     YOLOv8 tabanlı nesne tespit sınıfı.
 
-    CUDA üzerinde çalışır, COCO sınıflarını TEKNOFEST sınıflarına dönüştürür
+    CUDA üzerinde çalışır, model sınıflarını TEKNOFEST sınıflarına dönüştürür
     ve UAP/UAİ alanları için İniş Uygunluğu hesabı yapar.
 
     Attributes:
@@ -53,6 +54,8 @@ class ObjectDetector:
         self.log = Logger("Detector")
         self._frame_count: int = 0
         self._use_half: bool = False
+        self._class_map_mode: str = "unknown"
+        self._model_class_map: Dict[int, int] = {}
 
         # Cihaz Seçimi
         if Settings.DEVICE == "cuda" and torch.cuda.is_available():
@@ -74,6 +77,7 @@ class ObjectDetector:
                 )
             self.model = YOLO(Settings.MODEL_PATH)
             self.model.to(self.device)
+            self._configure_class_mapping()
 
             # FP16 Yarı Hassasiyet — GPU'da ~%40 hız artışı
             if self.device == "cuda" and Settings.HALF_PRECISION:
@@ -125,6 +129,73 @@ class ObjectDetector:
             self.log.success(f"Model ısınması tamamlandı ✓")
         except Exception as e:
             self.log.warn(f"Warmup sırasında hata (görmezden geliniyor): {e}")
+
+    @staticmethod
+    def _normalize_label(label: str) -> str:
+        text = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode("ascii")
+        text = text.lower().strip().replace("-", " ").replace("_", " ")
+        return " ".join(text.split())
+
+    @staticmethod
+    def _map_label_to_teknofest_id(label: str) -> int:
+        normalized = ObjectDetector._normalize_label(label)
+        if normalized in {"uap", "uap alan", "ucan araba park", "flying car park"}:
+            return Settings.CLASS_UAP
+        if normalized in {"uai", "uai alan", "uai alani", "ucan ambulans inis"}:
+            return Settings.CLASS_UAI
+        if normalized in {
+            "insan", "human", "person", "pedestrian", "people", "man", "woman",
+        }:
+            return Settings.CLASS_INSAN
+        if normalized in {
+            "tasit", "vehicle", "car", "van", "truck", "bus", "train", "boat",
+            "bicycle", "motorcycle", "motor", "tricycle", "awning tricycle",
+        }:
+            return Settings.CLASS_TASIT
+        return -1
+
+    def _configure_class_mapping(self) -> None:
+        names_raw = getattr(self.model, "names", {})
+        items: List[Tuple[int, str]] = []
+        if isinstance(names_raw, dict):
+            items = [(int(k), str(v)) for k, v in names_raw.items()]
+        elif isinstance(names_raw, list):
+            items = [(i, str(v)) for i, v in enumerate(names_raw)]
+
+        name_based_map: Dict[int, int] = {}
+        normalized_names: Dict[int, str] = {}
+        for idx, label in items:
+            normalized = self._normalize_label(label)
+            normalized_names[idx] = normalized
+            mapped = self._map_label_to_teknofest_id(label)
+            if mapped != -1:
+                name_based_map[idx] = mapped
+
+        direct_ids = [0, 1, 2, 3]
+        direct_ok = all(name_based_map.get(i, -1) == i for i in direct_ids)
+        looks_like_coco = (
+            normalized_names.get(0) == "person"
+            and normalized_names.get(1) == "bicycle"
+            and normalized_names.get(2) == "car"
+        )
+
+        if direct_ok:
+            self._class_map_mode = "official_direct"
+            self._model_class_map = {i: i for i in direct_ids}
+        elif looks_like_coco:
+            self._class_map_mode = "coco_remap"
+            self._model_class_map = dict(Settings.COCO_TO_TEKNOFEST)
+        else:
+            self._class_map_mode = "name_based"
+            self._model_class_map = name_based_map
+
+        self.log.info(
+            f"Sınıf eşleme modu: {self._class_map_mode} "
+            f"(tanınan model sınıfı: {len(self._model_class_map)})"
+        )
+
+    def _map_model_class_to_teknofest(self, model_cls_id: int) -> int:
+        return self._model_class_map.get(model_cls_id, -1)
 
     # =========================================================================
     #  ANA TESPİT FONKSİYONU
@@ -324,13 +395,13 @@ class ObjectDetector:
     # =========================================================================
 
     def _parse_results(self, results) -> List[Dict]:
-        """YOLO sonuçlarını COCO→TEKNOFEST dönüşümü ile parse eder."""
+        """YOLO sonuçlarını etkin sınıf eşleme moduna göre parse eder."""
         detections: List[Dict] = []
         for result in results:
             if result.boxes is None:
                 continue
             for box in result.boxes:
-                coco_id = int(box.cls[0].item())
+                model_cls_id = int(box.cls[0].item())
                 conf = float(box.conf[0].item())
                 coords = box.xyxy[0].tolist()
                 x1, y1, x2, y2 = (
@@ -338,14 +409,14 @@ class ObjectDetector:
                     float(coords[2]), float(coords[3]),
                 )
 
-                tf_id = Settings.COCO_TO_TEKNOFEST.get(coco_id, -1)
+                tf_id = self._map_model_class_to_teknofest(model_cls_id)
                 if tf_id == -1:
                     continue
 
                 detections.append({
                     "cls_int": tf_id,
                     "cls": str(tf_id),
-                    "source_cls_id": coco_id,
+                    "source_cls_id": model_cls_id,
                     "confidence": int(conf * 10000) / 10000,
                     "top_left_x": int(x1),
                     "top_left_y": int(y1),
