@@ -6,12 +6,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
+import cv2
+import numpy as np
 from config.settings import Settings
 
 
 @dataclass
 class _Track:
-    history: Deque[Tuple[float, float]] = field(default_factory=deque)
+    history: Deque[Tuple[float, float, float, float]] = field(default_factory=deque)
     missed: int = 0
 
 
@@ -28,8 +30,22 @@ class MovementEstimator:
     def __init__(self) -> None:
         self._tracks: Dict[int, _Track] = {}
         self._next_track_id: int = 1
+        self._prev_gray: Optional[np.ndarray] = None
+        self._prev_points: Optional[np.ndarray] = None
+        self._cam_shift_hist: Deque[Tuple[float, float]] = deque(
+            maxlen=Settings.MOVEMENT_WINDOW_FRAMES
+        )
+        self._cam_total_x: float = 0.0
+        self._cam_total_y: float = 0.0
 
-    def annotate(self, detections: List[Dict]) -> List[Dict]:
+    def annotate(self, detections: List[Dict], frame: Optional[np.ndarray] = None) -> List[Dict]:
+        cam_dx = cam_dy = 0.0
+        if Settings.MOTION_COMP_ENABLED and frame is not None:
+            cam_dx, cam_dy = self._estimate_camera_shift(frame)
+        self._cam_shift_hist.append((cam_dx, cam_dy))
+        self._cam_total_x += cam_dx
+        self._cam_total_y += cam_dy
+
         vehicles: List[Tuple[int, Dict]] = []
         for idx, det in enumerate(detections):
             if det.get("cls") == "0":
@@ -52,7 +68,8 @@ class MovementEstimator:
             if track_id is None:
                 track_id = self._create_track(centers[idx])
             track = self._tracks[track_id]
-            track.history.append(centers[idx])
+            cx, cy = centers[idx]
+            track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
             track.missed = 0
             status = self._status(track.history)
             det["movement_status"] = status
@@ -60,15 +77,19 @@ class MovementEstimator:
 
         return detections
 
-    def _status(self, history: Deque[Tuple[float, float]]) -> str:
+    def _status(self, history: Deque[Tuple[float, float, float, float]]) -> str:
         if len(history) < Settings.MOVEMENT_MIN_HISTORY:
             return "0"
 
-        x0, y0 = history[0]
-        x1, y1 = history[-1]
-        dx = x1 - x0
-        dy = y1 - y0
-        dist = (dx * dx + dy * dy) ** 0.5
+        x0, y0, cam0_x, cam0_y = history[0]
+        x1, y1, cam1_x, cam1_y = history[-1]
+        obj_dx = x1 - x0
+        obj_dy = y1 - y0
+
+        # Kamera hareketinin nesne merkezi üzerindeki etkisini çıkar.
+        rel_dx = obj_dx - (cam1_x - cam0_x)
+        rel_dy = obj_dy - (cam1_y - cam0_y)
+        dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
         return "1" if dist >= Settings.MOVEMENT_THRESHOLD_PX else "0"
 
     def _match(self, centers: Dict[int, Tuple[float, float]]) -> Dict[int, int]:
@@ -113,7 +134,8 @@ class MovementEstimator:
         track_id = self._next_track_id
         self._next_track_id += 1
         track = _Track(history=deque(maxlen=Settings.MOVEMENT_WINDOW_FRAMES))
-        track.history.append(center)
+        cx, cy = center
+        track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
         self._tracks[track_id] = track
         return track_id
 
@@ -123,3 +145,96 @@ class MovementEstimator:
             (float(det.get("top_left_x", 0)) + float(det.get("bottom_right_x", 0))) / 2.0,
             (float(det.get("top_left_y", 0)) + float(det.get("bottom_right_y", 0))) / 2.0,
         )
+
+    def _estimate_camera_shift(self, frame: np.ndarray) -> Tuple[float, float]:
+        """
+        Frame-to-frame global kamera kaymasını medyan optik akış ile tahmin eder.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self._prev_gray is None:
+            self._prev_gray = gray
+            self._prev_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+            )
+            return 0.0, 0.0
+
+        if self._prev_points is None or len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES:
+            self._prev_points = cv2.goodFeaturesToTrack(
+                self._prev_gray,
+                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+            )
+            if self._prev_points is None or len(self._prev_points) < 5:
+                self._prev_gray = gray
+                self._prev_points = cv2.goodFeaturesToTrack(
+                    gray,
+                    maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                    qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                    minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+                )
+                return 0.0, 0.0
+
+        win = Settings.MOTION_COMP_WIN_SIZE
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray,
+            gray,
+            self._prev_points,
+            None,
+            winSize=(win, win),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+        if next_pts is None or status is None:
+            self._prev_gray = gray
+            self._prev_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+            )
+            return 0.0, 0.0
+
+        valid = status.flatten() == 1
+        old = self._prev_points[valid].reshape(-1, 2)
+        new = next_pts[valid].reshape(-1, 2)
+        if len(new) < 5:
+            self._prev_gray = gray
+            self._prev_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+            )
+            return 0.0, 0.0
+
+        deltas = new - old
+        dx = deltas[:, 0]
+        dy = deltas[:, 1]
+
+        # Percentile kırpma ile outlier etkisini azalt.
+        low, high = 10, 90
+        dx_l, dx_h = np.percentile(dx, [low, high])
+        dy_l, dy_h = np.percentile(dy, [low, high])
+        keep = (dx >= dx_l) & (dx <= dx_h) & (dy >= dy_l) & (dy <= dy_h)
+        if np.count_nonzero(keep) >= 5:
+            dx = dx[keep]
+            dy = dy[keep]
+
+        cam_dx = float(np.median(dx))
+        cam_dy = float(np.median(dy))
+
+        self._prev_gray = gray
+        self._prev_points = new.reshape(-1, 1, 2)
+        if len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES // 2:
+            self._prev_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+            )
+
+        return cam_dx, cam_dy

@@ -252,6 +252,21 @@ class Settings:
     MOVEMENT_MATCH_DISTANCE_PX: float = 80.0
     MOVEMENT_MAX_MISSED_FRAMES: int = 8
 
+    # Kamera hareket kompanzasyonu (motion_status)
+    MOTION_COMP_ENABLED: bool = True
+    MOTION_COMP_MIN_FEATURES: int = 40
+    MOTION_COMP_MAX_CORNERS: int = 200
+    MOTION_COMP_QUALITY_LEVEL: float = 0.01
+    MOTION_COMP_MIN_DISTANCE: int = 20
+    MOTION_COMP_WIN_SIZE: int = 21
+
+    # Sürücü suppression (bisiklet/motosiklet üzerindeki insanı insan olarak sayma)
+    RIDER_SUPPRESS_ENABLED: bool = True
+    RIDER_OVERLAP_THRESHOLD: float = 0.35
+    RIDER_IOU_THRESHOLD: float = 0.15
+    # COCO: bicycle=1, motorcycle=3 | VisDrone: bicycle=3, motor=10
+    RIDER_SOURCE_CLASSES: tuple = (1, 3, 10)
+
     # =========================================================================
     #  YARIŞMA LİMİTLERİ (Şartname)
     # =========================================================================

@@ -243,6 +243,26 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `MOVEMENT_MATCH_DISTANCE_PX` | `80.0` | Frame arası bbox eşleştirme mesafesi |
 | `MOVEMENT_MAX_MISSED_FRAMES` | `8` | Takip kaybı toleransı |
 
+### Motion Compensation (Kamera Hareket Ayırma)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `MOTION_COMP_ENABLED` | `True` | Kamera hareket kompanzasyonunu aç/kapat |
+| `MOTION_COMP_MIN_FEATURES` | `40` | Güvenilir global flow için minimum köşe sayısı |
+| `MOTION_COMP_MAX_CORNERS` | `200` | Shi-Tomasi ile çıkarılacak maksimum köşe |
+| `MOTION_COMP_QUALITY_LEVEL` | `0.01` | Köşe kalite eşiği |
+| `MOTION_COMP_MIN_DISTANCE` | `20` | Köşeler arası minimum mesafe |
+| `MOTION_COMP_WIN_SIZE` | `21` | LK optik akış pencere boyutu |
+
+### Rider Suppression (Bisiklet/Motosiklet Sürücüsü)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `RIDER_SUPPRESS_ENABLED` | `True` | Sürücü suppression kuralını aç/kapat |
+| `RIDER_OVERLAP_THRESHOLD` | `0.35` | Person-overlap oranı eşiği |
+| `RIDER_IOU_THRESHOLD` | `0.15` | IoU yedek eşiği |
+| `RIDER_SOURCE_CLASSES` | `(1, 3, 10)` | Two-wheeler kaynak sınıf ID'leri (COCO/VisDrone) |
+
 ### Deterministiklik
 
 | Parametre | Varsayılan | Açıklama |
@@ -328,7 +348,7 @@ HavaciliktaYZ/
 ├── src/
 │   ├── __init__.py
 │   ├── detection.py        # YOLOv8 nesne tespiti + iniş durumu
-│   ├── movement.py        # Temporal karar mantığı (movement_status)
+│   ├── movement.py        # Temporal karar mantığı + kamera kompanzasyonu (motion_status)
 │   ├── data_loader.py     # Simülasyon veri yükleme (VID/DET)
 │   ├── runtime_profile.py # Deterministik profil uygulaması
 │   ├── network.py         # Sunucu iletişimi + retry + simülasyon
@@ -366,6 +386,7 @@ HavaciliktaYZ/
 - **Uygun (1):** Alan tamamen kadraj içinde VE üzerinde hiçbir nesne yok
 - **Uygun Değil (0):** Alan kısmen kadraj dışı VEYA üzerinde nesne var
 - Bisiklet/motosiklet sürücüleri "insan" değil, taşıtla birlikte "taşıt" olarak etiketlenir
+- Scooter için ayrı sınıf sinyali veri setinde yoksa two-wheeler suppression yaklaşımı kullanılır (yaklaşımsal kural).
 
 ## ⏱️ Görev 1 Temporal Karar Mantığı
 
@@ -387,6 +408,8 @@ Görev 1 kararları tek frame üzerinden verilmez. Tüm hareket ve iniş uygunlu
 
 - Pencere boyunca biriken temporal skor `S` hesaplanır.
 - `S >= T_move` ise taşıt için `movement_status=1`, aksi halde `movement_status=0`.
+- Runtime çıktısında bu alan şartname uyumu için `motion_status` adıyla gönderilir.
+- Kamera hareketi, global median optical-flow kompanzasyonu ile ayrıştırılır.
 - UAP/UAİ için `S >= T_land` ise `landing_status=1`, aksi halde `landing_status=0`.
 - `T_move` ve `T_land` kalibrasyon testleri ile sabitlenir.
 

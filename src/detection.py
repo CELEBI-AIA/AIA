@@ -157,6 +157,7 @@ class ObjectDetector:
 
             # ---- 2) Post-Processing Filtreleri ----
             raw_detections = self._post_filter(raw_detections)
+            raw_detections = self._suppress_rider_persons(raw_detections)
 
             # ---- 3) İniş Uygunluğu Hesaplaması ----
             frame_h, frame_w = frame.shape[:2]
@@ -344,6 +345,7 @@ class ObjectDetector:
                 detections.append({
                     "cls_int": tf_id,
                     "cls": str(tf_id),
+                    "source_cls_id": coco_id,
                     "confidence": int(conf * 10000) / 10000,
                     "top_left_x": int(x1),
                     "top_left_y": int(y1),
@@ -582,6 +584,77 @@ class ObjectDetector:
             filtered.append(det)
 
         return filtered
+
+    @staticmethod
+    def _suppress_rider_persons(detections: List[Dict]) -> List[Dict]:
+        """
+        Bisiklet/motosiklet üzerindeki sürücüyü insan sınıfından suppress eder.
+
+        Şartnameye göre: bisiklet/motosiklet sürücüsü "insan" olarak etiketlenmemelidir.
+        """
+        if not Settings.RIDER_SUPPRESS_ENABLED or not detections:
+            return detections
+
+        vehicles: List[Dict] = []
+        persons: List[Dict] = []
+        others: List[Dict] = []
+
+        rider_sources = set(Settings.RIDER_SOURCE_CLASSES)
+
+        for det in detections:
+            cls_int = int(det.get("cls_int", -1))
+            source_cls = int(det.get("source_cls_id", -1))
+            if cls_int == Settings.CLASS_TASIT and source_cls in rider_sources:
+                vehicles.append(det)
+            elif cls_int == Settings.CLASS_INSAN:
+                persons.append(det)
+            else:
+                others.append(det)
+
+        if not persons or not vehicles:
+            return detections
+
+        kept_persons: List[Dict] = []
+        for person in persons:
+            suppress = False
+            pbox = person["bbox"]
+            for veh in vehicles:
+                vbox = veh["bbox"]
+                overlap = ObjectDetector._intersection_over_area(pbox, vbox)
+                iou = ObjectDetector._bbox_iou(pbox, vbox)
+                if (
+                    overlap >= Settings.RIDER_OVERLAP_THRESHOLD
+                    or iou >= Settings.RIDER_IOU_THRESHOLD
+                ):
+                    suppress = True
+                    break
+            if not suppress:
+                kept_persons.append(person)
+
+        return others + vehicles + kept_persons
+
+    @staticmethod
+    def _bbox_iou(
+        box_a: Tuple[float, float, float, float],
+        box_b: Tuple[float, float, float, float],
+    ) -> float:
+        inter_x1 = max(box_a[0], box_b[0])
+        inter_y1 = max(box_a[1], box_b[1])
+        inter_x2 = min(box_a[2], box_b[2])
+        inter_y2 = min(box_a[3], box_b[3])
+
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+
+        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+        union = area_a + area_b - inter_area
+        if union <= 0:
+            return 0.0
+        return inter_area / union
 
     # =========================================================================
     #  İNİŞ UYGUNLUĞU (LANDING STATUS) MANTIĞI

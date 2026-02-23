@@ -131,7 +131,7 @@ def run_simulation(
                 gps_health = frame_info["gps_health"]
 
                 detected_objects = detector.detect(frame)
-                detected_objects = movement.annotate(detected_objects)
+                detected_objects = movement.annotate(detected_objects, frame=frame)
                 position = odometry.update(frame, server_data)
 
                 _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
@@ -307,7 +307,7 @@ def run_competition(log: Logger) -> None:
                     continue
 
                 detected_objects = detector.detect(frame)
-                detected_objects = movement.annotate(detected_objects)
+                detected_objects = movement.annotate(detected_objects, frame=frame)
 
                 position = odometry.update(frame, frame_data)
                 detected_translation = {
