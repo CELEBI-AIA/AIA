@@ -171,8 +171,9 @@ class Settings:
 
     # Perspektif toleransı: iniş alanı bbox'ını genişleterek yakın nesneleri yakalar
     # Şartname 4.6: "Çekim açısına bağlı yanıltıcı durumda iniş uygun değildir"
-    # 0.15 = bbox her yönde %15 genişletilir (70-90° kamera açısı toleransı)
-    LANDING_PROXIMITY_MARGIN: float = 0.15
+    # 0.10 = bbox her yönde %10 genişletilir — 70-90° kamera açısı toleransı
+    # 200px UAP'da ~20px ≈ gerçek dünyada ~0.5m buffer (sahada kalibrasyon önerilir)
+    LANDING_PROXIMITY_MARGIN: float = 0.10
 
     # Kenar temas kontrolü margin oranı (çözünürlüğe göre ölçeklenir)
     # 1920px'de ~8px, 3840px'de ~15px — çözünürlük bağımsız davranış
@@ -183,8 +184,9 @@ class Settings:
     UNKNOWN_OBJECTS_AS_OBSTACLES: bool = True
 
     # UAP/UAİ sınıfları için daha düşük containment suppression eşiği
-    # SAHI duplikasyonunu daha agresif temizler (standart: 0.85)
-    LANDING_ZONE_CONTAINMENT_IOU: float = 0.60
+    # SAHI duplikasyonlarını temizler (tipik %80+ örtüşme) ama
+    # yan yana gerçek alanları korur (standart: 0.85)
+    LANDING_ZONE_CONTAINMENT_IOU: float = 0.70
 
     # =========================================================================
     #  KAMERA PARAMETRELERİ (Yarışma günü kalibrasyon ile güncellenecek)
