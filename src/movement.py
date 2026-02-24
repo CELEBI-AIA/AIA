@@ -37,14 +37,26 @@ class MovementEstimator:
         )
         self._cam_total_x: float = 0.0
         self._cam_total_y: float = 0.0
+        self._frame_width: int = Settings.MOVEMENT_THRESHOLD_REF_WIDTH
+        self._is_frozen_frame: bool = False
+        self._frame_diff: float = float("inf")
 
     def annotate(self, detections: List[Dict], frame: Optional[np.ndarray] = None) -> List[Dict]:
+        if frame is not None:
+            self._frame_width = frame.shape[1]
+
         cam_dx = cam_dy = 0.0
         if Settings.MOTION_COMP_ENABLED and frame is not None:
             cam_dx, cam_dy = self._estimate_camera_shift(frame)
         self._cam_shift_hist.append((cam_dx, cam_dy))
         self._cam_total_x += cam_dx
         self._cam_total_y += cam_dy
+
+        # Frozen frame: piksel-bazlı fark kontrolü
+        # Kamera stabil + araç hareketli → frame_diff > 1.0 → NOT frozen (history güncellenir)
+        # Gerçek donmuş/duplicate frame → frame_diff ≈ 0 → frozen (history atlanır)
+        # İlk frame → frame_diff = inf → NOT frozen
+        self._is_frozen_frame = self._frame_diff < Settings.FROZEN_FRAME_DIFF_THRESHOLD
 
         vehicles: List[Tuple[int, Dict]] = []
         for idx, det in enumerate(detections):
@@ -69,8 +81,13 @@ class MovementEstimator:
                 track_id = self._create_track(centers[idx])
             track = self._tracks[track_id]
             cx, cy = centers[idx]
-            track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
+
+            # Frozen frame'lerde history'ye ekleme yapma —
+            # donmuş kareler gerçek motion verisini bozmasın
+            if not self._is_frozen_frame:
+                track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
             track.missed = 0
+
             status = self._status(track.history)
             det["movement_status"] = status
             det["motion_status"] = status
@@ -78,19 +95,38 @@ class MovementEstimator:
         return detections
 
     def _status(self, history: Deque[Tuple[float, float, float, float]]) -> str:
-        if len(history) < Settings.MOVEMENT_MIN_HISTORY:
+        """
+        Sliding window max displacement ile hareket durumu belirler.
+
+        MIN_HISTORY uzunluğundaki alt-pencereleri kaydırarak, herhangi bir
+        alt-pencerede kamera-kompanse edilmiş yer değiştirme eşiği aşıyorsa
+        "1" (hareketli) döner. İlk-son'dan farklı olarak, yeni başlayan
+        veya yeni duran hareketleri de yakalar.
+
+        Threshold, çözünürlüğe göre ölçeklenir (4K'da 2×, 1080p'de 1×).
+        """
+        n = len(history)
+        if n < Settings.MOVEMENT_MIN_HISTORY:
             return "0"
 
-        x0, y0, cam0_x, cam0_y = history[0]
-        x1, y1, cam1_x, cam1_y = history[-1]
-        obj_dx = x1 - x0
-        obj_dy = y1 - y0
+        scale = self._frame_width / Settings.MOVEMENT_THRESHOLD_REF_WIDTH
+        threshold = Settings.MOVEMENT_THRESHOLD_PX * scale
 
-        # Kamera hareketinin nesne merkezi üzerindeki etkisini çıkar.
-        rel_dx = obj_dx - (cam1_x - cam0_x)
-        rel_dy = obj_dy - (cam1_y - cam0_y)
-        dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
-        return "1" if dist >= Settings.MOVEMENT_THRESHOLD_PX else "0"
+        step = max(1, Settings.MOVEMENT_MIN_HISTORY - 1)
+
+        for i in range(n - step):
+            j = i + step
+            x0, y0, cam0_x, cam0_y = history[i]
+            x1, y1, cam1_x, cam1_y = history[j]
+
+            rel_dx = (x1 - x0) - (cam1_x - cam0_x)
+            rel_dy = (y1 - y0) - (cam1_y - cam0_y)
+            dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
+
+            if dist >= threshold:
+                return "1"
+
+        return "0"
 
     def _match(self, centers: Dict[int, Tuple[float, float]]) -> Dict[int, int]:
         assignments: Dict[int, int] = {}
@@ -102,7 +138,7 @@ class MovementEstimator:
             for track_id, track in self._tracks.items():
                 if not track.history:
                     continue
-                tx, ty = track.history[-1]
+                tx, ty = track.history[-1][:2]
                 dx = cx - tx
                 dy = cy - ty
                 dist = (dx * dx + dy * dy) ** 0.5
@@ -149,6 +185,7 @@ class MovementEstimator:
     def _estimate_camera_shift(self, frame: np.ndarray) -> Tuple[float, float]:
         """
         Frame-to-frame global kamera kaymasını medyan optik akış ile tahmin eder.
+        Ayrıca piksel-bazlı frame farkını hesaplar (frozen frame tespiti için).
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self._prev_gray is None:
@@ -159,7 +196,11 @@ class MovementEstimator:
                 qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
                 minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
             )
+            self._frame_diff = float("inf")
             return 0.0, 0.0
+
+        # Piksel-bazlı frame farkı — prev_gray güncellenmeden ÖNCE hesaplanmalı
+        self._frame_diff = float(cv2.absdiff(self._prev_gray, gray).mean())
 
         if self._prev_points is None or len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES:
             self._prev_points = cv2.goodFeaturesToTrack(

@@ -271,6 +271,16 @@ class Settings:
     MOVEMENT_MATCH_DISTANCE_PX: float = 80.0
     MOVEMENT_MAX_MISSED_FRAMES: int = 8
 
+    # Hareket eşiği referans çözünürlüğü — bu genişlikte MOVEMENT_THRESHOLD_PX geçerli
+    # 3840px frame'de otomatik 2× ölçeklenir, 1080p'de 1× kalır
+    MOVEMENT_THRESHOLD_REF_WIDTH: int = 1920
+
+    # Frozen frame tespiti — ardışık kareler arasındaki ortalama piksel farkı
+    # (0-255 ölçeği) bu eşiğin altındaysa frame donmuş sayılır.
+    # Piksel bazlı kontrol: kamera stabil ama araç hareketli → fark > 1.0 → NOT frozen
+    # Gerçek donmuş/duplicate frame → fark ≈ 0 → frozen
+    FROZEN_FRAME_DIFF_THRESHOLD: float = 1.0
+
     # Kamera hareket kompanzasyonu (motion_status)
     MOTION_COMP_ENABLED: bool = True
     MOTION_COMP_MIN_FEATURES: int = 40
