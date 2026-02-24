@@ -3,12 +3,13 @@ TEKNOFEST Havacılıkta Yapay Zeka - Nesne Tespit Modülü (Görev 1)
 =================================================================
 YOLOv8 tabanlı nesne tespiti ve İniş Uygunluğu (Landing Status) mantığı.
 
-İniş Uygunluğu Algoritması (teknofest_context.md'den):
+İniş Uygunluğu Algoritması (teknofest_context.md Bölüm 4.6):
     1. Taşıt (0) ve İnsan (1) → landing_status = "-1" (iniş alanı değil)
     2. UAP (2) ve UAİ (3) için:
        a. Bounding box kadrajın kenarına değiyorsa → "0" (alan tam görünmüyor)
-       b. Alan tamamen kadrajda VE üzerinde İnsan/Taşıt varsa (kesişim kontrolü) → "0"
-       c. Alan tamamen kadrajda VE üzerinde engel yoksa → "1" (uygun)
+       b. Üzerinde herhangi bir nesne (Taşıt/İnsan/bilinmeyen) varsa → "0"
+       c. Perspektif proximity zone içinde yakın nesne varsa → "0"
+       d. Yukarıdaki koşulların hiçbiri yoksa → "1" (uygun)
 
 Kullanım:
     from src.detection import ObjectDetector
@@ -237,8 +238,12 @@ class ObjectDetector:
             )
 
             # ---- 4) Dahili alanları temizle, TEKNOFEST formatı döndür ----
+            # cls_int == -1 (unknown) nesneler dahili engel olarak kullanıldı,
+            # ancak yarışma çıktısına dahil edilmez.
             output: List[Dict] = []
             for det in final_detections:
+                if det["cls_int"] == -1:
+                    continue
                 output.append({
                     "cls": det["cls"],
                     "landing_status": det["landing_status"],
@@ -395,7 +400,12 @@ class ObjectDetector:
     # =========================================================================
 
     def _parse_results(self, results) -> List[Dict]:
-        """YOLO sonuçlarını etkin sınıf eşleme moduna göre parse eder."""
+        """
+        YOLO sonuçlarını etkin sınıf eşleme moduna göre parse eder.
+
+        Haritalanamayan sınıflar (tf_id == -1) UNKNOWN_OBJECTS_AS_OBSTACLES
+        aktifken dahili engel olarak tutulur; TEKNOFEST çıktısına dahil edilmez.
+        """
         detections: List[Dict] = []
         for result in results:
             if result.boxes is None:
@@ -410,7 +420,8 @@ class ObjectDetector:
                 )
 
                 tf_id = self._map_model_class_to_teknofest(model_cls_id)
-                if tf_id == -1:
+
+                if tf_id == -1 and not Settings.UNKNOWN_OBJECTS_AS_OBSTACLES:
                     continue
 
                 detections.append({
@@ -476,56 +487,61 @@ class ObjectDetector:
         """
         Bir kutu diğerinin içindeyse (veya büyük oranda örtüşüyorsa) küçüğü siler.
         Standart NMS'in aksine, IoU yerine 'Intersection over Small Area' kullanır.
+
+        UAP/UAİ sınıfları için LANDING_ZONE_CONTAINMENT_IOU eşiği kullanılır —
+        SAHI duplikasyonundan gelen iniş alanı çiftlerini daha agresif temizler.
         """
         if not detections:
             return []
 
-        # Alanlarına göre büyükten küçüğe sırala
-        detections.sort(key=lambda x: (x["bbox"][2]-x["bbox"][0]) * (x["bbox"][3]-x["bbox"][1]), reverse=True)
-        
+        detections.sort(
+            key=lambda x: (x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]),
+            reverse=True,
+        )
+
         keep = []
         is_suppressed = [False] * len(detections)
+        landing_zone_ids = (Settings.CLASS_UAP, Settings.CLASS_UAI)
 
         for i in range(len(detections)):
             if is_suppressed[i]:
                 continue
-            
+
             box_a = detections[i]["bbox"]
-            area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
             keep.append(detections[i])
 
             for j in range(i + 1, len(detections)):
                 if is_suppressed[j]:
                     continue
-                
-                # Sadece aynı sınıfları kontrol et (İnsan içindeki İnsanı sil, Araç içindeki İnsanı silme)
+
                 if detections[i]["cls_int"] != detections[j]["cls_int"]:
                     continue
 
                 box_b = detections[j]["bbox"]
-                
-                # Kesişim alanı
+
                 inter_x1 = max(box_a[0], box_b[0])
                 inter_y1 = max(box_a[1], box_b[1])
                 inter_x2 = min(box_a[2], box_b[2])
                 inter_y2 = min(box_a[3], box_b[3])
-                
+
                 inter_w = max(0.0, inter_x2 - inter_x1)
                 inter_h = max(0.0, inter_y2 - inter_y1)
                 inter_area = inter_w * inter_h
-                
+
                 if inter_area == 0:
                     continue
 
-                # Küçük kutunun alanı (box_b çünkü sıralı gidiyoruz, j >= i, ama alan büyükten küçüğe)
-                # DİKKAT: Sıralama Büyük -> Küçük. Yani i Büyük, j Küçük.
                 area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-                
-                # IOS hesapla: Kesişim / Küçük Alan
                 ios = inter_area / area_b if area_b > 0 else 0
 
-                if ios > threshold:
-                    is_suppressed[j] = True  # Küçüğü bastır
+                effective_threshold = (
+                    Settings.LANDING_ZONE_CONTAINMENT_IOU
+                    if detections[i]["cls_int"] in landing_zone_ids
+                    else threshold
+                )
+
+                if ios > effective_threshold:
+                    is_suppressed[j] = True
 
         return keep
 
@@ -742,15 +758,17 @@ class ObjectDetector:
 
         Mantık (teknofest_context.md - Bölüm 4.6):
             - Taşıt (0) ve İnsan (1): landing_status = "-1" (sabit)
+            - Bilinmeyen nesneler (cls_int == -1): landing_status = "-1" (dahili)
             - UAP (2) ve UAİ (3):
                 a) bbox kadrajın kenarına değiyorsa → "0" (alan tam görünmüyor)
-                b) Üzerinde taşıt/insan varsa (kesişim kontrolü) → "0"
-                c) Yukarıdaki koşullar sağlanmıyorsa → "1" (uygun)
+                b) Üzerinde herhangi bir nesne varsa (Taşıt/İnsan/unknown) → "0"
+                c) Perspektif proximity zone içinde yakın nesne varsa → "0"
+                d) Yukarıdaki koşullar sağlanmıyorsa → "1" (uygun)
 
-        ÖNEMLİ: Engel kontrolünde IoU değil "intersection-over-area-of-landing-zone"
-        kullanılır. Çünkü şartname "alanın **üzerinde** nesne var mı" soruyor —
-        küçük bir insan büyük iniş alanının üzerinde olsa IoU çok düşük çıkar
-        ama yine de uygun değildir.
+        Engel kontrolünde IoU değil "intersection-over-area-of-landing-zone"
+        kullanılır. Şartname "alanın üzerinde nesne var mı" soruyor — küçük
+        bir insan büyük iniş alanının üzerinde olsa IoU düşük çıkar ama
+        yine de uygun değildir.
 
         Args:
             detections: Ham tespit listesi (bbox alanı dahil).
@@ -760,47 +778,53 @@ class ObjectDetector:
         Returns:
             landing_status alanı doldurulmuş tespit listesi.
         """
-        # Taşıt ve İnsan listesini ayır (engel olarak kullanılacak)
+        # UAP/UAİ dışındaki TÜM nesneleri engel olarak topla
+        # Şartname: "tespit edilen veya tespit edilemeyen herhangi bir nesne"
+        landing_zone_ids = (Settings.CLASS_UAP, Settings.CLASS_UAI)
         obstacles: List[Tuple[float, float, float, float]] = []
         for det in detections:
-            if det["cls_int"] in (Settings.CLASS_TASIT, Settings.CLASS_INSAN):
+            if det["cls_int"] not in landing_zone_ids:
                 obstacles.append(det["bbox"])
 
-        # Her nesne için iniş durumunu belirle
         for det in detections:
             cls_id = det["cls_int"]
 
             if cls_id in (Settings.CLASS_TASIT, Settings.CLASS_INSAN):
-                # ------ Taşıt veya İnsan: İniş alanı değil ------
                 det["landing_status"] = Settings.LANDING_NOT_AREA
 
-            elif cls_id in (Settings.CLASS_UAP, Settings.CLASS_UAI):
-                # ------ UAP veya UAİ: İniş uygunluğu hesapla ------
+            elif cls_id in landing_zone_ids:
                 bbox = det["bbox"]
 
                 # (a) Alan kadrajın kenarına değiyor mu?
                 if self._is_touching_edge(bbox, frame_w, frame_h):
                     det["landing_status"] = Settings.LANDING_NOT_SUITABLE
-                    self.log.debug(
-                        f"  UAP/UAİ kenar temas → uygun değil"
-                    )
+                    self.log.debug("  UAP/UAİ kenar temas → uygun değil")
                     continue
 
-                # (b) Üzerinde engel var mı? (Kesişim kontrolü)
-                has_obstacle = False
-                for obs_bbox in obstacles:
-                    overlap_ratio = self._intersection_over_area(bbox, obs_bbox)
-                    if overlap_ratio > Settings.LANDING_IOU_THRESHOLD:
-                        has_obstacle = True
+                # (b) Doğrudan engel örtüşme kontrolü
+                has_obstacle = self._check_obstacle_overlap(
+                    bbox, obstacles, Settings.LANDING_IOU_THRESHOLD
+                )
+
+                # (c) Perspektif proximity kontrolü — genişletilmiş bbox
+                # Şartname 4.6: "Çekim açısına bağlı yanıltıcı durumda
+                # alana yakın cisim alanda gibi görünebilir"
+                if not has_obstacle and Settings.LANDING_PROXIMITY_MARGIN > 0:
+                    expanded = self._expand_bbox(
+                        bbox, Settings.LANDING_PROXIMITY_MARGIN
+                    )
+                    has_obstacle = self._check_obstacle_overlap(
+                        expanded, obstacles, Settings.LANDING_IOU_THRESHOLD
+                    )
+                    if has_obstacle:
                         self.log.debug(
-                            f"  UAP/UAİ üzerinde engel (overlap={overlap_ratio:.3f}) → uygun değil"
+                            "  UAP/UAİ perspektif proximity engeli → uygun değil"
                         )
-                        break
 
                 if has_obstacle:
                     det["landing_status"] = Settings.LANDING_NOT_SUITABLE
                 else:
-                    # (c) Alan tamamen kadrajda ve engelsiz → uygun
+                    # (d) Alan tamamen kadrajda, engelsiz, proximity temiz → uygun
                     det["landing_status"] = Settings.LANDING_SUITABLE
                     self.log.debug("  UAP/UAİ → iniş uygun ✓")
 
@@ -808,6 +832,60 @@ class ObjectDetector:
                 det["landing_status"] = Settings.LANDING_NOT_AREA
 
         return detections
+
+    # =========================================================================
+    #  ENGEL ÖRTÜŞME KONTROL YARDIMCILARI
+    # =========================================================================
+
+    @staticmethod
+    def _check_obstacle_overlap(
+        landing_bbox: Tuple[float, float, float, float],
+        obstacles: List[Tuple[float, float, float, float]],
+        threshold: float,
+    ) -> bool:
+        """
+        İniş alanı ile engel listesi arasında eşik üstü kesişim olup olmadığını kontrol eder.
+
+        Args:
+            landing_bbox: İniş alanı (x1, y1, x2, y2).
+            obstacles: Engel bbox listesi.
+            threshold: Minimum overlap oranı (0.0 = herhangi bir piksel).
+
+        Returns:
+            Engel bulunduysa True.
+        """
+        for obs_bbox in obstacles:
+            overlap = ObjectDetector._intersection_over_area(
+                landing_bbox, obs_bbox
+            )
+            if overlap > threshold:
+                return True
+        return False
+
+    @staticmethod
+    def _expand_bbox(
+        bbox: Tuple[float, float, float, float],
+        margin_ratio: float,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Bounding box'ı her yönde margin_ratio oranında genişletir.
+
+        Perspektif kaynaklı yanılgıları yakalamak için iniş alanı
+        bbox'ı genişletilerek yakın nesneler kontrol edilir.
+
+        Args:
+            bbox: Orijinal (x1, y1, x2, y2).
+            margin_ratio: Genişletme oranı (0.15 = %15 her yönde).
+
+        Returns:
+            Genişletilmiş (x1, y1, x2, y2).
+        """
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        dx = w * margin_ratio
+        dy = h * margin_ratio
+        return (x1 - dx, y1 - dy, x2 + dx, y2 + dy)
 
     # =========================================================================
     #  KESİŞİM HESAPLAMA
@@ -870,10 +948,12 @@ class ObjectDetector:
         bbox: Tuple[float, float, float, float],
         frame_w: int,
         frame_h: int,
-        margin: int = 5,
     ) -> bool:
         """
         Bounding box'ın kadrajın kenarına değip değmediğini kontrol eder.
+
+        Margin, EDGE_MARGIN_RATIO ile çözünürlüğe orantılı hesaplanır.
+        1920px'de ~8px, 3840px'de ~15px — çözünürlük bağımsız davranış.
 
         Şartnameye göre: UAP/UAİ alanının tamamı kadraj içinde olmalıdır,
         aksi halde iniş durumu "uygun" olamaz.
@@ -882,15 +962,17 @@ class ObjectDetector:
             bbox: (x1, y1, x2, y2) formatında bounding box.
             frame_w: Görüntü genişliği.
             frame_h: Görüntü yüksekliği.
-            margin: Kenar toleransı (piksel).
 
         Returns:
             Kenarına değiyorsa True.
         """
+        margin_x = max(1, int(frame_w * Settings.EDGE_MARGIN_RATIO))
+        margin_y = max(1, int(frame_h * Settings.EDGE_MARGIN_RATIO))
+
         x1, y1, x2, y2 = bbox
         return (
-            x1 <= margin
-            or y1 <= margin
-            or x2 >= (frame_w - margin)
-            or y2 >= (frame_h - margin)
+            x1 <= margin_x
+            or y1 <= margin_y
+            or x2 >= (frame_w - margin_x)
+            or y2 >= (frame_h - margin_y)
         )
