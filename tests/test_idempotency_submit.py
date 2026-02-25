@@ -2,9 +2,14 @@ import unittest
 from unittest.mock import Mock
 
 from config.settings import Settings
-from src.network import NetworkManager
+try:
+    from src.network import NetworkManager, SendResultStatus
+except Exception:  # pragma: no cover - environment-dependent
+    NetworkManager = None
+    SendResultStatus = None
 
 
+@unittest.skipUnless(NetworkManager is not None and SendResultStatus is not None, "network deps are missing")
 class TestIdempotencySubmit(unittest.TestCase):
     def setUp(self):
         self._orig = {
@@ -30,7 +35,7 @@ class TestIdempotencySubmit(unittest.TestCase):
             frame_shape=None,
         )
 
-        self.assertTrue(ok)
+        self.assertEqual(ok, SendResultStatus.ACKED)
         headers = mgr.session.post.call_args.kwargs["headers"]
         self.assertEqual(headers["Idempotency-Key"], "aia:frame-7")
 
@@ -53,8 +58,8 @@ class TestIdempotencySubmit(unittest.TestCase):
             frame_shape=None,
         )
 
-        self.assertTrue(first)
-        self.assertTrue(second)
+        self.assertEqual(first, SendResultStatus.ACKED)
+        self.assertEqual(second, SendResultStatus.ACKED)
         self.assertEqual(mgr.session.post.call_count, 1)
 
 

@@ -220,7 +220,7 @@ def _print_simulation_result(
 
 
 def run_competition(log: Logger) -> None:
-    from src.network import FrameFetchStatus, NetworkManager, SendResultStatus
+    from src.network import FrameFetchStatus, NetworkManager
 
     log.info("Initializing modules...")
 
@@ -633,6 +633,10 @@ def _print_summary(
             "KPI: "
             f"Send OK={kpi_counters.get('send_ok', 0)} | "
             f"Send FAIL={kpi_counters.get('send_fail', 0)} | "
+            f"Fallback ACK={kpi_counters.get('send_fallback_ok', 0)} | "
+            f"Permanent Reject={kpi_counters.get('send_permanent_reject', 0)} | "
+            f"Preflight Reject={kpi_counters.get('payload_preflight_reject_count', 0)} | "
+            f"Payload Clipped={kpi_counters.get('payload_clipped_count', 0)} | "
             f"Mode GPS={kpi_counters.get('mode_gps', 0)} | "
             f"Mode OF={kpi_counters.get('mode_of', 0)} | "
             f"Degrade Frames={kpi_counters.get('degrade_frames', 0)} | "

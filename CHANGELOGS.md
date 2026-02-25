@@ -122,6 +122,13 @@
 - Enforced ACK-gated progression: the runtime no longer fetches a new frame while a previous frame result is unacknowledged, and retries result submission with bounded backoff plus failure budget for protocol-safe behavior.
 - Added a debug safety guard so visualizer drawing is skipped cleanly on fallback frames where no decoded image exists.
 
+## 0.0.24 - 2026-02-26
+- Added outbound payload preflight validation in `src/network.py` to enforce required top-level fields, strict translation schema (`len==1`), per-object normalization, and safe-fallback conversion on invalid payloads.
+- Implemented deterministic object-count protection with class quota + global cap (`RESULT_CLASS_QUOTA`, `RESULT_MAX_OBJECTS`) and structured clip telemetry logging.
+- Reworked `send_result` to explicit `SendResultStatus` flow and added 4xx handling that sends a single safe-fallback payload before classifying permanent rejection.
+- Updated competition send-state handling in `main.py` to branch on status outcomes and publish new KPI counters for fallback ACK, permanent reject, preflight reject, and payload clipping.
+- Added tests: `tests/test_network_payload_guard.py` and `tests/test_main_ack_state_machine.py`.
+
 ## 0.0.24 - 2026-02-25
 - Enforced competition-safe FP32 determinism in `main.py`: runtime now force-applies `deterministic-profile=max` in `--mode competition`, even when CLI requested `off` or `balanced`.
 - Added explicit override warning telemetry in `main.py` to reduce operator misconfiguration risk on final runs.

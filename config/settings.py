@@ -333,3 +333,13 @@ class Settings:
 
     # Oturum başına toplam kare sayısı (şartnameye göre 2250)
     MAX_FRAMES: int = 2250
+
+    # Sonuç payload nesne limiti (deterministik cap)
+    RESULT_MAX_OBJECTS: int = 100
+    # Sınıf bazlı kota (cls: quota)
+    RESULT_CLASS_QUOTA: dict = {
+        "0": 40,
+        "1": 40,
+        "2": 10,
+        "3": 10,
+    }

@@ -250,15 +250,42 @@ class NetworkManager:
         frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
         degrade: bool = False,
-    ) -> bool:
+    ) -> SendResultStatus:
         """Tespit ve konum sonuçlarını TEKNOFEST taslak şemasına uyumlu JSON ile gönderir."""
-        payload = self.build_competition_payload(
+        frame_key = self._normalize_frame_key(frame_id)
+        if self._was_already_submitted(frame_key):
+            self.log.warn(
+                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard"
+            )
+            return SendResultStatus.ACKED
+
+        raw_payload = self.build_competition_payload(
             frame_id=frame_id,
             detected_objects=detected_objects,
             detected_translation=detected_translation,
             frame_data=frame_data,
             frame_shape=frame_shape,
         )
+        force_fallback = self._should_force_fallback(frame_key)
+        if force_fallback:
+            payload = self._build_safe_fallback_payload(raw_payload)
+            preflight_rejected = True
+            payload_clipped = False
+        else:
+            payload, preflight_rejected, payload_clipped = (
+                self._preflight_validate_and_normalize_payload(
+                    raw_payload,
+                    frame_shape=frame_shape,
+                    frame_id=frame_id,
+                )
+            )
+
+        if preflight_rejected:
+            self._payload_guard_counters["preflight_reject"] += 1
+            self._mark_force_fallback(frame_key)
+        if payload_clipped:
+            self._payload_guard_counters["payload_clipped"] += 1
+        self._record_clip_event(payload_clipped)
 
         if self._should_log_json(self._result_counter):
             log_json_to_disk(payload, direction="outgoing", tag=f"result_{frame_id}")
@@ -270,17 +297,16 @@ class NetworkManager:
                 f"Objects: {len(payload['detected_objects'])} | "
                 f"Degrade: {'ON' if degrade else 'OFF'}"
             )
-            return True
-
-        frame_key = self._normalize_frame_key(frame_id)
-        if self._was_already_submitted(frame_key):
-            self.log.warn(
-                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard"
+            return (
+                SendResultStatus.FALLBACK_ACKED
+                if preflight_rejected
+                else SendResultStatus.ACKED
             )
-            return True
 
         url = f"{self.base_url}{Settings.ENDPOINT_SUBMIT_RESULT}"
         idempotency_key = self._build_idempotency_key(frame_key)
+        fallback_sent = preflight_rejected
+        saw_4xx = False
 
         for attempt in range(1, Settings.MAX_RETRIES + 1):
             try:
@@ -299,7 +325,17 @@ class NetworkManager:
                         f"(degrade={'ON' if degrade else 'OFF'})"
                     )
                     self._mark_submitted(frame_key)
-                    return True
+                    self._unmark_force_fallback(frame_key)
+                    if preflight_rejected or fallback_sent:
+                        return SendResultStatus.FALLBACK_ACKED
+                    return SendResultStatus.ACKED
+
+                if 400 <= response.status_code < 500:
+                    saw_4xx = True
+                    self.log.warn(
+                        f"Submit response HTTP {response.status_code} (4xx permanent reject candidate)"
+                    )
+                    break
 
                 self.log.warn(
                     f"Submit response HTTP {response.status_code} "
@@ -318,8 +354,54 @@ class NetworkManager:
 
             self._sleep_with_backoff(attempt)
 
+        if saw_4xx:
+            self._mark_force_fallback(frame_key)
+            if fallback_sent:
+                self.log.error(
+                    f"Frame {frame_id}: fallback payload also rejected (4xx), marking permanent reject"
+                )
+                return SendResultStatus.PERMANENT_REJECTED
+
+            fallback_payload = self._build_safe_fallback_payload(raw_payload)
+            try:
+                response = self.session.post(
+                    url,
+                    json=fallback_payload,
+                    timeout=self._timeout_tuple(self._read_timeout_submit()),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": idempotency_key,
+                    },
+                )
+                if response.status_code == 200:
+                    self.log.warn(
+                        f"Frame {frame_id}: 4xx recovered with safe fallback payload"
+                    )
+                    self._mark_submitted(frame_key)
+                    self._unmark_force_fallback(frame_key)
+                    return SendResultStatus.FALLBACK_ACKED
+                if 400 <= response.status_code < 500:
+                    self.log.error(
+                        f"Frame {frame_id}: fallback payload rejected with HTTP {response.status_code}"
+                    )
+                    return SendResultStatus.PERMANENT_REJECTED
+
+                self.log.warn(
+                    f"Frame {frame_id}: fallback payload non-ACK HTTP {response.status_code}, retryable"
+                )
+                return SendResultStatus.RETRYABLE_FAILURE
+            except requests.Timeout:
+                self._increment_timeout_counter("submit")
+                self.log.warn(f"Frame {frame_id}: fallback submit timeout, retryable")
+                return SendResultStatus.RETRYABLE_FAILURE
+            except Exception as exc:
+                self.log.warn(
+                    f"Frame {frame_id}: fallback submit transient error ({type(exc).__name__}): {exc}"
+                )
+                return SendResultStatus.RETRYABLE_FAILURE
+
         self.log.error(f"Result submission failed after retries for frame {frame_id}")
-        return False
+        return SendResultStatus.RETRYABLE_FAILURE
 
     @staticmethod
     def build_competition_payload(
@@ -367,6 +449,7 @@ class NetworkManager:
                     "top_left_y": y1,
                     "bottom_right_x": x2,
                     "bottom_right_y": y2,
+                    "_confidence": NetworkManager._safe_float(obj.get("confidence", 0.0)),
                 }
             )
 
@@ -488,10 +571,228 @@ class NetworkManager:
 
         return True
 
+    def _preflight_validate_and_normalize_payload(
+        self,
+        payload: Dict[str, Any],
+        frame_shape: Optional[tuple],
+        frame_id: Any,
+    ) -> Tuple[Dict[str, Any], bool, bool]:
+        required_fields = {
+            "id",
+            "user",
+            "frame",
+            "detected_objects",
+            "detected_translations",
+            "detected_undefined_objects",
+        }
+        if not isinstance(payload, dict) or not required_fields.issubset(payload.keys()):
+            self.log.error(
+                f"Frame {frame_id}: preflight reject (missing top-level fields), forcing safe fallback"
+            )
+            return self._build_safe_fallback_payload(payload), True, False
+
+        translations = payload.get("detected_translations")
+        if not isinstance(translations, list) or len(translations) != 1:
+            self.log.error(
+                f"Frame {frame_id}: preflight reject (detected_translations must be list with len=1)"
+            )
+            return self._build_safe_fallback_payload(payload), True, False
+
+        t0 = translations[0]
+        if not isinstance(t0, dict):
+            self.log.error(
+                f"Frame {frame_id}: preflight reject (translation object invalid), forcing safe fallback"
+            )
+            return self._build_safe_fallback_payload(payload), True, False
+
+        tx = self._safe_float(t0.get("translation_x", 0.0))
+        ty = self._safe_float(t0.get("translation_y", 0.0))
+        tz = self._safe_float(t0.get("translation_z", 0.0))
+
+        objects = payload.get("detected_objects")
+        if not isinstance(objects, list):
+            self.log.error(
+                f"Frame {frame_id}: preflight reject (detected_objects must be list), forcing safe fallback"
+            )
+            return self._build_safe_fallback_payload(payload), True, False
+
+        frame_h = frame_w = None
+        if frame_shape and len(frame_shape) >= 2:
+            frame_h = self._safe_int(frame_shape[0])
+            frame_w = self._safe_int(frame_shape[1])
+
+        normalized_objects: List[Dict[str, Any]] = []
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            cls = str(obj.get("cls", ""))
+            if cls not in {"0", "1", "2", "3"}:
+                continue
+
+            landing = str(obj.get("landing_status", "-1"))
+            if landing not in {"-1", "0", "1"}:
+                landing = "-1"
+
+            motion = str(obj.get("motion_status", obj.get("movement_status", "-1")))
+            if motion not in {"-1", "0", "1"}:
+                motion = "-1"
+
+            x1 = self._safe_int(obj.get("top_left_x", 0))
+            y1 = self._safe_int(obj.get("top_left_y", 0))
+            x2 = self._safe_int(obj.get("bottom_right_x", 0))
+            y2 = self._safe_int(obj.get("bottom_right_y", 0))
+            if frame_w is not None and frame_h is not None:
+                x1, y1, x2, y2 = self._clamp_bbox(
+                    x1, y1, x2, y2, frame_w=frame_w, frame_h=frame_h
+                )
+
+            normalized_objects.append(
+                {
+                    "cls": cls,
+                    "landing_status": landing,
+                    "motion_status": motion,
+                    "top_left_x": x1,
+                    "top_left_y": y1,
+                    "bottom_right_x": x2,
+                    "bottom_right_y": y2,
+                    "_confidence": self._safe_float(obj.get("_confidence", obj.get("confidence", 0.0))),
+                }
+            )
+
+        capped_objects, clip_stats = self._apply_object_caps(
+            normalized_objects=normalized_objects,
+            frame_id=frame_id,
+        )
+        payload_clipped = bool(clip_stats.get("dropped_total", 0) > 0)
+
+        clean_capped = [
+            {
+                "cls": obj["cls"],
+                "landing_status": obj["landing_status"],
+                "motion_status": obj["motion_status"],
+                "top_left_x": obj["top_left_x"],
+                "top_left_y": obj["top_left_y"],
+                "bottom_right_x": obj["bottom_right_x"],
+                "bottom_right_y": obj["bottom_right_y"],
+            }
+            for obj in capped_objects
+        ]
+
+        return (
+            {
+                "id": payload.get("id"),
+                "user": payload.get("user"),
+                "frame": payload.get("frame"),
+                "detected_objects": clean_capped,
+                "detected_translations": [
+                    {
+                        "translation_x": tx,
+                        "translation_y": ty,
+                        "translation_z": tz,
+                    }
+                ],
+                "detected_undefined_objects": [],
+            },
+            False,
+            payload_clipped,
+        )
+
+    def _apply_object_caps(
+        self,
+        normalized_objects: List[Dict[str, Any]],
+        frame_id: Any,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        class_order = ["0", "1", "2", "3"]
+        quota_raw = dict(getattr(Settings, "RESULT_CLASS_QUOTA", {"0": 40, "1": 40, "2": 10, "3": 10}))
+        class_quota = {
+            cls: max(0, self._safe_int(quota_raw.get(cls, 0)))
+            for cls in class_order
+        }
+        global_cap = max(0, self._safe_int(getattr(Settings, "RESULT_MAX_OBJECTS", 100)))
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {cls: [] for cls in class_order}
+        for obj in normalized_objects:
+            cls = str(obj.get("cls", ""))
+            if cls in grouped:
+                grouped[cls].append(obj)
+
+        def _rank_key(det: Dict[str, Any]) -> Tuple[float, float, int, int]:
+            x1 = self._safe_int(det.get("top_left_x", 0))
+            y1 = self._safe_int(det.get("top_left_y", 0))
+            x2 = self._safe_int(det.get("bottom_right_x", 0))
+            y2 = self._safe_int(det.get("bottom_right_y", 0))
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            conf = self._safe_float(det.get("_confidence", 0.0))
+            return (-conf, -float(area), x1, y1)
+
+        post_quota: List[Dict[str, Any]] = []
+        dropped_by_class: Dict[str, int] = {cls: 0 for cls in class_order}
+        for cls in class_order:
+            ranked = sorted(grouped[cls], key=_rank_key)
+            keep = ranked[: class_quota[cls]]
+            dropped_by_class[cls] = max(0, len(ranked) - len(keep))
+            post_quota.extend(keep)
+
+        post_quota_sorted = sorted(post_quota, key=_rank_key)
+        capped = post_quota_sorted[:global_cap]
+        dropped_global = max(0, len(post_quota_sorted) - len(capped))
+
+        # Global cap sonrası düşenleri sınıfa yaz.
+        if dropped_global > 0:
+            for det in post_quota_sorted[global_cap:]:
+                cls = str(det.get("cls", ""))
+                if cls in dropped_by_class:
+                    dropped_by_class[cls] += 1
+
+        raw_count = len(normalized_objects)
+        post_quota_count = len(post_quota_sorted)
+        post_global_cap_count = len(capped)
+        dropped_total = max(0, raw_count - post_global_cap_count)
+        stats = {
+            "raw_count": raw_count,
+            "post_quota_count": post_quota_count,
+            "post_global_cap_count": post_global_cap_count,
+            "dropped_total": dropped_total,
+            "dropped_count_by_class": dropped_by_class,
+        }
+
+        if dropped_total > 0:
+            self.log.warn(
+                "Payload clip applied: "
+                f"frame_id={frame_id} raw_count={raw_count} "
+                f"post_quota_count={post_quota_count} post_global_cap_count={post_global_cap_count} "
+                f"dropped_count_by_class={dropped_by_class}"
+            )
+
+        return capped, stats
+
+    @staticmethod
+    def _build_safe_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": payload.get("id", "unknown"),
+            "user": payload.get("user", Settings.TEAM_NAME),
+            "frame": payload.get("frame", payload.get("id", "unknown")),
+            "detected_objects": [],
+            "detected_translations": [
+                {
+                    "translation_x": 0.0,
+                    "translation_y": 0.0,
+                    "translation_z": 0.0,
+                }
+            ],
+            "detected_undefined_objects": [],
+        }
+
     def consume_timeout_counters(self) -> Dict[str, int]:
         snapshot = dict(self._timeout_counters)
         for key in self._timeout_counters:
             self._timeout_counters[key] = 0
+        return snapshot
+
+    def consume_payload_guard_counters(self) -> Dict[str, int]:
+        snapshot = dict(self._payload_guard_counters)
+        for key in self._payload_guard_counters:
+            self._payload_guard_counters[key] = 0
         return snapshot
 
     def _increment_timeout_counter(self, key: str) -> None:
@@ -521,12 +822,34 @@ class NetworkManager:
     def _mark_submitted(self, frame_key: str) -> None:
         self._touch_lru(self._submitted_frames_lru, frame_key)
 
+    def _should_force_fallback(self, frame_key: str) -> bool:
+        if frame_key in self._force_fallback_frames_lru:
+            self._force_fallback_frames_lru.move_to_end(frame_key)
+            return True
+        return False
+
+    def _mark_force_fallback(self, frame_key: str) -> None:
+        self._touch_lru(self._force_fallback_frames_lru, frame_key)
+
+    def _unmark_force_fallback(self, frame_key: str) -> None:
+        self._force_fallback_frames_lru.pop(frame_key, None)
+
     def _touch_lru(self, lru: "OrderedDict[str, None]", key: str) -> None:
         lru[key] = None
         lru.move_to_end(key)
         max_size = max(1, int(getattr(Settings, "SEEN_FRAME_LRU_SIZE", 512)))
         while len(lru) > max_size:
             lru.popitem(last=False)
+
+    def _record_clip_event(self, payload_clipped: bool) -> None:
+        self._clip_ratio_window.append(1 if payload_clipped else 0)
+        if len(self._clip_ratio_window) < self._clip_ratio_window.maxlen:
+            return
+        ratio = sum(self._clip_ratio_window) / float(len(self._clip_ratio_window))
+        if ratio > 0.2:
+            self.log.error(
+                f"CRITICAL payload clip ratio high in last 100 frames: ratio={ratio:.2f}"
+            )
 
     def _build_idempotency_key(self, frame_key: str) -> str:
         prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
@@ -580,7 +903,8 @@ class NetworkManager:
         delay = min(max_delay, base * (2 ** (capped_attempt - 1)))
         jitter_min = max(0.0, 1.0 - jitter_ratio)
         jitter_max = 1.0 + jitter_ratio
-        return delay * random.uniform(jitter_min, jitter_max)
+        jittered = delay * random.uniform(jitter_min, jitter_max)
+        return min(max_delay, max(0.0, jittered))
 
     @staticmethod
     def _clamp_bbox(
