@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 from collections import Counter
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import cv2
 import torch
@@ -25,6 +25,7 @@ from src.localization import VisualOdometry
 from src.movement import MovementEstimator
 from src.resilience import SessionResilienceController
 from src.runtime_profile import apply_runtime_profile
+from src.send_state import apply_send_result_status
 from src.utils import Logger, Visualizer
 
 BANNER = """
@@ -455,7 +456,7 @@ def run_competition(log: Logger) -> None:
                     pending_result,
                     should_abort_session,
                     success_cycle,
-                ) = _apply_send_result_status(
+                ) = apply_send_result_status(
                     send_status=send_status,
                     pending_result=pending_result,
                     kpi_counters=kpi_counters,
@@ -586,28 +587,6 @@ def _print_competition_result(
         f"Send: {send_status_text} ({send_status}) | Mode: {mode} | "
         f"Pos: x={x:+.1f} y={y:+.1f} z={z:.1f}"
     )
-
-
-def _apply_send_result_status(
-    send_status,
-    pending_result: Optional[Dict],
-    kpi_counters: Dict[str, int],
-) -> Tuple[Optional[Dict], bool, bool]:
-    status_value = str(getattr(send_status, "value", send_status))
-    if status_value == "acked":
-        kpi_counters["send_ok"] += 1
-        return None, False, True
-    if status_value == "fallback_acked":
-        kpi_counters["send_ok"] += 1
-        kpi_counters["send_fallback_ok"] += 1
-        return None, False, True
-    if status_value == "permanent_rejected":
-        kpi_counters["send_fail"] += 1
-        kpi_counters["send_permanent_reject"] += 1
-        return pending_result, True, False
-
-    kpi_counters["send_fail"] += 1
-    return pending_result, False, False
 
 
 def _print_summary(
