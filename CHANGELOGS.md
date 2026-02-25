@@ -107,3 +107,8 @@
 - Added configuration controls in `config/settings.py` for motion compensation and rider suppression thresholds/flags.
 - Updated `README.md` with new configuration tables, motion-comp behavior, and scooter approximation note.
 - Added lightweight unit tests in `tests/test_movement_compensation.py` and `tests/test_rider_suppression.py` covering planned motion and rider suppression scenarios with dependency-aware skips.
+
+## 0.0.23 - 2026-02-26
+- Hardened `main.py` competition loop with a "no frame left behind" state machine: when image download fails, the runtime now sends a mandatory fallback result (`detected_objects=[]`, zero translations) instead of skipping the frame.
+- Enforced ACK-gated progression: the runtime no longer fetches a new frame while a previous frame result is unacknowledged, and retries result submission with bounded backoff plus failure budget for protocol-safe behavior.
+- Added a debug safety guard so visualizer drawing is skipped cleanly on fallback frames where no decoded image exists.

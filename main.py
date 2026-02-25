@@ -246,6 +246,8 @@ def run_competition(log: Logger) -> None:
     running = True
     transient_failures = 0
     transient_budget = max(10, Settings.MAX_RETRIES * 5)
+    ack_failures = 0
+    ack_failure_budget = max(20, Settings.MAX_RETRIES * 10)
 
     kpi_counters: Dict[str, int] = {
         "send_ok": 0,
@@ -253,6 +255,7 @@ def run_competition(log: Logger) -> None:
         "mode_gps": 0,
         "mode_of": 0,
     }
+    pending_result: Optional[Dict] = None
 
     def signal_handler(sig, frame):
         nonlocal running
@@ -271,64 +274,106 @@ def run_competition(log: Logger) -> None:
                     )
                     break
 
-                fetch_result = network.get_frame()
+                if pending_result is None:
+                    fetch_result = network.get_frame()
 
-                if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
-                    log.info("End of stream confirmed by server (204)")
-                    break
-
-                if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
-                    transient_failures += 1
-                    delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4)))
-                    log.warn(
-                        f"Transient frame fetch failure {transient_failures}/{transient_budget}; "
-                        f"retrying in {delay:.1f}s"
-                    )
-                    if transient_failures >= transient_budget:
-                        log.error("Transient failure budget exceeded, aborting session")
+                    if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
+                        log.info("End of stream confirmed by server (204)")
                         break
-                    time.sleep(delay)
-                    continue
 
-                if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
-                    log.error(
-                        f"Fatal frame fetch error: {fetch_result.error_type} "
-                        f"(http={fetch_result.http_status})"
-                    )
-                    break
+                    if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
+                        transient_failures += 1
+                        delay = min(
+                            5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4))
+                        )
+                        log.warn(
+                            f"Transient frame fetch failure {transient_failures}/{transient_budget}; "
+                            f"retrying in {delay:.1f}s"
+                        )
+                        if transient_failures >= transient_budget:
+                            log.error("Transient failure budget exceeded, aborting session")
+                            break
+                        time.sleep(delay)
+                        continue
 
-                frame_data = fetch_result.frame_data or {}
-                transient_failures = 0
+                    if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
+                        log.error(
+                            f"Fatal frame fetch error: {fetch_result.error_type} "
+                            f"(http={fetch_result.http_status})"
+                        )
+                        break
 
-                frame_id = frame_data.get("frame_id", "unknown")
-                frame = network.download_image(frame_data)
-                if frame is None:
-                    log.warn(f"Frame {frame_id}: image download failed, skipping")
-                    continue
+                    frame_data = fetch_result.frame_data or {}
+                    transient_failures = 0
 
-                detected_objects = detector.detect(frame)
-                detected_objects = movement.annotate(detected_objects, frame=frame)
+                    frame_id = frame_data.get("frame_id", "unknown")
+                    frame = network.download_image(frame_data)
+                    if frame is None:
+                        log.warn(
+                            f"Frame {frame_id}: image download failed, sending fallback result"
+                        )
+                        pending_result = {
+                            "frame_id": frame_id,
+                            "frame_data": frame_data,
+                            "detected_objects": [],
+                            "frame": None,
+                            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "detected_translation": {
+                                "translation_x": 0.0,
+                                "translation_y": 0.0,
+                                "translation_z": 0.0,
+                            },
+                            "frame_shape": None,
+                        }
+                    else:
+                        detected_objects = detector.detect(frame)
+                        detected_objects = movement.annotate(detected_objects, frame=frame)
 
-                position = odometry.update(frame, frame_data)
-                detected_translation = {
-                    "translation_x": position["x"],
-                    "translation_y": position["y"],
-                    "translation_z": position["z"],
-                }
+                        position = odometry.update(frame, frame_data)
+                        pending_result = {
+                            "frame_id": frame_id,
+                            "frame_data": frame_data,
+                            "detected_objects": detected_objects,
+                            "frame": frame,
+                            "position": position,
+                            "detected_translation": {
+                                "translation_x": position["x"],
+                                "translation_y": position["y"],
+                                "translation_z": position["z"],
+                            },
+                            "frame_shape": frame.shape,
+                        }
 
+                frame_id = pending_result["frame_id"]
+                frame_data = pending_result["frame_data"]
+                detected_objects = pending_result["detected_objects"]
+                frame_for_debug = pending_result["frame"]
+                position = pending_result["position"]
                 success = network.send_result(
                     frame_id,
                     detected_objects,
-                    detected_translation,
+                    pending_result["detected_translation"],
                     frame_data=frame_data,
-                    frame_shape=frame.shape,
+                    frame_shape=pending_result["frame_shape"],
                 )
 
                 if success:
                     kpi_counters["send_ok"] += 1
+                    ack_failures = 0
+                    pending_result = None
                 else:
                     kpi_counters["send_fail"] += 1
-                    log.warn(f"Frame {frame_id}: result send failed")
+                    ack_failures += 1
+                    delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
+                    log.warn(
+                        f"Frame {frame_id}: result send failed, waiting ACK "
+                        f"({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s"
+                    )
+                    if ack_failures >= ack_failure_budget:
+                        log.error("ACK failure budget exceeded, aborting session")
+                        break
+                    time.sleep(delay)
+                    continue
 
                 try:
                     gps_health = int(float(frame_data.get("gps_health", 0)))
@@ -340,9 +385,9 @@ def run_competition(log: Logger) -> None:
                 else:
                     kpi_counters["mode_of"] += 1
 
-                if Settings.DEBUG and visualizer is not None:
+                if Settings.DEBUG and visualizer is not None and frame_for_debug is not None:
                     visualizer.draw_detections(
-                        frame,
+                        frame_for_debug,
                         detected_objects,
                         frame_id=str(frame_id),
                         position=position,
