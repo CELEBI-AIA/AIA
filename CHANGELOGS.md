@@ -122,13 +122,6 @@
 - Enforced ACK-gated progression: the runtime no longer fetches a new frame while a previous frame result is unacknowledged, and retries result submission with bounded backoff plus failure budget for protocol-safe behavior.
 - Added a debug safety guard so visualizer drawing is skipped cleanly on fallback frames where no decoded image exists.
 
-## 0.0.24 - 2026-02-26
-- Added outbound payload preflight validation in `src/network.py` to enforce required top-level fields, strict translation schema (`len==1`), per-object normalization, and safe-fallback conversion on invalid payloads.
-- Implemented deterministic object-count protection with class quota + global cap (`RESULT_CLASS_QUOTA`, `RESULT_MAX_OBJECTS`) and structured clip telemetry logging.
-- Reworked `send_result` to explicit `SendResultStatus` flow and added 4xx handling that sends a single safe-fallback payload before classifying permanent rejection.
-- Updated competition send-state handling in `main.py` to branch on status outcomes and publish new KPI counters for fallback ACK, permanent reject, preflight reject, and payload clipping.
-- Added tests: `tests/test_network_payload_guard.py` and `tests/test_main_ack_state_machine.py`.
-
 ## 0.0.24 - 2026-02-25
 - Enforced competition-safe FP32 determinism in `main.py`: runtime now force-applies `deterministic-profile=max` in `--mode competition`, even when CLI requested `off` or `balanced`.
 - Added explicit override warning telemetry in `main.py` to reduce operator misconfiguration risk on final runs.
@@ -141,3 +134,10 @@
 - Added duplicate frame/client idempotency safeguards in `src/network.py`: seen-frame LRU (`SEEN_FRAME_LRU_SIZE`), duplicate marking via `FrameFetchResult.is_duplicate`, `Idempotency-Key` header generation (`IDEMPOTENCY_KEY_PREFIX`), and strict duplicate submit short-circuit after successful ACK.
 - Updated `main.py` competition runtime to drop duplicate frames before expensive inference/submit stages and extended KPI telemetry with `frame_duplicate_drop` + timeout counters (`timeout_fetch`, `timeout_image`, `timeout_submit`).
 - Added dependency-aware test coverage for hardening changes in `tests/test_network_timeouts.py`, `tests/test_frame_dedup.py`, `tests/test_idempotency_submit.py`, and `tests/test_competition_loop_hardening.py`.
+
+## 0.0.26 - 2026-02-26
+- Added outbound payload preflight validation in `src/network.py` to enforce required top-level fields, strict translation schema (`len==1`), per-object normalization, and safe-fallback conversion on invalid payloads.
+- Implemented deterministic object-count protection with class quota + global cap (`RESULT_CLASS_QUOTA`, `RESULT_MAX_OBJECTS`) and structured clip telemetry logging.
+- Reworked `send_result` to explicit `SendResultStatus` flow and added 4xx handling that sends a single safe-fallback payload before classifying permanent rejection.
+- Updated competition send-state handling in `main.py` to branch on status outcomes and publish new KPI counters for fallback ACK, permanent reject, preflight reject, and payload clipping.
+- Added tests: `tests/test_network_payload_guard.py` and `tests/test_main_ack_state_machine.py`.
