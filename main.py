@@ -23,6 +23,7 @@ from config.settings import Settings
 from src.detection import ObjectDetector
 from src.localization import VisualOdometry
 from src.movement import MovementEstimator
+from src.resilience import SessionResilienceController
 from src.runtime_profile import apply_runtime_profile
 from src.utils import Logger, Visualizer
 
@@ -248,12 +249,18 @@ def run_competition(log: Logger) -> None:
     transient_budget = max(10, Settings.MAX_RETRIES * 5)
     ack_failures = 0
     ack_failure_budget = max(20, Settings.MAX_RETRIES * 10)
+    resilience = SessionResilienceController(log=log)
 
     kpi_counters: Dict[str, int] = {
         "send_ok": 0,
         "send_fail": 0,
         "mode_gps": 0,
         "mode_of": 0,
+        "degrade_frames": 0,
+        "frame_duplicate_drop": 0,
+        "timeout_fetch": 0,
+        "timeout_image": 0,
+        "timeout_submit": 0,
     }
     pending_result: Optional[Dict] = None
 
@@ -268,6 +275,11 @@ def run_competition(log: Logger) -> None:
     try:
         while running:
             try:
+                abort_reason = resilience.should_abort()
+                if abort_reason:
+                    log.error(f"Resilience abort: {abort_reason}")
+                    break
+
                 if fps_counter.frame_count >= Settings.MAX_FRAMES:
                     log.success(
                         f"Max frame count reached ({Settings.MAX_FRAMES}), session complete"
@@ -275,7 +287,21 @@ def run_competition(log: Logger) -> None:
                     break
 
                 if pending_result is None:
+                    if not resilience.before_fetch():
+                        cooldown_left = resilience.open_cooldown_remaining()
+                        wait_s = min(max(0.2, Settings.RETRY_DELAY), max(0.2, cooldown_left))
+                        log.warn(
+                            "Circuit breaker OPEN; waiting cooldown "
+                            f"({cooldown_left:.1f}s remaining, sleep={wait_s:.1f}s)"
+                        )
+                        time.sleep(wait_s)
+                        continue
+
                     fetch_result = network.get_frame()
+                    timeout_snapshot = network.consume_timeout_counters()
+                    kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+                    kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+                    kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
 
                     if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
                         log.info("End of stream confirmed by server (204)")
@@ -283,6 +309,7 @@ def run_competition(log: Logger) -> None:
 
                     if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
                         transient_failures += 1
+                        resilience.on_fetch_transient()
                         delay = min(
                             5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4))
                         )
@@ -291,8 +318,10 @@ def run_competition(log: Logger) -> None:
                             f"retrying in {delay:.1f}s"
                         )
                         if transient_failures >= transient_budget:
-                            log.error("Transient failure budget exceeded, aborting session")
-                            break
+                            log.warn(
+                                "Transient failure budget reached; "
+                                "session stays alive under wall-clock circuit breaker policy"
+                            )
                         time.sleep(delay)
                         continue
 
@@ -305,19 +334,70 @@ def run_competition(log: Logger) -> None:
 
                     frame_data = fetch_result.frame_data or {}
                     transient_failures = 0
+                    degrade_mode = (
+                        Settings.DEGRADE_FETCH_ONLY_ENABLED and resilience.is_degraded()
+                    )
 
                     frame_id = frame_data.get("frame_id", "unknown")
-                    frame = network.download_image(frame_data)
-                    if frame is None:
+                    if fetch_result.is_duplicate:
+                        kpi_counters["frame_duplicate_drop"] += 1
                         log.warn(
-                            f"Frame {frame_id}: image download failed, sending fallback result"
+                            f"Frame {frame_id}: duplicate metadata detected, dropping before inference/submit"
                         )
+                        continue
+
+                    frame = None
+                    use_fallback = False
+
+                    if degrade_mode:
+                        kpi_counters["degrade_frames"] += 1
+                        degrade_seq = resilience.record_degraded_frame()
+                        heavy_every = max(1, int(Settings.DEGRADE_SEND_INTERVAL_FRAMES))
+                        should_try_heavy = (degrade_seq % heavy_every) == 0
+                        if should_try_heavy:
+                            frame = network.download_image(frame_data)
+                            timeout_snapshot = network.consume_timeout_counters()
+                            kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+                            kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+                            kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+                            if frame is None:
+                                use_fallback = True
+                                log.warn(
+                                    f"Frame {frame_id}: degrade heavy pass image download failed, "
+                                    "sending fallback result"
+                                )
+                            else:
+                                log.info(
+                                    f"Frame {frame_id}: degrade heavy pass "
+                                    f"(every {heavy_every} frames)"
+                                )
+                        else:
+                            use_fallback = True
+                            log.info(
+                                f"Frame {frame_id}: degraded fetch-only fallback "
+                                f"(slot {degrade_seq}/{heavy_every})"
+                            )
+                    else:
+                        frame = network.download_image(frame_data)
+                        timeout_snapshot = network.consume_timeout_counters()
+                        kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+                        kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+                        kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+                        if frame is None:
+                            use_fallback = True
+                            log.warn(
+                                f"Frame {frame_id}: image download failed, sending fallback result"
+                            )
+
+                    if use_fallback:
                         pending_result = {
                             "frame_id": frame_id,
                             "frame_data": frame_data,
                             "detected_objects": [],
                             "frame": None,
                             "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                            "degraded": degrade_mode,
+                            "pending_ttl": 1 if degrade_mode else None,
                             "detected_translation": {
                                 "translation_x": 0.0,
                                 "translation_y": 0.0,
@@ -336,6 +416,8 @@ def run_competition(log: Logger) -> None:
                             "detected_objects": detected_objects,
                             "frame": frame,
                             "position": position,
+                            "degraded": degrade_mode,
+                            "pending_ttl": 1 if degrade_mode else None,
                             "detected_translation": {
                                 "translation_x": position["x"],
                                 "translation_y": position["y"],
@@ -355,23 +437,41 @@ def run_competition(log: Logger) -> None:
                     pending_result["detected_translation"],
                     frame_data=frame_data,
                     frame_shape=pending_result["frame_shape"],
+                    degrade=bool(pending_result.get("degraded", False)),
                 )
+                timeout_snapshot = network.consume_timeout_counters()
+                kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+                kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+                kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
 
                 if success:
                     kpi_counters["send_ok"] += 1
                     ack_failures = 0
                     pending_result = None
+                    resilience.on_success_cycle()
                 else:
                     kpi_counters["send_fail"] += 1
                     ack_failures += 1
+                    resilience.on_ack_failure()
                     delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
                     log.warn(
                         f"Frame {frame_id}: result send failed, waiting ACK "
                         f"({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s"
                     )
                     if ack_failures >= ack_failure_budget:
-                        log.error("ACK failure budget exceeded, aborting session")
-                        break
+                        log.warn(
+                            "ACK failure budget reached; "
+                            "session stays alive under wall-clock circuit breaker policy"
+                        )
+                    pending_ttl = pending_result.get("pending_ttl")
+                    if pending_ttl is not None:
+                        pending_ttl = int(pending_ttl) - 1
+                        pending_result["pending_ttl"] = pending_ttl
+                        if pending_ttl <= 0:
+                            log.warn(
+                                f"Frame {frame_id}: stale degraded pending result dropped after TTL"
+                            )
+                            pending_result = None
                     time.sleep(delay)
                     continue
 
@@ -418,12 +518,24 @@ def run_competition(log: Logger) -> None:
                 time.sleep(0.5)
 
     finally:
+        resilience_stats = resilience.finalize()
         log.info("Cleaning resources...")
         if Settings.DEBUG and visualizer is not None:
             cv2.destroyAllWindows()
             cv2.waitKey(1)
 
-        _print_summary(log, fps_counter, kpi_counters=kpi_counters)
+        _print_summary(
+            log,
+            fps_counter,
+            kpi_counters=kpi_counters,
+            resilience_stats={
+                "breaker_open_count": resilience_stats.breaker_open_count,
+                "degrade_entries": resilience_stats.degrade_entries,
+                "degrade_frames": resilience_stats.degrade_frames,
+                "recovered_count": resilience_stats.recovered_count,
+                "transient_wall_time_sec": resilience_stats.transient_wall_time_sec,
+            },
+        )
 
 
 def _print_competition_result(
@@ -462,6 +574,7 @@ def _print_summary(
     log: Logger,
     fps_counter: FPSCounter,
     kpi_counters: Optional[Dict[str, int]] = None,
+    resilience_stats: Optional[Dict[str, float]] = None,
 ) -> None:
     log.info("-" * 50)
     log.info(f"Total processed frames: {fps_counter.frame_count}")
@@ -481,7 +594,22 @@ def _print_summary(
             f"Send OK={kpi_counters.get('send_ok', 0)} | "
             f"Send FAIL={kpi_counters.get('send_fail', 0)} | "
             f"Mode GPS={kpi_counters.get('mode_gps', 0)} | "
-            f"Mode OF={kpi_counters.get('mode_of', 0)}"
+            f"Mode OF={kpi_counters.get('mode_of', 0)} | "
+            f"Degrade Frames={kpi_counters.get('degrade_frames', 0)} | "
+            f"DupDrop={kpi_counters.get('frame_duplicate_drop', 0)} | "
+            f"Timeouts(fetch/image/submit)="
+            f"{kpi_counters.get('timeout_fetch', 0)}/"
+            f"{kpi_counters.get('timeout_image', 0)}/"
+            f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+
+    if resilience_stats is not None:
+        log.info(
+            "Resilience: "
+            f"Breaker Open Count={int(resilience_stats.get('breaker_open_count', 0))} | "
+            f"Degrade Entries={int(resilience_stats.get('degrade_entries', 0))} | "
+            f"Recovery Count={int(resilience_stats.get('recovered_count', 0))} | "
+            f"Transient Wall Time={float(resilience_stats.get('transient_wall_time_sec', 0.0)):.1f}s"
         )
 
     log.success("System shutdown complete")

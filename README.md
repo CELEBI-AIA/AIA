@@ -324,6 +324,7 @@ Sistem çıktılarının tekrarlanabilir olması için aşağıdaki kurallar zor
 5. **Frame-Index Tabanlı Karar Kuralları:**
    - Adaptasyonlar wall-clock süreye göre değil, frame index/pencere kuralına göre yapılmalıdır.
    - Bu yaklaşım farklı donanımlarda aynı karar davranışını korur.
+   - Not: Wall-clock kullanımı yalnızca ağ dayanıklılığı orkestrasyonu (circuit breaker/degrade) için kabul edilir; model karar mantığı (`motion_status`, `landing_status`, sınıf çıktıları) frame-index tabanlı kalmalıdır.
 
 6. **Runtime Profil Kullanımı:**
    - Yarışma için `--deterministic-profile balanced` önerilir.

@@ -108,6 +108,15 @@
 - Updated `README.md` with new configuration tables, motion-comp behavior, and scooter approximation note.
 - Added lightweight unit tests in `tests/test_movement_compensation.py` and `tests/test_rider_suppression.py` covering planned motion and rider suppression scenarios with dependency-aware skips.
 
+## 0.0.24 - 2026-02-25
+- Added wall-clock aware session resilience layer (`src/resilience.py`) with `NORMAL/DEGRADED/OPEN` breaker states, transient event windows, cooldown-based half-open transition, and soft-first abort policy.
+- Refactored `main.py` competition loop to use resilience orchestration: transient/ACK storms trigger degrade/open flow instead of immediate budget abort, while `FATAL_ERROR` and `204 END_OF_STREAM` behavior remains strict.
+- Implemented fetch-only degrade mode in competition flow with configurable heavy-pass interval (`DEGRADE_SEND_INTERVAL_FRAMES`) and stale pending TTL protection for degraded frames.
+- Extended `NetworkManager.send_result(..., degrade: bool = False)` logging for resilience telemetry without changing payload schema semantics.
+- Added new resilience configuration knobs in `config/settings.py` (`CB_TRANSIENT_WINDOW_SEC`, `CB_TRANSIENT_MAX_EVENTS`, `CB_OPEN_COOLDOWN_SEC`, `CB_MAX_OPEN_CYCLES`, `CB_SESSION_MAX_TRANSIENT_SEC`, `DEGRADE_FETCH_ONLY_ENABLED`, `DEGRADE_SEND_INTERVAL_FRAMES`).
+- Added unit tests in `tests/test_session_resilience.py` covering transient window trigger, OPEN→DEGRADED→NORMAL recovery path, wall-clock abort, and breaker open-cycle abort.
+- Updated `README.md` determinism section to clarify that wall-clock is used only for network resilience orchestration, not model decision logic.
+
 ## 0.0.23 - 2026-02-26
 - Hardened `main.py` competition loop with a "no frame left behind" state machine: when image download fails, the runtime now sends a mandatory fallback result (`detected_objects=[]`, zero translations) instead of skipping the frame.
 - Enforced ACK-gated progression: the runtime no longer fetches a new frame while a previous frame result is unacknowledged, and retries result submission with bounded backoff plus failure budget for protocol-safe behavior.

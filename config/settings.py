@@ -208,12 +208,43 @@ class Settings:
 
     # HTTP İstek Timeout (saniye)
     REQUEST_TIMEOUT: int = 5
+    # Yeni timeout ayrıştırması için fallback taban değer (geriye uyumluluk)
+    REQUEST_CONNECT_TIMEOUT_SEC: float = 1.5
+    REQUEST_READ_TIMEOUT_SEC_FRAME_META: float = 2.5
+    REQUEST_READ_TIMEOUT_SEC_IMAGE: float = 4.0
+    REQUEST_READ_TIMEOUT_SEC_SUBMIT: float = 3.5
 
     # Bağlantı Hatası Retry Sayısı
     MAX_RETRIES: int = 3
 
     # Retry Arası Bekleme (saniye)
     RETRY_DELAY: float = 1.0
+    BACKOFF_BASE_SEC: float = 0.4
+    BACKOFF_MAX_SEC: float = 5.0
+    BACKOFF_JITTER_RATIO: float = 0.25
+    SEEN_FRAME_LRU_SIZE: int = 512
+    IDEMPOTENCY_KEY_PREFIX: str = "aia"
+
+    # Circuit breaker transient pencere süresi (saniye)
+    CB_TRANSIENT_WINDOW_SEC: float = 30.0
+
+    # Aynı pencere içindeki transient olay limiti (open tetikleme)
+    CB_TRANSIENT_MAX_EVENTS: int = 12
+
+    # Breaker OPEN bekleme (cooldown) süresi (saniye)
+    CB_OPEN_COOLDOWN_SEC: float = 8.0
+
+    # Oturumda izin verilen maksimum breaker OPEN çevrimi
+    CB_MAX_OPEN_CYCLES: int = 6
+
+    # Oturum genelinde transient/degrade toplam duvar saati limiti (saniye)
+    CB_SESSION_MAX_TRANSIENT_SEC: float = 120.0
+
+    # Degrade modunda fetch-only yaklaşımı (ağ toparlanana kadar ağır inference azaltılır)
+    DEGRADE_FETCH_ONLY_ENABLED: bool = True
+
+    # Degrade modunda ağır inference deneme aralığı (her N karede bir)
+    DEGRADE_SEND_INTERVAL_FRAMES: int = 3
 
     # =========================================================================
     #  DOSYA YOLLARI

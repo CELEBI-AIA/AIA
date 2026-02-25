@@ -6,9 +6,11 @@ Retry mekanizması, hata yönetimi ve simülasyon modu desteği içerir.
 """
 
 import time
+import random
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -31,6 +33,14 @@ class FrameFetchResult:
     frame_data: Optional[Dict[str, Any]] = None
     error_type: str = ""
     http_status: Optional[int] = None
+    is_duplicate: bool = False
+
+
+class SendResultStatus(str, Enum):
+    ACKED = "acked"
+    FALLBACK_ACKED = "fallback_acked"
+    RETRYABLE_FAILURE = "retryable_failure"
+    PERMANENT_REJECTED = "permanent_rejected"
 
 
 class NetworkManager:
@@ -50,6 +60,19 @@ class NetworkManager:
         self._frame_counter: int = 0
         self._result_counter: int = 0
         self._sim_image_cache: Optional[np.ndarray] = None
+        self._seen_frames_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._submitted_frames_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._force_fallback_frames_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._timeout_counters: Dict[str, int] = {
+            "fetch": 0,
+            "image": 0,
+            "submit": 0,
+        }
+        self._payload_guard_counters: Dict[str, int] = {
+            "preflight_reject": 0,
+            "payload_clipped": 0,
+        }
+        self._clip_ratio_window: Deque[int] = deque(maxlen=100)
 
     def start_session(self) -> bool:
         """Sunucu ile oturum başlatır."""
@@ -63,7 +86,8 @@ class NetworkManager:
                     f"Connecting server... (Attempt {attempt}/{Settings.MAX_RETRIES})"
                 )
                 response = self.session.get(
-                    self.base_url, timeout=Settings.REQUEST_TIMEOUT
+                    self.base_url,
+                    timeout=self._timeout_tuple(self._read_timeout_frame_meta()),
                 )
                 if response.status_code == 200:
                     self.log.success(f"Server connection successful -> {self.base_url}")
@@ -74,12 +98,13 @@ class NetworkManager:
                     f"Connection error! Retrying in {Settings.RETRY_DELAY}s..."
                 )
             except requests.Timeout:
+                self._increment_timeout_counter("fetch")
                 self.log.error(
                     f"Connection timeout! Retrying in {Settings.RETRY_DELAY}s..."
                 )
             except Exception as exc:
                 self.log.error(f"Unexpected startup error: {exc}")
-            time.sleep(Settings.RETRY_DELAY)
+            self._sleep_with_backoff(attempt)
 
         self.log.error("Server unavailable after all retries.")
         return False
@@ -96,7 +121,10 @@ class NetworkManager:
 
         for attempt in range(1, Settings.MAX_RETRIES + 1):
             try:
-                response = self.session.get(url, timeout=Settings.REQUEST_TIMEOUT)
+                response = self.session.get(
+                    url,
+                    timeout=self._timeout_tuple(self._read_timeout_frame_meta()),
+                )
 
                 if response.status_code == 200:
                     data = response.json()
@@ -115,10 +143,16 @@ class NetworkManager:
                             tag=f"frame_{self._frame_counter}",
                         )
                     self._frame_counter += 1
+                    is_duplicate = self._mark_seen_frame(data.get("frame_id"))
+                    if is_duplicate:
+                        self.log.warn(
+                            f"Duplicate frame_id dropped by client dedup: {data.get('frame_id')}"
+                        )
                     return FrameFetchResult(
                         status=FrameFetchStatus.OK,
                         frame_data=data,
                         http_status=200,
+                        is_duplicate=is_duplicate,
                     )
 
                 if response.status_code == 204:
@@ -132,7 +166,7 @@ class NetworkManager:
                     self.log.warn(
                         f"Server temporary error: HTTP {response.status_code}"
                     )
-                    time.sleep(Settings.RETRY_DELAY)
+                    self._sleep_with_backoff(attempt)
                     continue
 
                 self.log.error(f"Unexpected frame response: HTTP {response.status_code}")
@@ -143,6 +177,8 @@ class NetworkManager:
                 )
 
             except (requests.ConnectionError, requests.Timeout) as exc:
+                if isinstance(exc, requests.Timeout):
+                    self._increment_timeout_counter("fetch")
                 self.log.warn(
                     f"Frame fetch transient error ({type(exc).__name__}) "
                     f"Attempt {attempt}/{Settings.MAX_RETRIES}"
@@ -156,7 +192,7 @@ class NetworkManager:
             except Exception as exc:
                 self.log.warn(f"Frame fetch transient exception: {exc}")
 
-            time.sleep(Settings.RETRY_DELAY)
+            self._sleep_with_backoff(attempt)
 
         return FrameFetchResult(
             status=FrameFetchStatus.TRANSIENT_ERROR,
@@ -177,7 +213,10 @@ class NetworkManager:
 
         for attempt in range(1, Settings.MAX_RETRIES + 1):
             try:
-                response = self.session.get(full_url, timeout=Settings.REQUEST_TIMEOUT)
+                response = self.session.get(
+                    full_url,
+                    timeout=self._timeout_tuple(self._read_timeout_image()),
+                )
                 if response.status_code == 200:
                     img_array = np.frombuffer(response.content, dtype=np.uint8)
                     frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -191,13 +230,14 @@ class NetworkManager:
 
                 self.log.warn(f"Image download HTTP {response.status_code}")
             except requests.Timeout:
+                self._increment_timeout_counter("image")
                 self.log.warn(
                     f"Image download timeout attempt {attempt}/{Settings.MAX_RETRIES}"
                 )
             except Exception as exc:
                 self.log.warn(f"Image download transient error: {exc}")
 
-            time.sleep(Settings.RETRY_DELAY)
+            self._sleep_with_backoff(attempt)
 
         self.log.error("Image download failed after all retries")
         return None
@@ -209,6 +249,7 @@ class NetworkManager:
         detected_translation: Dict[str, float],
         frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
+        degrade: bool = False,
     ) -> bool:
         """Tespit ve konum sonuçlarını TEKNOFEST taslak şemasına uyumlu JSON ile gönderir."""
         payload = self.build_competition_payload(
@@ -226,22 +267,38 @@ class NetworkManager:
         if self.simulation_mode:
             self.log.success(
                 f"[SIMULATION] Result prepared -> Frame: {frame_id} | "
-                f"Objects: {len(payload['detected_objects'])}"
+                f"Objects: {len(payload['detected_objects'])} | "
+                f"Degrade: {'ON' if degrade else 'OFF'}"
+            )
+            return True
+
+        frame_key = self._normalize_frame_key(frame_id)
+        if self._was_already_submitted(frame_key):
+            self.log.warn(
+                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard"
             )
             return True
 
         url = f"{self.base_url}{Settings.ENDPOINT_SUBMIT_RESULT}"
+        idempotency_key = self._build_idempotency_key(frame_key)
 
         for attempt in range(1, Settings.MAX_RETRIES + 1):
             try:
                 response = self.session.post(
                     url,
                     json=payload,
-                    timeout=Settings.REQUEST_TIMEOUT,
-                    headers={"Content-Type": "application/json"},
+                    timeout=self._timeout_tuple(self._read_timeout_submit()),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": idempotency_key,
+                    },
                 )
                 if response.status_code == 200:
-                    self.log.debug(f"Result sent successfully: Frame {frame_id}")
+                    self.log.debug(
+                        f"Result sent successfully: Frame {frame_id} "
+                        f"(degrade={'ON' if degrade else 'OFF'})"
+                    )
+                    self._mark_submitted(frame_key)
                     return True
 
                 self.log.warn(
@@ -249,6 +306,7 @@ class NetworkManager:
                     f"(attempt {attempt}/{Settings.MAX_RETRIES})"
                 )
             except requests.Timeout:
+                self._increment_timeout_counter("submit")
                 self.log.warn(
                     f"Submit timeout attempt {attempt}/{Settings.MAX_RETRIES}"
                 )
@@ -258,7 +316,7 @@ class NetworkManager:
                     f"(attempt {attempt}/{Settings.MAX_RETRIES})"
                 )
 
-            time.sleep(Settings.RETRY_DELAY)
+            self._sleep_with_backoff(attempt)
 
         self.log.error(f"Result submission failed after retries for frame {frame_id}")
         return False
@@ -429,6 +487,100 @@ class NetworkManager:
                     data[key] = 0.0
 
         return True
+
+    def consume_timeout_counters(self) -> Dict[str, int]:
+        snapshot = dict(self._timeout_counters)
+        for key in self._timeout_counters:
+            self._timeout_counters[key] = 0
+        return snapshot
+
+    def _increment_timeout_counter(self, key: str) -> None:
+        if key in self._timeout_counters:
+            self._timeout_counters[key] += 1
+
+    @staticmethod
+    def _normalize_frame_key(frame_id: Any) -> str:
+        if frame_id is None:
+            return "unknown"
+        return str(frame_id).strip() or "unknown"
+
+    def _mark_seen_frame(self, frame_id: Any) -> bool:
+        key = self._normalize_frame_key(frame_id)
+        if key in self._seen_frames_lru:
+            self._seen_frames_lru.move_to_end(key)
+            return True
+        self._touch_lru(self._seen_frames_lru, key)
+        return False
+
+    def _was_already_submitted(self, frame_key: str) -> bool:
+        if frame_key in self._submitted_frames_lru:
+            self._submitted_frames_lru.move_to_end(frame_key)
+            return True
+        return False
+
+    def _mark_submitted(self, frame_key: str) -> None:
+        self._touch_lru(self._submitted_frames_lru, frame_key)
+
+    def _touch_lru(self, lru: "OrderedDict[str, None]", key: str) -> None:
+        lru[key] = None
+        lru.move_to_end(key)
+        max_size = max(1, int(getattr(Settings, "SEEN_FRAME_LRU_SIZE", 512)))
+        while len(lru) > max_size:
+            lru.popitem(last=False)
+
+    def _build_idempotency_key(self, frame_key: str) -> str:
+        prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
+        return f"{prefix}:{frame_key}"
+
+    def _timeout_tuple(self, read_timeout: float) -> Tuple[float, float]:
+        connect_timeout = self._connect_timeout()
+        read_timeout = max(0.1, float(read_timeout))
+        return (connect_timeout, read_timeout)
+
+    def _connect_timeout(self) -> float:
+        raw = getattr(Settings, "REQUEST_CONNECT_TIMEOUT_SEC", Settings.REQUEST_TIMEOUT)
+        return max(0.1, float(raw))
+
+    def _read_timeout_frame_meta(self) -> float:
+        raw = getattr(
+            Settings,
+            "REQUEST_READ_TIMEOUT_SEC_FRAME_META",
+            Settings.REQUEST_TIMEOUT,
+        )
+        return max(0.1, float(raw))
+
+    def _read_timeout_image(self) -> float:
+        raw = getattr(
+            Settings,
+            "REQUEST_READ_TIMEOUT_SEC_IMAGE",
+            Settings.REQUEST_TIMEOUT,
+        )
+        return max(0.1, float(raw))
+
+    def _read_timeout_submit(self) -> float:
+        raw = getattr(
+            Settings,
+            "REQUEST_READ_TIMEOUT_SEC_SUBMIT",
+            Settings.REQUEST_TIMEOUT,
+        )
+        return max(0.1, float(raw))
+
+    def _sleep_with_backoff(self, attempt: int) -> None:
+        time.sleep(self._compute_backoff_delay(attempt))
+
+    def _compute_backoff_delay(self, attempt: int) -> float:
+        capped_attempt = max(1, int(attempt))
+        base = float(getattr(Settings, "BACKOFF_BASE_SEC", Settings.RETRY_DELAY))
+        max_delay = float(getattr(Settings, "BACKOFF_MAX_SEC", 5.0))
+        jitter_ratio = float(getattr(Settings, "BACKOFF_JITTER_RATIO", 0.25))
+        base = max(0.01, base)
+        max_delay = max(base, max_delay)
+        jitter_ratio = min(max(jitter_ratio, 0.0), 1.0)
+
+        delay = min(max_delay, base * (2 ** (capped_attempt - 1)))
+        jitter_min = max(0.0, 1.0 - jitter_ratio)
+        jitter_max = 1.0 + jitter_ratio
+        return delay * random.uniform(jitter_min, jitter_max)
 
     @staticmethod
     def _clamp_bbox(
