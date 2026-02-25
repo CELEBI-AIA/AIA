@@ -121,3 +121,16 @@
 - Hardened `main.py` competition loop with a "no frame left behind" state machine: when image download fails, the runtime now sends a mandatory fallback result (`detected_objects=[]`, zero translations) instead of skipping the frame.
 - Enforced ACK-gated progression: the runtime no longer fetches a new frame while a previous frame result is unacknowledged, and retries result submission with bounded backoff plus failure budget for protocol-safe behavior.
 - Added a debug safety guard so visualizer drawing is skipped cleanly on fallback frames where no decoded image exists.
+
+## 0.0.24 - 2026-02-25
+- Enforced competition-safe FP32 determinism in `main.py`: runtime now force-applies `deterministic-profile=max` in `--mode competition`, even when CLI requested `off` or `balanced`.
+- Added explicit override warning telemetry in `main.py` to reduce operator misconfiguration risk on final runs.
+- Extended runtime profile observability in `src/runtime_profile.py` to log both `requested` and `effective` profile values for auditability.
+- Updated deterministic profile guidance in `README.md`: competition path requires `max` (FP32), while `balanced` remains the speed-oriented simulation profile.
+
+## 0.0.25 - 2026-02-25
+- Implemented adaptive HTTP timeout split in `src/network.py` with separate connect/read budgets for frame metadata, image download, and result submission (`REQUEST_CONNECT_TIMEOUT_SEC`, `REQUEST_READ_TIMEOUT_SEC_*`) while preserving fallback compatibility with legacy `REQUEST_TIMEOUT`.
+- Added jittered exponential backoff (`BACKOFF_BASE_SEC`, `BACKOFF_MAX_SEC`, `BACKOFF_JITTER_RATIO`) and wired it into network retry paths to reduce chained timeout stalls under transient network turbulence.
+- Added duplicate frame/client idempotency safeguards in `src/network.py`: seen-frame LRU (`SEEN_FRAME_LRU_SIZE`), duplicate marking via `FrameFetchResult.is_duplicate`, `Idempotency-Key` header generation (`IDEMPOTENCY_KEY_PREFIX`), and strict duplicate submit short-circuit after successful ACK.
+- Updated `main.py` competition runtime to drop duplicate frames before expensive inference/submit stages and extended KPI telemetry with `frame_duplicate_drop` + timeout counters (`timeout_fetch`, `timeout_image`, `timeout_submit`).
+- Added dependency-aware test coverage for hardening changes in `tests/test_network_timeouts.py`, `tests/test_frame_dedup.py`, `tests/test_idempotency_submit.py`, and `tests/test_competition_loop_hardening.py`.

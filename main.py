@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 from collections import Counter
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import torch
@@ -220,7 +220,7 @@ def _print_simulation_result(
 
 
 def run_competition(log: Logger) -> None:
-    from src.network import FrameFetchStatus, NetworkManager
+    from src.network import FrameFetchStatus, NetworkManager, SendResultStatus
 
     log.info("Initializing modules...")
 
@@ -254,6 +254,10 @@ def run_competition(log: Logger) -> None:
     kpi_counters: Dict[str, int] = {
         "send_ok": 0,
         "send_fail": 0,
+        "send_fallback_ok": 0,
+        "send_permanent_reject": 0,
+        "payload_preflight_reject_count": 0,
+        "payload_clipped_count": 0,
         "mode_gps": 0,
         "mode_of": 0,
         "degrade_frames": 0,
@@ -431,7 +435,7 @@ def run_competition(log: Logger) -> None:
                 detected_objects = pending_result["detected_objects"]
                 frame_for_debug = pending_result["frame"]
                 position = pending_result["position"]
-                success = network.send_result(
+                send_status = network.send_result(
                     frame_id,
                     detected_objects,
                     pending_result["detected_translation"],
@@ -443,19 +447,33 @@ def run_competition(log: Logger) -> None:
                 kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
                 kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
                 kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+                guard_snapshot = network.consume_payload_guard_counters()
+                kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
+                kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
 
-                if success:
-                    kpi_counters["send_ok"] += 1
+                (
+                    pending_result,
+                    should_abort_session,
+                    success_cycle,
+                ) = _apply_send_result_status(
+                    send_status=send_status,
+                    pending_result=pending_result,
+                    kpi_counters=kpi_counters,
+                )
+
+                if should_abort_session:
+                    log.error(f"Frame {frame_id}: permanent rejected payload, aborting session")
+                    break
+
+                if success_cycle:
                     ack_failures = 0
-                    pending_result = None
                     resilience.on_success_cycle()
                 else:
-                    kpi_counters["send_fail"] += 1
                     ack_failures += 1
                     resilience.on_ack_failure()
                     delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
                     log.warn(
-                        f"Frame {frame_id}: result send failed, waiting ACK "
+                        f"Frame {frame_id}: result send failed ({send_status}), waiting ACK "
                         f"({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s"
                     )
                     if ack_failures >= ack_failure_budget:
@@ -501,7 +519,7 @@ def run_competition(log: Logger) -> None:
                         log=log,
                         frame_id=frame_id,
                         detected_objects=detected_objects,
-                        success=success,
+                        send_status=str(getattr(send_status, "value", send_status)),
                         frame_data=frame_data,
                         position=position,
                     )
@@ -542,7 +560,7 @@ def _print_competition_result(
     log: Logger,
     frame_id,
     detected_objects: list,
-    success: bool,
+    send_status: str,
     frame_data: dict,
     position: dict,
 ) -> None:
@@ -562,12 +580,34 @@ def _print_competition_result(
     y = _safe_float(position.get("y", 0.0))
     z = _safe_float(position.get("z", 0.0))
 
-    send_status = "OK" if success else "FAIL"
+    send_status_text = "OK" if send_status in {"acked", "fallback_acked"} else "FAIL"
     log.info(
         f"Frame: {frame_id} | Obj: {len(detected_objects)} | "
-        f"Send: {send_status} | Mode: {mode} | "
+        f"Send: {send_status_text} ({send_status}) | Mode: {mode} | "
         f"Pos: x={x:+.1f} y={y:+.1f} z={z:.1f}"
     )
+
+
+def _apply_send_result_status(
+    send_status,
+    pending_result: Optional[Dict],
+    kpi_counters: Dict[str, int],
+) -> Tuple[Optional[Dict], bool, bool]:
+    status_value = str(getattr(send_status, "value", send_status))
+    if status_value == "acked":
+        kpi_counters["send_ok"] += 1
+        return None, False, True
+    if status_value == "fallback_acked":
+        kpi_counters["send_ok"] += 1
+        kpi_counters["send_fallback_ok"] += 1
+        return None, False, True
+    if status_value == "permanent_rejected":
+        kpi_counters["send_fail"] += 1
+        kpi_counters["send_permanent_reject"] += 1
+        return pending_result, True, False
+
+    kpi_counters["send_fail"] += 1
+    return pending_result, False, False
 
 
 def _print_summary(
@@ -692,7 +732,16 @@ def main() -> None:
     log = Logger("Main")
     args = parse_args()
 
-    apply_runtime_profile(args.deterministic_profile)
+    requested_profile = args.deterministic_profile
+    effective_profile = requested_profile
+    if args.mode == "competition" and requested_profile != "max":
+        log.warn(
+            "Competition mode requires deterministic-profile=max; "
+            f"overriding requested profile '{requested_profile}' -> 'max'"
+        )
+        effective_profile = "max"
+
+    apply_runtime_profile(effective_profile, requested_profile=requested_profile)
 
     print(BANNER)
 

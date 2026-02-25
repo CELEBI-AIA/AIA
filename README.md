@@ -134,7 +134,7 @@ python main.py
 
 ```bash
 # Yarışma modu
-python main.py --mode competition --deterministic-profile balanced
+python main.py --mode competition --deterministic-profile max
 
 # Otonom test (VID)
 python main.py --mode simulate_vid --show
@@ -148,8 +148,8 @@ python main.py --interactive
 
 Desteklenen deterministik profiller:
 - `off`
-- `balanced` (önerilen, varsayılan)
-- `max`
+- `balanced` (simülasyon/iterasyon için önerilen varsayılan)
+- `max` (competition modunda zorunlu uygulanır)
 
 ### Çıktı Formatı (Sunucuya Gönderilen JSON)
 
@@ -327,8 +327,9 @@ Sistem çıktılarının tekrarlanabilir olması için aşağıdaki kurallar zor
    - Not: Wall-clock kullanımı yalnızca ağ dayanıklılığı orkestrasyonu (circuit breaker/degrade) için kabul edilir; model karar mantığı (`motion_status`, `landing_status`, sınıf çıktıları) frame-index tabanlı kalmalıdır.
 
 6. **Runtime Profil Kullanımı:**
-   - Yarışma için `--deterministic-profile balanced` önerilir.
-   - `balanced`: seed + deterministic backend + TTA kapalı, FP16 açık kalır.
+   - Competition çalıştırmasında profil runtime tarafından `max` olarak zorunlu uygulanır.
+   - `max`: seed + deterministic backend + TTA kapalı + FP16 kapalı (FP32); sınır vakalarda run-to-run farkını azaltır.
+   - `balanced`: seed + deterministic backend + TTA kapalı, FP16 açık; simülasyon ve hızlı iterasyon için uygundur.
 
 ---
 
