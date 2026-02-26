@@ -33,6 +33,7 @@ BANNER = """
 ║     🛩️  TEKNOFEST 2026 - HAVACILIKTA YAPAY ZEKA YARIŞMASI    ║
 ║     ──────────────────────────────────────────────────────    ║
 ║     Nesne Tespiti (Görev 1) + Konum Kestirimi (Görev 2)     ║
+║     Görüntü Eşleme (Görev 3)                                ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -95,6 +96,16 @@ def run_simulation(
         movement = MovementEstimator()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
+        # Görev 3 — Referans obje eşleştirme
+        image_matcher = None
+        if Settings.TASK3_ENABLED:
+            from src.image_matcher import ImageMatcher
+            image_matcher = ImageMatcher()
+            loaded = image_matcher.load_references_from_directory()
+            if loaded == 0:
+                log.warn("Görev 3: Referans obje bulunamadı, Simülasyonda Görev 3 pasif")
+                image_matcher = None
+
         visualizer = Visualizer()
         if save:
             os.makedirs(Settings.DEBUG_OUTPUT_DIR, exist_ok=True)
@@ -135,6 +146,11 @@ def run_simulation(
                 detected_objects = detector.detect(frame)
                 detected_objects = movement.annotate(detected_objects, frame=frame)
                 position = odometry.update(frame, server_data)
+
+                # Görev 3
+                undefined_objects = []
+                if image_matcher is not None:
+                    undefined_objects = image_matcher.match(frame)
 
                 _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
 
@@ -231,6 +247,16 @@ def run_competition(log: Logger) -> None:
         odometry = VisualOdometry()
         movement = MovementEstimator()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
+
+        # Görev 3 — Referans obje eşleştirme
+        image_matcher = None
+        if Settings.TASK3_ENABLED:
+            from src.image_matcher import ImageMatcher
+            image_matcher = ImageMatcher()
+            # Yarışma modunda referanslar sunucudan veya local dizinden yüklenir
+            loaded = image_matcher.load_references_from_directory()
+            if loaded == 0:
+                log.warn("Görev 3: Referans obje bulunamadı, detected_undefined_objects boş gönderilecek")
 
         visualizer: Optional[Visualizer] = Visualizer() if Settings.DEBUG else None
 
@@ -409,10 +435,16 @@ def run_competition(log: Logger) -> None:
                                 "translation_z": 0.0,
                             },
                             "frame_shape": None,
+                            "detected_undefined_objects": [],
                         }
                     else:
                         detected_objects = detector.detect(frame)
                         detected_objects = movement.annotate(detected_objects, frame=frame)
+
+                        # Görev 3
+                        undefined_objects = []
+                        if image_matcher is not None:
+                            undefined_objects = image_matcher.match(frame)
 
                         position = odometry.update(frame, frame_data)
                         pending_result = {
@@ -429,6 +461,7 @@ def run_competition(log: Logger) -> None:
                                 "translation_z": position["z"],
                             },
                             "frame_shape": frame.shape,
+                            "detected_undefined_objects": undefined_objects,
                         }
 
                 frame_id = pending_result["frame_id"]
@@ -443,6 +476,7 @@ def run_competition(log: Logger) -> None:
                     frame_data=frame_data,
                     frame_shape=pending_result["frame_shape"],
                     degrade=bool(pending_result.get("degraded", False)),
+                    detected_undefined_objects=pending_result.get("detected_undefined_objects"),
                 )
                 timeout_snapshot = network.consume_timeout_counters()
                 kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)

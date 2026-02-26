@@ -1,0 +1,44 @@
+---
+description: Generate commit message — changelog, version bump, README sync; AI does not commit, only provides message
+alwaysApply: false
+---
+# Commit Rule
+
+When this rule file is invoked for commit-related tasks (e.g. "commit", "create commit message", or when the user references `@commit.mdc`):
+
+**AI only generates and provides the commit message.** The user runs the git commit command themselves.
+
+## Steps (Apply in Order)
+
+### 1. Pre-Commit Checks (Apply if there are changes)
+
+- **Changelog**: If there are code changes but no new version in CHANGELOGS.md, add a new `## X.X.XX - YYYY-MM-DD` block.
+- **Version bump**: Increment `__version__` in `uav_training/__init__.py` and `uav_training/train.py` (e.g. 0.8.37 → 0.8.38).
+- **README sync**: Update version number in headers of `README.md` and `uav_training/README.md`.
+
+### 2. Create Commit Message and Give to User
+
+Read the last ~20 lines of `CHANGELOGS.md`. Generate commit message from the latest version entries and **provide it to the user as text**. Do not run git commands.
+
+Format:
+
+```
+type(scope): Brief summary from changelog
+
+- Detail 1
+- Detail 2
+```
+
+`type`: `fix`, `feat`, `perf`, `refactor`, `chore`, `docs`, `test`, `log`, `release`.(Only For Header)
+
+### 3. Git Commit — User Does It
+
+AI does not run `git add` or `git commit`. Provide the ready message to the user; the user commits in their own terminal.
+
+## Changelog Format
+
+```markdown
+## X.X.XX - YYYY-MM-DD
+- **type(scope)**: Description of the change.
+- **release**: Bumped module/script version from `0.8.X` to `0.8.Y`.
+```

@@ -1,5 +1,12 @@
 # CHANGELOGS
 
+## 0.0.27 - 2026-02-26
+- **feat(task3)**: Added `src/image_matcher.py` (ORB/SIFT feature matching + homography) and integrated it into main competition/simulation loops.
+- **fix(detection)**: Safely bypassed `MAX_BBOX_SIZE` filter by increasing it to `9999` to ensure large vehicles like buses and trains are not filtered.
+- **feat(network)**: Wired `detected_undefined_objects` throughout the payload builder and preflight validation layers.
+- **fix(simulation)**: Corrected robust GPS health simulation in `data_loader.py` to match the exact requirements of `sartname.md` (first 450 frames healthy, switching to cyclic degradation).
+- **feat(testing)**: Created `tools/mock_server.py` to provide a complete standalone local testing environment perfectly simulating the TEKNOFEST competition HTTP format.
+- **docs(readme)**: Completely realigned `README.md` with the latest `sartname.md` details (updated table of contents, three-task description, extended technical constraint matrices, architecture diagrams).
 ## 0.0.01 - 2026-02-21
 - Fixed P1 mode-safety issue: selecting competition mode now forces `NetworkManager` to run with `simulation_mode=False`, even if `Settings.SIMULATION_MODE=True`.
 - Refactored network mode checks to use instance-level `self.simulation_mode` instead of global settings so runtime mode is explicit and controllable.

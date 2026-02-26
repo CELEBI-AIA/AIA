@@ -250,6 +250,7 @@ class NetworkManager:
         frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
         degrade: bool = False,
+        detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> SendResultStatus:
         """Tespit ve konum sonuçlarını TEKNOFEST taslak şemasına uyumlu JSON ile gönderir."""
         frame_key = self._normalize_frame_key(frame_id)
@@ -265,6 +266,7 @@ class NetworkManager:
             detected_translation=detected_translation,
             frame_data=frame_data,
             frame_shape=frame_shape,
+            detected_undefined_objects=detected_undefined_objects,
         )
         force_fallback = self._should_force_fallback(frame_key)
         if force_fallback:
@@ -410,6 +412,7 @@ class NetworkManager:
         detected_translation: Dict[str, float],
         frame_data: Optional[Dict[str, Any]] = None,
         frame_shape: Optional[tuple] = None,
+        detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> Dict[str, Any]:
         """TEKNOFEST taslak şemasına uyumlu payload builder."""
         frame_data = frame_data or {}
@@ -473,7 +476,7 @@ class NetworkManager:
                     "translation_z": tz,
                 }
             ],
-            "detected_undefined_objects": [],
+            "detected_undefined_objects": detected_undefined_objects or [],
         }
 
     def _get_simulation_frame(self) -> Dict[str, Any]:
@@ -691,7 +694,7 @@ class NetworkManager:
                         "translation_z": tz,
                     }
                 ],
-                "detected_undefined_objects": [],
+                "detected_undefined_objects": payload.get("detected_undefined_objects", []),
             },
             False,
             payload_clipped,

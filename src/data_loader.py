@@ -239,12 +239,19 @@ class DatasetLoader:
                 self._index += 1
                 continue
 
-            # GPS sağlığını simüle et
-            # VID: her 50 karede bir GPS kesilsin (odometri testi için)
-            # DET: her zaman GPS sağlıklı (tekil kareler)
+            # GPS sağlığını simüle et — Şartname Bölüm 3.2.2:
+            # İlk 1 dakika (450 kare @ 7.5fps) GPS kesinlikle sağlıklı.
+            # Son 4 dakikada (1800 kare) sağlıksız duruma geçebilir.
+            # DET modunda: her zaman GPS sağlıklı (tekil kareler)
             if self._mode == "vid":
-                # 50 kare GPS sağlıklı, 50 kare GPS kesik — döngüsel
-                gps_health = 1 if (self._index % 100) < 50 else 0
+                if self._index < 450:
+                    # İlk 1 dakika — kesinlikle sağlıklı
+                    gps_health = 1
+                else:
+                    # 450+ frame: sağlıksız geçişleri simüle et
+                    # Deterministik pattern: 100 kare sağlıklı, 200 kare sağlıksız
+                    cycle_pos = (self._index - 450) % 300
+                    gps_health = 1 if cycle_pos < 100 else 0
             else:
                 gps_health = 1
 
@@ -255,14 +262,14 @@ class DatasetLoader:
                 "mode": self._mode,
                 "gps_health": gps_health,
                 # Sunucu formatını taklit et — localization.py beklediği key isimleri
+                # Şartname: GPS sağlıksız olduğunda translation = "NaN"
                 "server_data": {
                     "frame_id": self._index,
                     "gps_health": gps_health,
-                    # Telemetri simülasyonu (hareket varmış gibi)
-                    # Drone hızı: X ekseninde 0.5m/kare (~3.7 m/s), Y ekseninde 0.1m/kare
-                    "translation_x": float(self._index * 0.5),
-                    "translation_y": float(self._index * 0.1),
-                    "translation_z": Settings.DEFAULT_ALTITUDE,
+                    "gps_health_status": gps_health,
+                    "translation_x": float(self._index * 0.5) if gps_health == 1 else "NaN",
+                    "translation_y": float(self._index * 0.1) if gps_health == 1 else "NaN",
+                    "translation_z": Settings.DEFAULT_ALTITUDE if gps_health == 1 else "NaN",
                 },
             }
 

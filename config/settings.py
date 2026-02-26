@@ -93,9 +93,9 @@ class Settings:
     # 10px = Uzaktaki insan için alt sınır. Daha küçüğü (kol/bacak) elenir.
     MIN_BBOX_SIZE: int = 10
 
-    # Maksimum bbox boyutu (piksel) — üstündekiler bina/çatı vs. sayılır
-    # 50m irtifada: Otobüs ~200px. Bina çatısı > 300px.
-    MAX_BBOX_SIZE: int = 300
+    # Maksimum bbox boyutu (piksel) — şartname büyük nesneleri de tespit etmeyi zorunlu kılıyor
+    # (otobüs, tren, gemi vb.) Bu nedenle pratikte devre dışı bırakıldı.
+    MAX_BBOX_SIZE: int = 9999
 
     # =========================================================================
     #  SAHI (Slicing Aided Hyper Inference) — Tepeden Görünüm İyileştirmesi
@@ -109,6 +109,18 @@ class Settings:
 
     # Model ısınma tekrar sayısı (ilk kare gecikmesini önler)
     WARMUP_ITERATIONS: int = 3
+
+    # =========================================================================
+    #  GÖREV 3 — REFERANS OBJE TESPİTİ (Image Matching)
+    # =========================================================================
+    TASK3_ENABLED: bool = True
+    TASK3_REFERENCE_DIR: str = str(PROJECT_ROOT / "datasets" / "task3_references")
+    TASK3_SIMILARITY_THRESHOLD: float = 0.72    # task3_params.yaml: t_confirm
+    TASK3_FALLBACK_THRESHOLD: float = 0.66      # task3_params.yaml: t_fallback
+    TASK3_FALLBACK_INTERVAL: int = 5            # Her N karede fallback sweep
+    TASK3_GRID_STRIDE: int = 32                 # Sliding window adımı (piksel)
+    TASK3_MAX_REFERENCES: int = 10              # Oturum başına maks referans obje
+    TASK3_FEATURE_METHOD: str = "ORB"           # "ORB" veya "SIFT"
 
     # =========================================================================
     #  SINIF TANIMLARI (TEKNOFEST Şartname)
@@ -321,6 +333,10 @@ class Settings:
     MOTION_COMP_WIN_SIZE: int = 21
 
     # Sürücü suppression (bisiklet/motosiklet üzerindeki insanı insan olarak sayma)
+    # Şartname: Bisiklet/motosiklet sürücüsü → taşıt olarak etiketlenir
+    # Scooter kuralı: COCO'da ayrı sınıf yok, bu yüzden rider suppression
+    # ile yaklaşımsal olarak kapsanır. Veri setinde scooter ayrı sınıf
+    # olarak gelirse aşağıdaki RIDER_SOURCE_CLASSES'a eklenmeli.
     RIDER_SUPPRESS_ENABLED: bool = True
     RIDER_OVERLAP_THRESHOLD: float = 0.35
     RIDER_IOU_THRESHOLD: float = 0.15

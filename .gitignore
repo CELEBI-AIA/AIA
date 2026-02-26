@@ -37,10 +37,6 @@ env/
 # =============================================================================
 #  TEKNOFEST Proje Özel
 # =============================================================================
-# Model dosyaları (büyük dosyalar — git'te tutulmamalı)
-models/*.pt
-*.pt
-
 # Debug çıktıları
 debug_output/
 
