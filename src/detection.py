@@ -616,6 +616,16 @@ class ObjectDetector:
         """
         result = frame
 
+        is_grayscale = len(result.shape) == 2 or result.shape[2] == 1
+
+        if is_grayscale:
+            if self._clahe is not None:
+                result = self._clahe.apply(result)
+            blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=2.0)
+            result = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
+            result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+            return result
+
         # ---- CLAHE Kontrast İyileştirme ----
         if self._clahe is not None:
             # LAB renk uzayına çevir (L = parlaklık kanayı)

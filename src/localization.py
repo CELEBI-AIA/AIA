@@ -165,9 +165,12 @@ class VisualOdometry:
         new_y = float(server_data.get("translation_y", self.position["y"]))
         new_z = float(server_data.get("translation_z", self.position["z"]))
 
-        self.position["x"] = new_x
-        self.position["y"] = new_y
-        self.position["z"] = new_z
+        if not np.isnan(new_x):
+            self.position["x"] = new_x
+        if not np.isnan(new_y):
+            self.position["y"] = new_y
+        if not np.isnan(new_z):
+            self.position["z"] = new_z
 
         # Kalibrasyon referansını kaydet
         self._last_gps_position = {
@@ -234,14 +237,14 @@ class VisualOdometry:
         altitude = float(
             server_data.get("translation_z", self.position.get("z", Settings.DEFAULT_ALTITUDE))
         )
-        if altitude <= 0:
+        if np.isnan(altitude) or altitude <= 0:
             altitude = Settings.DEFAULT_ALTITUDE
 
         dx_meters, dy_meters = self._pixel_to_meter(dx_pixels, dy_pixels, altitude)
 
         # ------ 5) Pozisyonu güncelle ------
-        self.position["x"] += dx_meters
-        self.position["y"] += dy_meters
+        self.position["x"] -= dx_meters
+        self.position["y"] -= dy_meters
 
         self.log.debug(
             f"Optik Akış → dX:{dx_meters:.3f}m dY:{dy_meters:.3f}m | "

@@ -138,9 +138,11 @@ class MovementEstimator:
             for track_id, track in self._tracks.items():
                 if not track.history:
                     continue
-                tx, ty = track.history[-1][:2]
-                dx = cx - tx
-                dy = cy - ty
+                tx, ty, t_cam_x, t_cam_y = track.history[-1]
+                pred_x = tx + (self._cam_total_x - t_cam_x)
+                pred_y = ty + (self._cam_total_y - t_cam_y)
+                dx = cx - pred_x
+                dy = cy - pred_y
                 dist = (dx * dx + dy * dy) ** 0.5
                 if dist <= Settings.MOVEMENT_MATCH_DISTANCE_PX:
                     candidates.append((dist, det_idx, track_id))
