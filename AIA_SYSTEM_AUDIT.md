@@ -6,27 +6,22 @@
 
 ## 1. Detected Issues
 
-### Issue 1.1: Missing UAP/UAİ Output Generation
-- **Description:** The detection module relies on `COCO_TO_TEKNOFEST` mapping by default (`car`, `person`, etc.). There is no COCO/VisDrone class equivalent for UAP (ID: 2) or UAİ (ID: 3). Unless a custom fine-tuned model is used, the system will *never* generate `cls=2` or `cls=3` outputs.
-- **Root Cause:** Hardcoded mapping relies on generalized datasets for specific competition classes.
-- **Risk Level:** **Critical** (Failure to score on Task 1 landing zone metrics).
-
-### Issue 1.2: Incorrect GPS Simulation Cycle
-- **Description:** `data_loader.py` simulates GPS degradation as 100 healthy frames followed by 200 unhealthy frames in a loop after the initial 450 healthy frames. The specification states that the last 4 minutes (1800 frames) "may switch to an unhealthy state," but it does not specify a looping cycle. Furthermore, `localization.py` permanently loses tracking if feature points are not renewed.
+### Issue 1.1: Incorrect GPS Simulation Cycle
+- **Description:** `data_loader.py` simulates GPS degradation as 100 healthy frames followed by 200 unhealthy frames in a loop after the initial 450 healthy frames. The specification states that the last 4 minutes (1800 frames) "may switch to an unhealthy state," but it does not specify a looping cycle.
 - **Root Cause:** Hardcoded mock sequence instead of reading `server_data` or randomly triggering degradation bounds.
 - **Risk Level:** **Medium** (Only affects simulation/testing, but creates false confidence).
 
-### Issue 1.3: Optical Flow Accumulation Drift (Memory Leak / Drift)
+### Issue 1.2: Optical Flow Accumulation Drift (Memory Leak / Drift)
 - **Description:** In `localization.py`, the Lucas-Kanade optical flow computes translation continuously. `self._prev_points` is updated by copying new points but when point count drops below 50%, it re-detects features. Each re-detection resets the point topology, leading to discrete jumps or integration drift without a global optimization or loop closure.
 - **Root Cause:** Naive frame-to-frame pixel delta summation without scaling correction over time.
 - **Risk Level:** **High** (Task 2 position error will grow unbounded).
 
-### Issue 1.4: Feature Matching Memory Leak
+### Issue 1.3: Feature Matching Memory Leak
 - **Description:** In `movement.py`, `self._tracks` caches vehicle histories. If a vehicle leaves the frame, `track.missed` increments. Tracks are deleted after `MOVEMENT_MAX_MISSED_FRAMES` (8). However, `self._cam_shift_hist` is a `deque` that safely bounds its memory, but `self._cam_total_x` and `self._cam_total_y` are floats that grow indefinitely.
 - **Root Cause:** Unbounded accumulation of floats for global camera shift, which can lead to floating point precision loss over long runs.
 - **Risk Level:** **Low** (Precision loss over 2250 frames is minimal, but architecturally unsafe).
 
-### Issue 1.5: Payload Bounding Box Clamp Modifies Original Reference
+### Issue 1.4: Payload Bounding Box Clamp Modifies Original Reference
 - **Description:** In `network.py`, the `build_competition_payload` and `_preflight_validate_and_normalize_payload` clamp bounding boxes to `frame_w` and `frame_h`. However, if the source detection dictionary is modified in place before the JSON serialization, it corrupts the visualizer's state.
 - **Root Cause:** Shared dictionary references.
 - **Risk Level:** **Low** (Only affects visualization).
@@ -77,7 +72,7 @@
 - **`MAX_BBOX_SIZE` Logic:** In `detection.py`, the `_post_filter` has logic for `MAX_BBOX_SIZE`, but it is configured to `9999`, meaning the branch is effectively dead code.
 - **`task3_params.yaml`:** Discussed in architecture. Unused file.
 - **`SIMULATION_DET_SAMPLE_SIZE`:** Used only in standalone testing, adds bloat to production config.
-- **`UNKNOWN_OBJECTS_AS_OBSTACLES` branch:** Allows unmapped classes to invalidate landing zones, but the competition specifically expects only designated classes or explicit object bounding boxes. Using invisible unmapped classes as obstacles might artificially lower the mAP if the ground truth doesn't consider them.
+- **`UNKNOWN_OBJECTS_AS_OBSTACLES` branch:** Allows unmapped classes to invalidate landing zones, but the competition specifically expects only designated classes or explicit object bounding boxes. Since you are using a custom model that natively supports all competition classes, using unmapped or "unknown" classes as obstacles might artificially lower the mAP if the ground truth doesn't consider them, and essentially acts as dead/unnecessary logic.
 
 ---
 
@@ -91,9 +86,8 @@
 
 ## 9. Recommended Fix Strategy (No Code)
 
-1. **Model & Mapping:** Ensure a custom YOLO weights file is deployed that natively outputs 4 classes (0: Vehicle, 1: Human, 2: UAP, 3: UAİ). Remove COCO/VisDrone fallback mappings.
-2. **Concurrency:** Implement a Producer-Consumer queue pattern using `threading` or `asyncio`. Thread 1: Fetch metadata & image. Thread 2: GPU Inference & optical flow. Thread 3: Submit JSON.
-3. **Determinism Stabilization:** Disable `torch.cuda.empty_cache()` inside the inference loop. Enforce `stable=True` in numpy sorting. Move `random.seed` initialization to occur *before* any module imports.
-4. **Odometry Hardening:** Implement a basic Kalman Filter or exponential moving average to smooth the Lucas-Kanade optical flow translation vectors and integrate the last known valid GPS altitude instead of a static 50m fallback.
-5. **Config Cleanup:** Read `task3_params.yaml` directly into the `Settings` class dynamically or remove the YAML file entirely to maintain a single source of truth.
-6. **Error Propagation:** Remove naked `except Exception:` blocks in `detection.py` and `main.py`. Allow `SystemExit` or specific handled exceptions so that fatal pipeline breaks trigger the circuit breaker rather than emitting empty data.
+1. **Concurrency:** Implement a Producer-Consumer queue pattern using `threading` or `asyncio`. Thread 1: Fetch metadata & image. Thread 2: GPU Inference & optical flow. Thread 3: Submit JSON.
+2. **Determinism Stabilization:** Disable `torch.cuda.empty_cache()` inside the inference loop. Enforce `stable=True` in numpy sorting. Move `random.seed` initialization to occur *before* any module imports.
+3. **Odometry Hardening:** Implement a basic Kalman Filter or exponential moving average to smooth the Lucas-Kanade optical flow translation vectors and integrate the last known valid GPS altitude instead of a static 50m fallback.
+4. **Config Cleanup:** Read `task3_params.yaml` directly into the `Settings` class dynamically or remove the YAML file entirely to maintain a single source of truth. Remove COCO/VisDrone mapping dicts as you're using a fine-tuned model.
+5. **Error Propagation:** Remove naked `except Exception:` blocks in `detection.py` and `main.py`. Allow `SystemExit` or specific handled exceptions so that fatal pipeline breaks trigger the circuit breaker rather than emitting empty data.
