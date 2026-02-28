@@ -182,6 +182,19 @@ class MovementEstimator:
             (float(det.get("top_left_y", 0)) + float(det.get("bottom_right_y", 0))) / 2.0,
         )
 
+    def _get_features(self, gray: np.ndarray) -> Optional[np.ndarray]:
+        return cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+            qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+            minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+        )
+
+    def _reset_features(self, gray: np.ndarray) -> Tuple[float, float]:
+        self._prev_gray = gray
+        self._prev_points = self._get_features(gray)
+        return 0.0, 0.0
+
     def _estimate_camera_shift(self, frame: np.ndarray) -> Tuple[float, float]:
         """
         Frame-to-frame global kamera kaymasını medyan optik akış ile tahmin eder.
@@ -189,35 +202,16 @@ class MovementEstimator:
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self._prev_gray is None:
-            self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
             self._frame_diff = float("inf")
-            return 0.0, 0.0
+            return self._reset_features(gray)
 
         # Piksel-bazlı frame farkı — prev_gray güncellenmeden ÖNCE hesaplanmalı
         self._frame_diff = float(cv2.absdiff(self._prev_gray, gray).mean())
 
         if self._prev_points is None or len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES:
-            self._prev_points = cv2.goodFeaturesToTrack(
-                self._prev_gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._get_features(self._prev_gray)
             if self._prev_points is None or len(self._prev_points) < 5:
-                self._prev_gray = gray
-                self._prev_points = cv2.goodFeaturesToTrack(
-                    gray,
-                    maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                    qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                    minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-                )
-                return 0.0, 0.0
+                return self._reset_features(gray)
 
         win = Settings.MOTION_COMP_WIN_SIZE
         next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -229,28 +223,15 @@ class MovementEstimator:
             maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
         )
+
         if next_pts is None or status is None:
-            self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
-            return 0.0, 0.0
+            return self._reset_features(gray)
 
         valid = status.flatten() == 1
         old = self._prev_points[valid].reshape(-1, 2)
         new = next_pts[valid].reshape(-1, 2)
         if len(new) < 5:
-            self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
-            return 0.0, 0.0
+            return self._reset_features(gray)
 
         deltas = new - old
         dx = deltas[:, 0]
@@ -271,11 +252,6 @@ class MovementEstimator:
         self._prev_gray = gray
         self._prev_points = new.reshape(-1, 1, 2)
         if len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES // 2:
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._get_features(gray)
 
         return cam_dx, cam_dy

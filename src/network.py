@@ -11,6 +11,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
+import concurrent.futures
 
 import cv2
 import numpy as np
@@ -73,6 +74,9 @@ class NetworkManager:
             "payload_clipped": 0,
         }
         self._clip_ratio_window: Deque[int] = deque(maxlen=100)
+
+        # Async networking
+        self._submit_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     def start_session(self) -> bool:
         """Sunucu ile oturum başlatır."""
@@ -241,6 +245,28 @@ class NetworkManager:
 
         self.log.error("Image download failed after all retries")
         return None
+
+    def send_result_async(
+        self,
+        frame_id: Any,
+        detected_objects: List[Dict],
+        detected_translation: Dict[str, float],
+        frame_data: Optional[Dict[str, Any]] = None,
+        frame_shape: Optional[tuple] = None,
+        degrade: bool = False,
+        detected_undefined_objects: Optional[List[Dict]] = None,
+    ) -> concurrent.futures.Future:
+        """Asynchronously sends the payload to unblock the main thread."""
+        return self._submit_executor.submit(
+            self.send_result,
+            frame_id,
+            detected_objects,
+            detected_translation,
+            frame_data,
+            frame_shape,
+            degrade,
+            detected_undefined_objects
+        )
 
     def send_result(
         self,

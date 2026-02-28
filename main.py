@@ -469,6 +469,10 @@ def run_competition(log: Logger) -> None:
                 detected_objects = pending_result["detected_objects"]
                 frame_for_debug = pending_result["frame"]
                 position = pending_result["position"]
+
+                # Use synchronous call but can easily swap to send_result_async if strictly needing
+                # to not block the current loop. But since `apply_send_result_status` depends on `send_status`
+                # we continue sequentially but wrap IO internally if required.
                 send_status = network.send_result(
                     frame_id,
                     detected_objects,

@@ -348,50 +348,59 @@ class ObjectDetector:
         step = int(slice_size * (1 - overlap))
 
         all_slice_dets: List[Dict] = []
+        tiles: List[np.ndarray] = []
+        tile_coords: List[Tuple[int, int]] = []
+
+        for y_start in range(0, h, step):
+            for x_start in range(0, w, step):
+                # Parça sınırlarını hesapla
+                x_end = min(x_start + slice_size, w)
+                y_end = min(y_start + slice_size, h)
+
+                # Çok küçük kenar parçalarını atla
+                if (x_end - x_start) < slice_size // 2 or \
+                   (y_end - y_start) < slice_size // 2:
+                    continue
+
+                # Parçayı kes
+                tile = frame[y_start:y_end, x_start:x_end]
+                tiles.append(tile)
+                tile_coords.append((x_start, y_start))
+
+        if not tiles:
+            return []
 
         with torch.no_grad():
-            for y_start in range(0, h, step):
-                for x_start in range(0, w, step):
-                    # Parça sınırlarını hesapla
-                    x_end = min(x_start + slice_size, w)
-                    y_end = min(y_start + slice_size, h)
+            # Inference in batches to improve GPU utilization
+            results = self.model.predict(
+                source=tiles,
+                imgsz=slice_size,
+                conf=Settings.CONFIDENCE_THRESHOLD,
+                iou=Settings.NMS_IOU_THRESHOLD,
+                device=self.device,
+                verbose=False,
+                save=False,
+                half=self._use_half,
+                agnostic_nms=Settings.AGNOSTIC_NMS,
+                max_det=Settings.MAX_DETECTIONS,
+            )
 
-                    # Çok küçük kenar parçalarını atla
-                    if (x_end - x_start) < slice_size // 2 or \
-                       (y_end - y_start) < slice_size // 2:
-                        continue
-
-                    # Parçayı kes
-                    tile = frame[y_start:y_end, x_start:x_end]
-
-                    # Inference (parça boyutunda, tile'ın kendi boyutu)
-                    results = self.model.predict(
-                        source=tile,
-                        imgsz=slice_size,
-                        conf=Settings.CONFIDENCE_THRESHOLD,
-                        iou=Settings.NMS_IOU_THRESHOLD,
-                        device=self.device,
-                        verbose=False,
-                        save=False,
-                        half=self._use_half,
-                        agnostic_nms=Settings.AGNOSTIC_NMS,
-                        max_det=Settings.MAX_DETECTIONS,
-                    )
-
-                    # Koordinatları orijinal frame'e dönüştür
-                    tile_dets = self._parse_results(results)
-                    for det in tile_dets:
-                        det["top_left_x"] += x_start
-                        det["top_left_y"] += y_start
-                        det["bottom_right_x"] += x_start
-                        det["bottom_right_y"] += y_start
-                        det["bbox"] = (
-                            det["top_left_x"],
-                            det["top_left_y"],
-                            det["bottom_right_x"],
-                            det["bottom_right_y"],
-                        )
-                    all_slice_dets.extend(tile_dets)
+        # Coordinate transformation
+        for idx, result in enumerate(results):
+            x_start, y_start = tile_coords[idx]
+            tile_dets = self._parse_results([result])
+            for det in tile_dets:
+                det["top_left_x"] += x_start
+                det["top_left_y"] += y_start
+                det["bottom_right_x"] += x_start
+                det["bottom_right_y"] += y_start
+                det["bbox"] = (
+                    det["top_left_x"],
+                    det["top_left_y"],
+                    det["bottom_right_x"],
+                    det["bottom_right_y"],
+                )
+            all_slice_dets.extend(tile_dets)
 
         return all_slice_dets
 

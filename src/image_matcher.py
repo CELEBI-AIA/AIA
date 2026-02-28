@@ -74,13 +74,27 @@ class ImageMatcher:
             self.detector = cv2.SIFT_create()
             self.norm_type = cv2.NORM_L2
             self.log.info("Feature method: SIFT (daha robust, yavaş)")
+
+            # FLANN parameters for SIFT
+            FLANN_INDEX_KDTREE = 1
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+            search_params = dict(checks=50)
+            self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
         else:
             self.detector = cv2.ORB_create(nfeatures=2000)
             self.norm_type = cv2.NORM_HAMMING
             self.log.info("Feature method: ORB (hızlı, offline-uyumlu)")
 
-        # BFMatcher — cross-check ile daha güvenilir eşleşme
-        self.matcher = cv2.BFMatcher(self.norm_type, crossCheck=False)
+            # FLANN parameters for ORB
+            FLANN_INDEX_LSH = 6
+            index_params = dict(
+                algorithm=FLANN_INDEX_LSH,
+                table_number=6,
+                key_size=12,
+                multi_probe_level=1
+            )
+            search_params = dict(checks=50)
+            self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
 
         self.log.info(
             f"ImageMatcher initialized | "
@@ -250,16 +264,16 @@ class ImageMatcher:
 
         try:
             # KNN matching
-            matches = self.matcher.knnMatch(ref.descriptors, frame_desc, k=2)
+            # FLANN match returns empty list for points that can't be matched
+            # so we drop elements with len != 2
+            raw_matches = self.matcher.knnMatch(ref.descriptors, frame_desc, k=2)
+            matches = [m for m in raw_matches if len(m) == 2]
         except cv2.error:
             return None
 
         # Lowe's ratio test
         good_matches = []
-        for m_pair in matches:
-            if len(m_pair) < 2:
-                continue
-            m, n = m_pair
+        for m, n in matches:
             if m.distance < 0.75 * n.distance:
                 good_matches.append(m)
 
