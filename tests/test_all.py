@@ -520,7 +520,9 @@ class TestIdempotencySubmit(unittest.TestCase):
             frame_data={"id": "frame-7", "url": "/f/7"}, frame_shape=None,
         )
         self.assertEqual(ok, SendResultStatus.ACKED)
-        self.assertEqual(mgr.session.post.call_args.kwargs["headers"]["Idempotency-Key"], "aia:frame-7")
+        key = mgr.session.post.call_args.kwargs["headers"]["Idempotency-Key"]
+        self.assertTrue(key.startswith("aia:"))
+        self.assertTrue(key.endswith(":frame-7"))
 
     def test_second_submit_same_frame_is_blocked(self):
         mgr = NetworkManager(base_url="http://test", simulation_mode=False)

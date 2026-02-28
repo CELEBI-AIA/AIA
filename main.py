@@ -213,11 +213,14 @@ def _process_simulation_step(
         )
 
         if show:
-            cv2.imshow("TEKNOFEST - Simulation", annotated)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                log.info("Window closed by user (q/ESC)")
-                return True
+            try:
+                cv2.imshow("TEKNOFEST - Simulation", annotated)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    log.info("Window closed by user (q/ESC)")
+                    return True
+            except cv2.error:
+                pass  # Headless ortamda GUI mevcut değil — sessizce atla
 
         if save:
             save_path = os.path.join(

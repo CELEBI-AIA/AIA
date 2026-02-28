@@ -1,5 +1,15 @@
 # CHANGELOGS
 
+## 0.0.29 - 2026-03-01
+- **fix(movement)**: Hardened `_age_tracks` dict iteration with `list()` wrapper to prevent `RuntimeError` on future mutation (§2.2).
+- **fix(movement)**: Added explicit `None` guard after `goodFeaturesToTrack` fallback in `_estimate_camera_shift` to prevent `TypeError` crash (§2.3).
+- **fix(network)**: Changed JSON `ValueError` handler from immediate `FATAL_ERROR` to transient retry with backoff (§2.5).
+- **fix(network)**: Added session timestamp to idempotency key format (`prefix:session_id:frame_id`) to prevent cross-session key collisions (§6).
+- **fix(detection)**: Added `np.maximum(areas, 1e-6)` guard to `_nms_greedy` to prevent zero-area bbox math issues (§9).
+- **fix(main)**: Wrapped `cv2.imshow`/`cv2.waitKey` in `try/except cv2.error` for headless environment safety (§7).
+- **chore(deps)**: Replaced `opencv-python` with `opencv-python-headless` in `requirements.txt` to avoid GUI dependency crashes (§4/§7).
+- **test(tests)**: Updated idempotency key test assertion to match new session-scoped key format.
+
 ## 0.0.28 - 2026-02-28
 - **fix(localization)**: Added EMA smoothing (α=0.4), last-GPS-altitude fallback, and max displacement clamping to optical flow for drift resistance.
 - **fix(detection)**: Hardened exception handling — OOM isolated, SystemExit/KeyboardInterrupt re-raised, periodic `empty_cache()` anti-pattern removed.

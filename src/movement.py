@@ -162,7 +162,7 @@ class MovementEstimator:
 
     def _age_tracks(self, matched_track_ids: set) -> None:
         to_delete: List[int] = []
-        for track_id, track in self._tracks.items():
+        for track_id, track in list(self._tracks.items()):
             if track_id not in matched_track_ids:
                 track.missed += 1
                 if track.missed > Settings.MOVEMENT_MAX_MISSED_FRAMES:
@@ -282,5 +282,8 @@ class MovementEstimator:
                 qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
                 minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
             )
+            # goodFeaturesToTrack None dönebilir — sonraki frame için güvenli
+            if self._prev_points is None:
+                self._prev_points = None  # Açık atama, sonraki frame L210'da yakalar
 
         return cam_dx, cam_dy

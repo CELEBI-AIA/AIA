@@ -74,6 +74,7 @@ class NetworkManager:
             "payload_clipped": 0,
         }
         self._clip_ratio_window: Deque[int] = deque(maxlen=100)
+        self._session_id: str = str(int(time.time()))  # Oturum benzersiz kimliği
 
     def start_session(self) -> bool:
         """Sunucu ile oturum başlatır."""
@@ -185,10 +186,9 @@ class NetworkManager:
                     f"Attempt {attempt}/{Settings.MAX_RETRIES}"
                 )
             except ValueError as exc:
-                self.log.error(f"JSON parse error: {exc}")
-                return FrameFetchResult(
-                    status=FrameFetchStatus.FATAL_ERROR,
-                    error_type="json_parse",
+                self.log.warn(
+                    f"JSON parse transient error ({exc}), "
+                    f"attempt {attempt}/{Settings.MAX_RETRIES}"
                 )
             except Exception as exc:
                 self.log.warn(f"Frame fetch transient exception: {exc}")
@@ -855,7 +855,7 @@ class NetworkManager:
 
     def _build_idempotency_key(self, frame_key: str) -> str:
         prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
-        return f"{prefix}:{frame_key}"
+        return f"{prefix}:{self._session_id}:{frame_key}"
 
     def _timeout_tuple(self, read_timeout: float) -> Tuple[float, float]:
         connect_timeout = self._connect_timeout()

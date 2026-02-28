@@ -550,7 +550,7 @@ class ObjectDetector:
         y1 = boxes[:, 1]
         x2 = boxes[:, 2]
         y2 = boxes[:, 3]
-        areas = (x2 - x1) * (y2 - y1)
+        areas = np.maximum((x2 - x1) * (y2 - y1), 1e-6)
 
         order = np.argsort(scores, kind="stable")[::-1]
         keep: List[int] = []
