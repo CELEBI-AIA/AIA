@@ -24,6 +24,7 @@
 - [Görev 3 Parametre Dosyası](#-görev-3-parametre-dosyası)
 - [Deterministiklik Sözleşmesi](#-deterministiklik-sözleşmesi)
 - [Dosya Yapısı](#-dosya-yapısı)
+- [Audit & Sağlamlaştırma](#-audit--sağlamlaştırma)
 - [Yarışma Kuralları](#-yarışma-kuralları)
 - [Görev 1 Temporal Karar Mantığı](#-görev-1-temporal-karar-mantığı)
 - [Eğitim ve Test Veri Setleri](#-eğitim-ve-test-veri-setleri)
@@ -63,7 +64,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
     └─────────┴──────────┴─────────────┴────────────────┘
                           │
      ┌────────────────────▼────────────────────────────────────┐
-     │              config/settings.py + task3_params.yaml      │
+     │              config/settings.py                          │
      │   Merkezi yapılandırma • Sınıf eşleştirme • Görev 3     │
      └────────────────────┬────────────────────────────────────┘
                           │
@@ -83,12 +84,13 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 | **Hız** | FP16 half-precision + model warmup → **~33 FPS** (RTX 3060) |
 | **İniş Tespiti** | Intersection-over-area + kenar temas kontrolü + perspektif marjı |
 | **Hareket Tespiti** | Temporal pencere tabanlı karar + kamera hareket kompanzasyonu |
-| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış (ilk 1 dk GPS sağlıklı, sonra görsel) |
-| **Referans Obje** | ORB/SIFT feature matching + homography (Görev 3) |
+| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + EMA yumuşatma (ilk 1 dk GPS, sonra görsel) |
+| **Referans Obje** | ORB/SIFT feature matching + homography + degenerate guard (Görev 3) |
 | **Ağ** | Otomatik retry, timeout yönetimi, circuit breaker, idempotency guard |
 | **Debug** | Renkli konsol çıktısı, tespit görselleştirme, periyodik kayıt |
-| **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, asla çökmez |
+| **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, OOM koruması |
 | **Offline** | İnternet bağlantısı gerektirmez — yarışma kurallarına uygun (şartname 6.2) |
+| **Test** | 47 birim testi, 10s timeout, tek dosyada konsolide (`tests/test_all.py`) |
 
 ---
 
@@ -306,30 +308,13 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 
 ## 🎛️ Görev 3 Parametre Dosyası
 
-Görev 3 (dinamik referans obje tespiti) için tüm kritik eşikler tek bir dosyada tanımlanır:
+> **⚠️ Kullanımdan Kaldırıldı:** `config/task3_params.yaml` dosyası artık kod tarafından okunmamaktadır. Tüm Görev 3 parametreleri `config/settings.py` içinde merkezi olarak tanımlıdır (`TASK3_SIMILARITY_THRESHOLD`, `TASK3_FALLBACK_THRESHOLD`, `TASK3_FALLBACK_INTERVAL`). YAML dosyası yalnızca referans amaçlı tutulmaktadır.
 
-- Dosya: [`config/task3_params.yaml`](config/task3_params.yaml)
-- Amaç: `T_confirm`, `T_fallback`, `N`, `grid stride` değerlerini merkezi ve denetlenebilir tutmak
-
-### Parametreler
-
-| Parametre | Dosya Anahtarı | Açıklama |
-|-----------|----------------|----------|
-| `T_confirm` | `t_confirm` | Stage-2 aday doğrulama minimum benzerlik eşiği |
-| `T_fallback` | `t_fallback` | Stage-3 fallback sweep kabul eşiği |
-| `N` | `n_fallback_interval` | Stage-3 fallback'in her kaç frame'de bir tetikleneceği |
-| `grid stride` | `grid_stride` | Stage-3 grid/sliding-window tarama adımı (piksel) |
-
-### Örnek İçerik
-
-```yaml
-t_confirm: 0.72
-t_fallback: 0.66
-n_fallback_interval: 5
-grid_stride: 32
-```
-
-Not: Bu değerler çalışma sırasında dinamik değiştirilmemelidir; deterministik ve tekrarlanabilir karar için oturum başında sabitlenmelidir.
+| Settings Parametresi | Değer | YAML Karşılığı |
+|---------------------|-------|----------------|
+| `TASK3_SIMILARITY_THRESHOLD` | `0.72` | `t_confirm` |
+| `TASK3_FALLBACK_THRESHOLD` | `0.66` | `t_fallback` |
+| `TASK3_FALLBACK_INTERVAL` | `5` | `n_fallback_interval` |
 
 ---
 
@@ -377,13 +362,13 @@ HavaciliktaYZ/
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py         # Merkezi yapılandırma (tüm görevler)
-│   └── task3_params.yaml   # Görev 3 eşik ve tarama parametreleri
+│   └── task3_params.yaml   # (Deprecated) Görev 3 referans parametreleri
 │
 ├── src/
 │   ├── __init__.py
 │   ├── detection.py        # Görev 1: YOLOv8 nesne tespiti + iniş durumu
 │   ├── movement.py         # Görev 1: Temporal hareket kararı + kamera kompanzasyonu
-│   ├── localization.py     # Görev 2: GPS + optik akış pozisyon kestirimi
+│   ├── localization.py     # Görev 2: GPS + optik akış + EMA pozisyon kestirimi
 │   ├── image_matcher.py    # Görev 3: ORB/SIFT referans obje eşleştirme
 │   ├── network.py          # Sunucu iletişimi + retry + idempotency + payload guard
 │   ├── resilience.py       # Circuit breaker + degrade mode kontrolü
@@ -396,15 +381,8 @@ HavaciliktaYZ/
 │   └── mock_server.py      # Yerel mock sunucu (yarışma formatı test)
 │
 ├── tests/
-│   ├── test_session_resilience.py
-│   ├── test_rider_suppression.py
-│   ├── test_network_payload_guard.py
-│   ├── test_network_timeouts.py
-│   ├── test_movement_compensation.py
-│   ├── test_main_ack_state_machine.py
-│   ├── test_idempotency_submit.py
-│   ├── test_frame_dedup.py
-│   └── test_competition_loop_hardening.py
+│   ├── conftest.py         # ML mock'ları + 10s global timeout
+│   └── test_all.py         # 47 konsolide birim testi
 │
 ├── models/
 │   └── yolov8m.pt          # YOLOv8 medium modeli (Git'e dahil değil)
@@ -417,6 +395,29 @@ HavaciliktaYZ/
 │
 ├── logs/                   # Çalışma zamanı logları (otomatik)
 └── debug_output/           # Debug görselleri (otomatik)
+```
+
+---
+
+## 🛡️ Audit & Sağlamlaştırma
+
+Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirmeler uygulanmıştır:
+
+| # | İyileştirme | Dosya | Detay |
+|---|------------|-------|-------|
+| 1 | **Optik akış EMA yumuşatma** | `localization.py` | Frame-to-frame gürültüyü α=0.4 EMA ile bastırma + son GPS irtifası fallback |
+| 2 | **Exception sağlamlaştırma** | `detection.py` | OOM ayrı handle, `SystemExit`/`KeyboardInterrupt` yeniden raise |
+| 3 | **Kararlı sıralama** | `detection.py` | NMS ve containment suppression'da `kind="stable"` |
+| 4 | **Float birikim sınırı** | `movement.py` | `_cam_total_x/y` ±1e6 ile sınırlandı |
+| 5 | **GPS simülasyonu** | `data_loader.py` | Deterministik döngü yerine %33 rastgele degradasyon |
+| 6 | **Homography koruması** | `image_matcher.py` | Dejenere/koliner nokta kontrolü |
+| 7 | **Config temizliği** | — | `task3_params.yaml` kullanımdan kaldırıldı (dead code) |
+
+### Testler
+
+```bash
+# Tüm testleri çalıştır (47 test, ~6 saniye, 10s timeout)
+python -m pytest tests/test_all.py -v
 ```
 
 ---

@@ -52,6 +52,11 @@ class MovementEstimator:
         self._cam_total_x += cam_dx
         self._cam_total_y += cam_dy
 
+        # Sonsuz birikim yerine precision kaybını önle (audit §1.3)
+        _CAM_TOTAL_CAP = 1e6
+        self._cam_total_x = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_x))
+        self._cam_total_y = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_y))
+
         # Frozen frame: piksel-bazlı fark kontrolü
         # Kamera stabil + araç hareketli → frame_diff > 1.0 → NOT frozen (history güncellenir)
         # Gerçek donmuş/duplicate frame → frame_diff ≈ 0 → frozen (history atlanır)

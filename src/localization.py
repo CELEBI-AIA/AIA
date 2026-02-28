@@ -58,6 +58,17 @@ class VisualOdometry:
         # En son bilinen GPS pozisyonu (kalibrasyon referansı)
         self._last_gps_position: Optional[Dict[str, float]] = None
 
+        # Son bilinen geçerli GPS irtifası (NaN fallback için)
+        self._last_gps_altitude: float = Settings.DEFAULT_ALTITUDE
+
+        # EMA yumuşatma katsayısı (0.0–1.0, düşük = daha fazla yumuşatma)
+        self._ema_alpha: float = 0.4
+        self._ema_dx: float = 0.0
+        self._ema_dy: float = 0.0
+
+        # Tek karedeki maksimum kabul edilebilir yer değiştirme (metre)
+        self._max_displacement_per_frame: float = 5.0
+
         # GPS → Optik Akış geçiş takibi
         self._was_gps_healthy: bool = False
 
@@ -169,12 +180,20 @@ class VisualOdometry:
         self.position["y"] = new_y
         self.position["z"] = new_z
 
+        # GPS irtifasını kaydet (optik akış fallback için)
+        if new_z > 0:
+            self._last_gps_altitude = new_z
+
         # Kalibrasyon referansını kaydet
         self._last_gps_position = {
             "x": new_x,
             "y": new_y,
             "z": new_z,
         }
+
+        # EMA durumunu sıfırla (GPS→OF geçişinde temiz başlangıç)
+        self._ema_dx = 0.0
+        self._ema_dy = 0.0
 
         self.log.debug(
             f"GPS güncelleme → X:{new_x:.2f}m Y:{new_y:.2f}m Z:{new_z:.2f}m"
@@ -231,17 +250,30 @@ class VisualOdometry:
         dy_pixels = float(np.median(good_new[:, 1] - good_old[:, 1]))
 
         # ------ 4) Piksel → Metre dönüşümü ------
-        altitude = float(
-            server_data.get("translation_z", self.position.get("z", Settings.DEFAULT_ALTITUDE))
-        )
+        # Son bilinen GPS irtifasını kullan (sabit 50m yerine)
+        raw_alt = server_data.get("translation_z", None)
+        try:
+            altitude = float(raw_alt)
+        except (TypeError, ValueError):
+            altitude = 0.0
         if altitude <= 0:
-            altitude = Settings.DEFAULT_ALTITUDE
+            altitude = self._last_gps_altitude
 
         dx_meters, dy_meters = self._pixel_to_meter(dx_pixels, dy_pixels, altitude)
 
-        # ------ 5) Pozisyonu güncelle ------
-        self.position["x"] += dx_meters
-        self.position["y"] += dy_meters
+        # ------ 5) EMA yumuşatma ------
+        alpha = self._ema_alpha
+        self._ema_dx = alpha * dx_meters + (1 - alpha) * self._ema_dx
+        self._ema_dy = alpha * dy_meters + (1 - alpha) * self._ema_dy
+
+        # ------ 6) Aykırı değer sınırlama ------
+        cap = self._max_displacement_per_frame
+        smooth_dx = max(-cap, min(cap, self._ema_dx))
+        smooth_dy = max(-cap, min(cap, self._ema_dy))
+
+        # ------ 7) Pozisyonu güncelle ------
+        self.position["x"] += smooth_dx
+        self.position["y"] += smooth_dy
 
         self.log.debug(
             f"Optik Akış → dX:{dx_meters:.3f}m dY:{dy_meters:.3f}m | "

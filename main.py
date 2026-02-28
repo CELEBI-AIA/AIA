@@ -8,7 +8,6 @@ import os
 import signal
 import sys
 import time
-import traceback
 from collections import Counter
 from typing import Dict, Optional
 
@@ -27,6 +26,7 @@ from src.resilience import SessionResilienceController
 from src.runtime_profile import apply_runtime_profile
 from src.send_state import apply_send_result_status
 from src.utils import Logger, Visualizer
+from typing import Any
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -111,16 +111,15 @@ def run_simulation(
             os.makedirs(Settings.DEBUG_OUTPUT_DIR, exist_ok=True)
             log.info(f"Saving frames to: {Settings.DEBUG_OUTPUT_DIR}")
 
-        log.success("All modules initialized ✓")
+        log.success("All modules initialized successfully")
 
-    except Exception as exc:
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
         log.error(f"Initialization error: {exc}")
-        log.error(f"Stack trace:\n{traceback.format_exc()}")
         return
 
     running = True
 
-    def signal_handler(sig, frame):
+    def signal_handler(sig, frame) -> None:
         nonlocal running
         running = False
         log.warn("Shutdown signal received, stopping loop...")
@@ -138,61 +137,23 @@ def run_simulation(
                 break
 
             try:
-                frame = frame_info["frame"]
-                frame_idx = frame_info["frame_idx"]
-                server_data = frame_info["server_data"]
-                gps_health = frame_info["gps_health"]
-
-                detected_objects = detector.detect(frame)
-                detected_objects = movement.annotate(detected_objects, frame=frame)
-                position = odometry.update(frame, server_data)
-
-                # Görev 3
-                undefined_objects = []
-                if image_matcher is not None:
-                    undefined_objects = image_matcher.match(frame)
-
-                _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
-
-                if show or save:
-                    annotated = visualizer.draw_detections(
-                        frame,
-                        detected_objects,
-                        frame_id=str(frame_idx),
-                        position=position,
-                        save_to_disk=not save,
-                    )
-
-                    mode_text = "GPS" if gps_health == 1 else "Optical Flow"
-                    cv2.putText(
-                        annotated,
-                        f"Mode: {mode_text}",
-                        (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0) if gps_health else (0, 165, 255),
-                        2,
-                    )
-
-                    if show:
-                        cv2.imshow("TEKNOFEST - Simulation", annotated)
-                        key = cv2.waitKey(1) & 0xFF
-                        if key in (ord("q"), 27):
-                            log.info("Window closed by user (q/ESC)")
-                            break
-
-                    if save:
-                        save_path = os.path.join(
-                            Settings.DEBUG_OUTPUT_DIR,
-                            f"frame_{frame_idx:04d}.jpg",
-                        )
-                        cv2.imwrite(save_path, annotated)
-
+                should_stop = _process_simulation_step(
+                    log,
+                    frame_info,
+                    detector,
+                    movement,
+                    odometry,
+                    image_matcher,
+                    visualizer,
+                    show,
+                    save,
+                )
+                if should_stop:
+                    break
                 fps_counter.tick()
 
             except Exception as exc:
                 log.error(f"Frame {frame_info.get('frame_idx', '?')} error: {exc}")
-                log.error(f"Stack trace:\n{traceback.format_exc()}")
                 continue
 
     finally:
@@ -204,6 +165,68 @@ def run_simulation(
             log.success(f"Frames saved: {Settings.DEBUG_OUTPUT_DIR}/")
 
         _print_summary(log, fps_counter)
+
+
+def _process_simulation_step(
+    log: Logger,
+    frame_info: dict,
+    detector: ObjectDetector,
+    movement: MovementEstimator,
+    odometry: VisualOdometry,
+    image_matcher: Any,
+    visualizer: Any,
+    show: bool,
+    save: bool,
+) -> bool:
+    frame = frame_info["frame"]
+    frame_idx = frame_info["frame_idx"]
+    server_data = frame_info["server_data"]
+    gps_health = frame_info["gps_health"]
+
+    detected_objects = detector.detect(frame)
+    detected_objects = movement.annotate(detected_objects, frame=frame)
+    position = odometry.update(frame, server_data)
+
+    if image_matcher is not None:
+        _ = image_matcher.match(frame)
+
+    _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
+
+    if show or save:
+        annotated = visualizer.draw_detections(
+            frame,
+            detected_objects,
+            frame_id=str(frame_idx),
+            position=position,
+            save_to_disk=not save,
+        )
+
+        mode_text = "GPS" if gps_health == 1 else "Optical Flow"
+        cv2.putText(
+            annotated,
+            f"Mode: {mode_text}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0) if gps_health else (0, 165, 255),
+            2,
+        )
+
+        if show:
+            cv2.imshow("TEKNOFEST - Simulation", annotated)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                log.info("Window closed by user (q/ESC)")
+                return True
+
+        if save:
+            save_path = os.path.join(
+                Settings.DEBUG_OUTPUT_DIR,
+                f"frame_{frame_idx:04d}.jpg",
+            )
+            cv2.imwrite(save_path, annotated)
+
+    return False
 
 
 def _print_simulation_result(
@@ -237,7 +260,7 @@ def _print_simulation_result(
 
 
 def run_competition(log: Logger) -> None:
-    from src.network import FrameFetchStatus, NetworkManager
+    from src.network import NetworkManager
 
     log.info("Initializing modules...")
 
@@ -260,9 +283,9 @@ def run_competition(log: Logger) -> None:
 
         visualizer: Optional[Visualizer] = Visualizer() if Settings.DEBUG else None
 
-        log.success("All modules initialized ✓")
+        log.success("All modules initialized successfully")
 
-    except Exception as exc:
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
         log.error(f"Initialization error: {exc}")
         log.error("System startup failed, exiting.")
         return
@@ -295,7 +318,7 @@ def run_competition(log: Logger) -> None:
     }
     pending_result: Optional[Dict] = None
 
-    def signal_handler(sig, frame):
+    def signal_handler(sig, frame) -> None:
         nonlocal running
         running = False
         log.warn("Shutdown signal received (Ctrl+C)")
@@ -318,256 +341,77 @@ def run_competition(log: Logger) -> None:
                     break
 
                 if pending_result is None:
-                    if not resilience.before_fetch():
-                        cooldown_left = resilience.open_cooldown_remaining()
-                        wait_s = min(max(0.2, Settings.RETRY_DELAY), max(0.2, cooldown_left))
-                        log.warn(
-                            "Circuit breaker OPEN; waiting cooldown "
-                            f"({cooldown_left:.1f}s remaining, sleep={wait_s:.1f}s)"
-                        )
-                        time.sleep(wait_s)
+                    fetch_res, tf_new, action = _fetch_competition_step(
+                        log, network, detector, movement, odometry, image_matcher,
+                        resilience, kpi_counters, transient_failures, transient_budget
+                    )
+                    transient_failures = tf_new
+                    if action == "continue":
+                        time.sleep(min(max(0.2, Settings.RETRY_DELAY), 5.0) if fetch_res is None else 0)
                         continue
-
-                    fetch_result = network.get_frame()
-                    timeout_snapshot = network.consume_timeout_counters()
-                    kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
-                    kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
-                    kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-
-                    if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
-                        log.info("End of stream confirmed by server (204)")
+                    elif action == "break":
                         break
+                    
+                    pending_result = fetch_res
 
-                    if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
-                        transient_failures += 1
-                        resilience.on_fetch_transient()
-                        delay = min(
-                            5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4))
-                        )
-                        log.warn(
-                            f"Transient frame fetch failure {transient_failures}/{transient_budget}; "
-                            f"retrying in {delay:.1f}s"
-                        )
-                        if transient_failures >= transient_budget:
-                            log.warn(
-                                "Transient failure budget reached; "
-                                "session stays alive under wall-clock circuit breaker policy"
-                            )
-                        time.sleep(delay)
-                        continue
+                # GÖNDERME
+                if pending_result is not None:
+                    frame_for_debug = pending_result["frame"]
+                    detected_objects = pending_result["detected_objects"]
+                    position = pending_result["position"]
+                    frame_id = pending_result["frame_id"]
+                    frame_data = pending_result["frame_data"]
 
-                    if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
-                        log.error(
-                            f"Fatal frame fetch error: {fetch_result.error_type} "
-                            f"(http={fetch_result.http_status})"
-                        )
+                    pending_result, ack_new, action = _submit_competition_step(
+                        log, network, resilience, kpi_counters, pending_result,
+                        ack_failures, ack_failure_budget
+                    )
+                    ack_failures = ack_new
+                    if action == "break":
                         break
-
-                    frame_data = fetch_result.frame_data or {}
-                    transient_failures = 0
-                    degrade_mode = (
-                        Settings.DEGRADE_FETCH_ONLY_ENABLED and resilience.is_degraded()
-                    )
-
-                    frame_id = frame_data.get("frame_id", "unknown")
-                    if fetch_result.is_duplicate:
-                        kpi_counters["frame_duplicate_drop"] += 1
-                        log.warn(
-                            f"Frame {frame_id}: duplicate metadata detected, dropping before inference/submit"
-                        )
+                    elif action == "continue":
                         continue
 
-                    frame = None
-                    use_fallback = False
+                    # Metrics & Visuals on success
+                    try:
+                        gps_health = int(float(frame_data.get("gps_health", 0)))
+                    except (TypeError, ValueError):
+                        gps_health = 0
 
-                    if degrade_mode:
-                        kpi_counters["degrade_frames"] += 1
-                        degrade_seq = resilience.record_degraded_frame()
-                        heavy_every = max(1, int(Settings.DEGRADE_SEND_INTERVAL_FRAMES))
-                        should_try_heavy = (degrade_seq % heavy_every) == 0
-                        if should_try_heavy:
-                            frame = network.download_image(frame_data)
-                            timeout_snapshot = network.consume_timeout_counters()
-                            kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
-                            kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
-                            kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-                            if frame is None:
-                                use_fallback = True
-                                log.warn(
-                                    f"Frame {frame_id}: degrade heavy pass image download failed, "
-                                    "sending fallback result"
-                                )
-                            else:
-                                log.info(
-                                    f"Frame {frame_id}: degrade heavy pass "
-                                    f"(every {heavy_every} frames)"
-                                )
-                        else:
-                            use_fallback = True
-                            log.info(
-                                f"Frame {frame_id}: degraded fetch-only fallback "
-                                f"(slot {degrade_seq}/{heavy_every})"
-                            )
+                    if gps_health == 1:
+                        kpi_counters["mode_gps"] += 1
                     else:
-                        frame = network.download_image(frame_data)
-                        timeout_snapshot = network.consume_timeout_counters()
-                        kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
-                        kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
-                        kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-                        if frame is None:
-                            use_fallback = True
-                            log.warn(
-                                f"Frame {frame_id}: image download failed, sending fallback result"
-                            )
+                        kpi_counters["mode_of"] += 1
 
-                    if use_fallback:
-                        pending_result = {
-                            "frame_id": frame_id,
-                            "frame_data": frame_data,
-                            "detected_objects": [],
-                            "frame": None,
-                            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
-                            "degraded": degrade_mode,
-                            "pending_ttl": 1 if degrade_mode else None,
-                            "detected_translation": {
-                                "translation_x": 0.0,
-                                "translation_y": 0.0,
-                                "translation_z": 0.0,
-                            },
-                            "frame_shape": None,
-                            "detected_undefined_objects": [],
-                        }
-                    else:
-                        detected_objects = detector.detect(frame)
-                        detected_objects = movement.annotate(detected_objects, frame=frame)
-
-                        # Görev 3
-                        undefined_objects = []
-                        if image_matcher is not None:
-                            undefined_objects = image_matcher.match(frame)
-
-                        position = odometry.update(frame, frame_data)
-                        pending_result = {
-                            "frame_id": frame_id,
-                            "frame_data": frame_data,
-                            "detected_objects": detected_objects,
-                            "frame": frame,
-                            "position": position,
-                            "degraded": degrade_mode,
-                            "pending_ttl": 1 if degrade_mode else None,
-                            "detected_translation": {
-                                "translation_x": position["x"],
-                                "translation_y": position["y"],
-                                "translation_z": position["z"],
-                            },
-                            "frame_shape": frame.shape,
-                            "detected_undefined_objects": undefined_objects,
-                        }
-
-                frame_id = pending_result["frame_id"]
-                frame_data = pending_result["frame_data"]
-                detected_objects = pending_result["detected_objects"]
-                frame_for_debug = pending_result["frame"]
-                position = pending_result["position"]
-                send_status = network.send_result(
-                    frame_id,
-                    detected_objects,
-                    pending_result["detected_translation"],
-                    frame_data=frame_data,
-                    frame_shape=pending_result["frame_shape"],
-                    degrade=bool(pending_result.get("degraded", False)),
-                    detected_undefined_objects=pending_result.get("detected_undefined_objects"),
-                )
-                timeout_snapshot = network.consume_timeout_counters()
-                kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
-                kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
-                kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-                guard_snapshot = network.consume_payload_guard_counters()
-                kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
-                kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
-
-                (
-                    pending_result,
-                    should_abort_session,
-                    success_cycle,
-                ) = apply_send_result_status(
-                    send_status=send_status,
-                    pending_result=pending_result,
-                    kpi_counters=kpi_counters,
-                )
-
-                if should_abort_session:
-                    log.error(f"Frame {frame_id}: permanent rejected payload, aborting session")
-                    break
-
-                if success_cycle:
-                    ack_failures = 0
-                    resilience.on_success_cycle()
-                else:
-                    ack_failures += 1
-                    resilience.on_ack_failure()
-                    delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
-                    log.warn(
-                        f"Frame {frame_id}: result send failed ({send_status}), waiting ACK "
-                        f"({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s"
-                    )
-                    if ack_failures >= ack_failure_budget:
-                        log.warn(
-                            "ACK failure budget reached; "
-                            "session stays alive under wall-clock circuit breaker policy"
+                    if Settings.DEBUG and visualizer is not None and frame_for_debug is not None:
+                        visualizer.draw_detections(
+                            frame_for_debug,
+                            detected_objects,
+                            frame_id=str(frame_id),
+                            position=position,
                         )
-                    pending_ttl = pending_result.get("pending_ttl")
-                    if pending_ttl is not None:
-                        pending_ttl = int(pending_ttl) - 1
-                        pending_result["pending_ttl"] = pending_ttl
-                        if pending_ttl <= 0:
-                            log.warn(
-                                f"Frame {frame_id}: stale degraded pending result dropped after TTL"
-                            )
-                            pending_result = None
-                    time.sleep(delay)
-                    continue
 
-                try:
-                    gps_health = int(float(frame_data.get("gps_health", 0)))
-                except (TypeError, ValueError):
-                    gps_health = 0
+                    fps_counter.tick()
 
-                if gps_health == 1:
-                    kpi_counters["mode_gps"] += 1
-                else:
-                    kpi_counters["mode_of"] += 1
+                    interval = max(1, int(Settings.COMPETITION_RESULT_LOG_INTERVAL))
+                    if fps_counter.frame_count % interval == 0:
+                        _print_competition_result(
+                            log=log,
+                            frame_id=frame_id,
+                            detected_objects=detected_objects,
+                            send_status="SUCCESS",
+                            position=position,
+                            gps_health=gps_health,
+                        )
 
-                if Settings.DEBUG and visualizer is not None and frame_for_debug is not None:
-                    visualizer.draw_detections(
-                        frame_for_debug,
-                        detected_objects,
-                        frame_id=str(frame_id),
-                        position=position,
-                    )
-
-                fps_counter.tick()
-
-                interval = max(1, int(Settings.COMPETITION_RESULT_LOG_INTERVAL))
-                if fps_counter.frame_count % interval == 0:
-                    _print_competition_result(
-                        log=log,
-                        frame_id=frame_id,
-                        detected_objects=detected_objects,
-                        send_status=str(getattr(send_status, "value", send_status)),
-                        frame_data=frame_data,
-                        position=position,
-                    )
-
-                if Settings.LOOP_DELAY > 0:
-                    time.sleep(Settings.LOOP_DELAY)
+                    if Settings.LOOP_DELAY > 0:
+                        time.sleep(Settings.LOOP_DELAY)
 
             except KeyboardInterrupt:
                 log.warn("Interrupted by user")
                 break
             except Exception as exc:
                 log.error(f"Runtime error: {exc}")
-                log.error(f"Stack trace:\n{traceback.format_exc()}")
                 time.sleep(0.5)
 
     finally:
@@ -596,13 +440,9 @@ def _print_competition_result(
     frame_id,
     detected_objects: list,
     send_status: str,
-    frame_data: dict,
     position: dict,
+    gps_health: int,
 ) -> None:
-    try:
-        gps_health = int(float(frame_data.get("gps_health", 0)))
-    except (TypeError, ValueError):
-        gps_health = 0
     mode = "GPS" if gps_health == 1 else "OF"
 
     def _safe_float(val) -> float:
@@ -615,7 +455,7 @@ def _print_competition_result(
     y = _safe_float(position.get("y", 0.0))
     z = _safe_float(position.get("z", 0.0))
 
-    send_status_text = "OK" if send_status in {"acked", "fallback_acked"} else "FAIL"
+    send_status_text = "OK" if send_status in {"acked", "fallback_acked", "SUCCESS"} else "FAIL"
     log.info(
         f"Frame: {frame_id} | Obj: {len(detected_objects)} | "
         f"Send: {send_status_text} ({send_status}) | Mode: {mode} | "
@@ -641,6 +481,9 @@ def _print_summary(
         torch.cuda.empty_cache()
         log.info("GPU cache cleared")
 
+    def val_str(val):
+        return f"{val:.0f}" if isinstance(val, (float, int)) else str(val)
+
     if kpi_counters is not None:
         log.info(
             "KPI: "
@@ -650,7 +493,6 @@ def _print_summary(
             f"Permanent Reject={kpi_counters.get('send_permanent_reject', 0)} | "
             f"Preflight Reject={kpi_counters.get('payload_preflight_reject_count', 0)} | "
             f"Payload Clipped={kpi_counters.get('payload_clipped_count', 0)} | "
-            f"Mode GPS={kpi_counters.get('mode_gps', 0)} | "
             f"Mode OF={kpi_counters.get('mode_of', 0)} | "
             f"Degrade Frames={kpi_counters.get('degrade_frames', 0)} | "
             f"DupDrop={kpi_counters.get('frame_duplicate_drop', 0)} | "
@@ -658,6 +500,10 @@ def _print_summary(
             f"{kpi_counters.get('timeout_fetch', 0)}/"
             f"{kpi_counters.get('timeout_image', 0)}/"
             f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+        log.info(
+            f"Payload Size   : Max {val_str(kpi_counters.get('max_payload_bytes'))} bytes "
+            f"(Avg: {val_str(kpi_counters.get('avg_payload_bytes'))} bytes)"
         )
 
     if resilience_stats is not None:
@@ -800,6 +646,167 @@ def main() -> None:
     else:
         run_competition(log)
 
+
+def _fetch_competition_step(
+    log: Logger, network: Any, detector: Any, movement: Any, odometry: Any, image_matcher: Any,
+    resilience: Any, kpi_counters: dict, transient_failures: int, transient_budget: int
+):
+    from src.network import FrameFetchStatus
+    import time
+
+    if not resilience.before_fetch():
+        cooldown_left = resilience.open_cooldown_remaining()
+        wait_s = min(max(0.2, Settings.RETRY_DELAY), max(0.2, cooldown_left))
+        log.warn(f"Circuit breaker OPEN; waiting cooldown ({cooldown_left:.1f}s remaining, sleep={wait_s:.1f}s)")
+        return None, transient_failures, "continue"
+
+    fetch_result = network.get_frame()
+    timeout_snapshot = network.consume_timeout_counters()
+    kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+    kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+    kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+
+    if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
+        log.info("End of stream confirmed by server (204)")
+        return None, transient_failures, "break"
+
+    if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
+        transient_failures += 1
+        resilience.on_fetch_transient()
+        delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(transient_failures, 4)))
+        log.warn(f"Transient frame fetch failure {transient_failures}/{transient_budget}; retrying in {delay:.1f}s")
+        if transient_failures >= transient_budget:
+            log.warn("Transient failure budget reached; session stays alive under wall-clock circuit breaker policy")
+        time.sleep(delay)
+        return None, transient_failures, "continue"
+
+    if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
+        log.error(f"Fatal frame fetch error: {fetch_result.error_type} (http={fetch_result.http_status})")
+        return None, transient_failures, "break"
+
+    frame_data = fetch_result.frame_data or {}
+    transient_failures = 0
+    degrade_mode = Settings.DEGRADE_FETCH_ONLY_ENABLED and resilience.is_degraded()
+    frame_id = frame_data.get("frame_id", "unknown")
+
+    if fetch_result.is_duplicate:
+        kpi_counters["frame_duplicate_drop"] += 1
+        log.warn(f"Frame {frame_id}: duplicate metadata detected, dropping before inference/submit")
+        return None, transient_failures, "continue"
+
+    frame = None
+    use_fallback = False
+
+    if degrade_mode:
+        kpi_counters["degrade_frames"] += 1
+        degrade_seq = resilience.record_degraded_frame()
+        heavy_every = max(1, int(Settings.DEGRADE_SEND_INTERVAL_FRAMES))
+        should_try_heavy = (degrade_seq % heavy_every) == 0
+        if should_try_heavy:
+            frame = network.download_image(frame_data)
+            timeout_snapshot = network.consume_timeout_counters()
+            kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+            kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+            kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+            if frame is None:
+                use_fallback = True
+                log.warn(f"Frame {frame_id}: degrade heavy pass image download failed, sending fallback result")
+            else:
+                log.info(f"Frame {frame_id}: degrade heavy pass (every {heavy_every} frames)")
+        else:
+            use_fallback = True
+            log.info(f"Frame {frame_id}: degraded fetch-only fallback (slot {degrade_seq}/{heavy_every})")
+    else:
+        frame = network.download_image(frame_data)
+        timeout_snapshot = network.consume_timeout_counters()
+        kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+        kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+        kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+        if frame is None:
+            use_fallback = True
+            log.warn(f"Frame {frame_id}: image download failed, sending fallback result")
+
+    if use_fallback:
+        pending_result = {
+            "frame_id": frame_id, "frame_data": frame_data, "detected_objects": [],
+            "frame": None, "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "degraded": degrade_mode, "pending_ttl": 1 if degrade_mode else None,
+            "detected_translation": {"translation_x": 0.0, "translation_y": 0.0, "translation_z": 0.0},
+            "frame_shape": None, "detected_undefined_objects": [],
+        }
+    else:
+        detected_objects = detector.detect(frame)
+        detected_objects = movement.annotate(detected_objects, frame=frame)
+        undefined_objects = []
+        if image_matcher is not None:
+            undefined_objects = image_matcher.match(frame)
+        position = odometry.update(frame, frame_data)
+        pending_result = {
+            "frame_id": frame_id, "frame_data": frame_data, "detected_objects": detected_objects,
+            "frame": frame, "position": position, "degraded": degrade_mode,
+            "pending_ttl": 1 if degrade_mode else None,
+            "detected_translation": {"translation_x": position["x"], "translation_y": position["y"], "translation_z": position["z"]},
+            "frame_shape": frame.shape, "detected_undefined_objects": undefined_objects,
+        }
+
+    return pending_result, transient_failures, "process"
+
+def _submit_competition_step(
+    log: Logger, network: Any, resilience: Any, kpi_counters: dict, pending_result: dict,
+    ack_failures: int, ack_failure_budget: int
+):
+    import time
+    frame_id = pending_result["frame_id"]
+    frame_data = pending_result["frame_data"]
+    detected_objects = pending_result["detected_objects"]
+    
+    send_status = network.send_result(
+        frame_id, detected_objects, pending_result["detected_translation"],
+        frame_data=frame_data, frame_shape=pending_result["frame_shape"],
+        degrade=bool(pending_result.get("degraded", False)),
+        detected_undefined_objects=pending_result.get("detected_undefined_objects"),
+    )
+    
+    timeout_snapshot = network.consume_timeout_counters()
+    kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+    kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+    kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+    
+    guard_snapshot = network.consume_payload_guard_counters()
+    kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
+    kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
+
+    pending_result, should_abort_session, success_cycle = apply_send_result_status(
+        send_status=send_status, pending_result=pending_result, kpi_counters=kpi_counters,
+    )
+
+    if should_abort_session:
+        log.error(f"Frame {frame_id}: permanent rejected payload, aborting session")
+        return pending_result, ack_failures, "break"
+
+    if success_cycle:
+        ack_failures = 0
+        resilience.on_success_cycle()
+        return pending_result, ack_failures, "process"
+    else:
+        ack_failures += 1
+        resilience.on_ack_failure()
+        delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
+        log.warn(f"Frame {frame_id}: result send failed ({send_status}), waiting ACK ({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s")
+        if ack_failures >= ack_failure_budget:
+            log.warn("ACK failure budget reached; session stays alive under wall-clock circuit breaker policy")
+        
+        if pending_result is not None:
+            pending_ttl = pending_result.get("pending_ttl")
+            if pending_ttl is not None:
+                pending_ttl = int(pending_ttl) - 1
+                pending_result["pending_ttl"] = pending_ttl
+                if pending_ttl <= 0:
+                    log.warn(f"Frame {frame_id}: stale degraded pending result dropped after TTL")
+                    pending_result = None
+        
+        time.sleep(delay)
+        return pending_result, ack_failures, "continue"
 
 if __name__ == "__main__":
     main()

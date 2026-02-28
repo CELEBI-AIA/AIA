@@ -20,7 +20,7 @@ Kullanım:
 import os
 import unicodedata
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -127,7 +127,7 @@ class ObjectDetector:
                         save=False,
                         half=self._use_half,
                     )
-            self.log.success(f"Model ısınması tamamlandı ✓")
+            self.log.success("Model ısınması tamamlandı ✓")
         except Exception as e:
             self.log.warn(f"Warmup sırasında hata (görmezden geliniyor): {e}")
 
@@ -265,17 +265,17 @@ class ObjectDetector:
                     f"UAİ: {cls_counts.get('3', 0)})"
                 )
 
-            # ---- GPU Bellek Temizliği (periyodik) ----
+            # ---- GPU Bellek Temizliği (kaldırıldı: anti-pattern) ----
             self._frame_count += 1
-            if (
-                self.device == "cuda"
-                and self._frame_count % Settings.GPU_CLEANUP_INTERVAL == 0
-            ):
-                torch.cuda.empty_cache()
-                self.log.debug("GPU bellek temizlendi (empty_cache)")
 
             return output
 
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except torch.cuda.OutOfMemoryError:
+            self.log.error("GPU OOM hatası! Inference başarısız.")
+            torch.cuda.empty_cache()
+            return []
         except Exception as e:
             self.log.error(f"Tespit hatası: {e}")
             return []
@@ -494,56 +494,52 @@ class ObjectDetector:
         if not detections:
             return []
 
-        detections.sort(
-            key=lambda x: (x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]),
-            reverse=True,
-        )
+        boxes = np.array([d["bbox"] for d in detections])
+        areas = np.maximum((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]), 1e-6)
+        cls_ints = np.array([d["cls_int"] for d in detections])
 
-        keep = []
-        is_suppressed = [False] * len(detections)
-        landing_zone_ids = (Settings.CLASS_UAP, Settings.CLASS_UAI)
+        order = np.argsort(areas, kind="stable")[::-1]
+        keep: List[int] = []
+        is_suppressed = np.zeros(len(detections), dtype=bool)
+        landing_zone_ids = {Settings.CLASS_UAP, Settings.CLASS_UAI}
 
-        for i in range(len(detections)):
+        for i_idx, i in enumerate(order):
             if is_suppressed[i]:
                 continue
+            keep.append(int(i))
 
-            box_a = detections[i]["bbox"]
-            keep.append(detections[i])
+            remaining_indices = order[i_idx + 1:]
+            valid_mask = ~is_suppressed[remaining_indices] & (cls_ints[remaining_indices] == cls_ints[i])
+            valid_remaining = remaining_indices[valid_mask]
 
-            for j in range(i + 1, len(detections)):
-                if is_suppressed[j]:
-                    continue
+            if len(valid_remaining) == 0:
+                continue
 
-                if detections[i]["cls_int"] != detections[j]["cls_int"]:
-                    continue
+            box_a = boxes[i]
+            boxes_b = boxes[valid_remaining]
+            areas_b = areas[valid_remaining]
 
-                box_b = detections[j]["bbox"]
+            inter_x1 = np.maximum(box_a[0], boxes_b[:, 0])
+            inter_y1 = np.maximum(box_a[1], boxes_b[:, 1])
+            inter_x2 = np.minimum(box_a[2], boxes_b[:, 2])
+            inter_y2 = np.minimum(box_a[3], boxes_b[:, 3])
 
-                inter_x1 = max(box_a[0], box_b[0])
-                inter_y1 = max(box_a[1], box_b[1])
-                inter_x2 = min(box_a[2], box_b[2])
-                inter_y2 = min(box_a[3], box_b[3])
+            inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+            inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+            inter_area = inter_w * inter_h
 
-                inter_w = max(0.0, inter_x2 - inter_x1)
-                inter_h = max(0.0, inter_y2 - inter_y1)
-                inter_area = inter_w * inter_h
+            ios = inter_area / areas_b
 
-                if inter_area == 0:
-                    continue
+            effective_threshold = (
+                Settings.LANDING_ZONE_CONTAINMENT_IOU
+                if cls_ints[i] in landing_zone_ids
+                else threshold
+            )
 
-                area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-                ios = inter_area / area_b if area_b > 0 else 0
+            suppress_mask = ios > effective_threshold
+            is_suppressed[valid_remaining[suppress_mask]] = True
 
-                effective_threshold = (
-                    Settings.LANDING_ZONE_CONTAINMENT_IOU
-                    if detections[i]["cls_int"] in landing_zone_ids
-                    else threshold
-                )
-
-                if ios > effective_threshold:
-                    is_suppressed[j] = True
-
-        return keep
+        return [detections[i] for i in keep]
 
     @staticmethod
     def _nms_greedy(
@@ -556,7 +552,7 @@ class ObjectDetector:
         y2 = boxes[:, 3]
         areas = (x2 - x1) * (y2 - y1)
 
-        order = scores.argsort()[::-1]
+        order = np.argsort(scores, kind="stable")[::-1]
         keep: List[int] = []
 
         while order.size > 0:
@@ -701,22 +697,29 @@ class ObjectDetector:
         if not persons or not vehicles:
             return detections
 
-        kept_persons: List[Dict] = []
-        for person in persons:
-            suppress = False
-            pbox = person["bbox"]
-            for veh in vehicles:
-                vbox = veh["bbox"]
-                overlap = ObjectDetector._intersection_over_area(pbox, vbox)
-                iou = ObjectDetector._bbox_iou(pbox, vbox)
-                if (
-                    overlap >= Settings.RIDER_OVERLAP_THRESHOLD
-                    or iou >= Settings.RIDER_IOU_THRESHOLD
-                ):
-                    suppress = True
-                    break
-            if not suppress:
-                kept_persons.append(person)
+        p_boxes = np.array([p["bbox"] for p in persons])
+        v_boxes = np.array([v["bbox"] for v in vehicles])
+
+        inter_x1 = np.maximum(p_boxes[:, None, 0], v_boxes[None, :, 0])
+        inter_y1 = np.maximum(p_boxes[:, None, 1], v_boxes[None, :, 1])
+        inter_x2 = np.minimum(p_boxes[:, None, 2], v_boxes[None, :, 2])
+        inter_y2 = np.minimum(p_boxes[:, None, 3], v_boxes[None, :, 3])
+
+        inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+        inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        p_area = np.maximum((p_boxes[:, 2] - p_boxes[:, 0]) * (p_boxes[:, 3] - p_boxes[:, 1]), 1e-6)
+        v_area = np.maximum((v_boxes[:, 2] - v_boxes[:, 0]) * (v_boxes[:, 3] - v_boxes[:, 1]), 1e-6)
+
+        overlap = inter_area / p_area[:, None]
+        union = p_area[:, None] + v_area[None, :] - inter_area
+        iou = inter_area / np.maximum(union, 1e-6)
+
+        suppress_mask = (overlap >= Settings.RIDER_OVERLAP_THRESHOLD) | (iou >= Settings.RIDER_IOU_THRESHOLD)
+        suppress_persons = np.any(suppress_mask, axis=1)
+
+        kept_persons = [p for i, p in enumerate(persons) if not suppress_persons[i]]
 
         return others + vehicles + kept_persons
 

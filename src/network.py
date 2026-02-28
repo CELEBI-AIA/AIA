@@ -57,6 +57,7 @@ class NetworkManager:
         )
         self.log = Logger("Network")
         self.session = requests.Session()
+        self.session.verify = True  # Strict SSL verification
         self._frame_counter: int = 0
         self._result_counter: int = 0
         self._sim_image_cache: Optional[np.ndarray] = None
@@ -787,15 +788,13 @@ class NetworkManager:
         }
 
     def consume_timeout_counters(self) -> Dict[str, int]:
-        snapshot = dict(self._timeout_counters)
-        for key in self._timeout_counters:
-            self._timeout_counters[key] = 0
+        snapshot = self._timeout_counters
+        self._timeout_counters = dict.fromkeys(snapshot, 0)
         return snapshot
 
     def consume_payload_guard_counters(self) -> Dict[str, int]:
-        snapshot = dict(self._payload_guard_counters)
-        for key in self._payload_guard_counters:
-            self._payload_guard_counters[key] = 0
+        snapshot = self._payload_guard_counters
+        self._payload_guard_counters = dict.fromkeys(snapshot, 0)
         return snapshot
 
     def _increment_timeout_counter(self, key: str) -> None:

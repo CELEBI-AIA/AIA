@@ -28,13 +28,14 @@ import time
 from glob import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import List
 
 # Proje kökünü ayarla
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Görüntü dosyalarını keşfet
-def discover_frames():
+def discover_frames() -> List[str]:
     """datasets/ içindeki görüntüleri keşfeder."""
     datasets_dir = PROJECT_ROOT / "datasets"
     frames = []
@@ -61,12 +62,12 @@ class MockServerHandler(BaseHTTPRequestHandler):
     results_received = 0
     session_start = time.time()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args) -> None:
         """Sunucu loglarını formatla."""
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] [MockServer] {format % args}")
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         """GET isteklerini işle."""
         if self.path == "/" or self.path == "":
             # Bağlantı testi
@@ -91,7 +92,7 @@ class MockServerHandler(BaseHTTPRequestHandler):
 
         self.send_error(404, "Not Found")
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         """POST isteklerini işle."""
         if self.path.startswith("/submit_result"):
             self._handle_submit_result()
@@ -99,7 +100,7 @@ class MockServerHandler(BaseHTTPRequestHandler):
 
         self.send_error(404, "Not Found")
 
-    def _handle_next_frame(self):
+    def _handle_next_frame(self) -> None:
         """Sıradaki frame'i JSON olarak sun."""
         cls = MockServerHandler
 
@@ -156,7 +157,7 @@ class MockServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(frame_data).encode())
 
-    def _handle_submit_result(self):
+    def _handle_submit_result(self) -> None:
         """Sonuç submission'ı kabul et."""
         cls = MockServerHandler
 
@@ -184,11 +185,20 @@ class MockServerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error(400, "Invalid JSON")
 
-    def _serve_image(self):
+    def _serve_image(self) -> None:
         """Görüntü dosyasını sun."""
         # /images/ prefix'ini kaldır
         rel_path = self.path[len("/images/"):]
-        abs_path = PROJECT_ROOT / rel_path
+        
+        try:
+            abs_path = (PROJECT_ROOT / rel_path).resolve()
+        except Exception:
+            self.send_error(400, "Bad Request")
+            return
+
+        if not str(abs_path).startswith(str(PROJECT_ROOT.resolve())):
+            self.send_error(403, "Forbidden")
+            return
 
         if not abs_path.is_file():
             self.send_error(404, f"Image not found: {rel_path}")
@@ -240,7 +250,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         elapsed = time.time() - MockServerHandler.session_start
-        print(f"\n\n  Sunucu kapatıldı.")
+        print("\n\n  Sunucu kapatıldı.")
         print(f"  Toplam süre: {elapsed:.1f}s")
         print(f"  Gönderilen kare: {MockServerHandler.current_index}")
         print(f"  Alınan sonuç: {MockServerHandler.results_received}")

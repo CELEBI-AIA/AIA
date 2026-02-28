@@ -20,10 +20,9 @@ Kullanım:
 import os
 import random
 from glob import glob
-from typing import Dict, Iterator, List, Optional, Any
+from typing import Dict, Iterator, List, Any, Optional
 
 import cv2
-import numpy as np
 
 from config.settings import Settings
 from src.utils import Logger
@@ -248,10 +247,9 @@ class DatasetLoader:
                     # İlk 1 dakika — kesinlikle sağlıklı
                     gps_health = 1
                 else:
-                    # 450+ frame: sağlıksız geçişleri simüle et
-                    # Deterministik pattern: 100 kare sağlıklı, 200 kare sağlıksız
-                    cycle_pos = (self._index - 450) % 300
-                    gps_health = 1 if cycle_pos < 100 else 0
+                    # 450+ frame: rastgele sağlıksız geçişler (audit §1.1)
+                    # %33 olasılıkla sağlıksız — şartname "geçebilir" der
+                    gps_health = 0 if random.random() < 0.33 else 1
             else:
                 gps_health = 1
 

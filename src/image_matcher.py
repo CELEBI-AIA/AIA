@@ -288,6 +288,12 @@ class ImageMatcher:
                 [frame_kp[m.trainIdx].pt for m in good_matches]
             ).reshape(-1, 1, 2)
 
+            # Dejenere/koliner nokta koruması (audit §2)
+            if len(np.unique(src_pts.reshape(-1, 2), axis=0)) < 4:
+                return None
+            if len(np.unique(dst_pts.reshape(-1, 2), axis=0)) < 4:
+                return None
+
             M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
             if M is None:
                 return None
