@@ -13,6 +13,7 @@ from typing import List
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+
 def discover_frames() -> List[str]:
     datasets_dir = PROJECT_ROOT / "datasets"
     frames = []
@@ -161,7 +162,7 @@ class MockServerHandler(BaseHTTPRequestHandler):
 
     def _serve_image(self) -> None:
         rel_path = self.path[len("/images/"):]
-        
+
         try:
             abs_path = (PROJECT_ROOT / rel_path).resolve()
         except Exception:

@@ -90,7 +90,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 | **Debug** | Renkli konsol çıktısı, tespit görselleştirme, periyodik kayıt |
 | **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, OOM koruması |
 | **Offline** | İnternet bağlantısı gerektirmez — yarışma kurallarına uygun (şartname 6.2) |
-| **Test** | 47 birim testi, pytest-timeout, tek dosyada (`tests/test_all.py`) |
+| **Test** | 45 birim testi, pytest-timeout (10s), tek dosyada (`tests/test_all.py`) |
 
 ---
 
@@ -251,7 +251,7 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `SAHI_ENABLED` | `True` | Parçalı inference (küçük nesneler için) |
 | `SAHI_SLICE_SIZE` | `640` | Parça boyutu (piksel) |
 | `SAHI_OVERLAP_RATIO` | `0.35` | Parçalar arası örtüşme oranı |
-| `SAHI_MERGE_IOU` | `0.15` | Birleştirme NMS IoU eşiği |
+| `SAHI_MERGE_IOU` | `0.25` | Birleştirme NMS IoU eşiği |
 
 ### Bbox Filtreleri
 
@@ -259,6 +259,14 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 |-----------|-----------|----------|
 | `MIN_BBOX_SIZE` | `20` | Minimum bbox boyutu (px) |
 | `MAX_BBOX_SIZE` | `9999` | Maksimum bbox boyutu (px) |
+
+### Simülasyon (datasets/)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `DATASETS_DIR` | `datasets` | Simülasyon görüntü kök dizini |
+| `IMAGE_EXTENSIONS` | `(.jpg, .jpeg, .png, .bmp, .tif, .tiff)` | Recursive taranacak uzantılar |
+| `SIMULATION_DET_SAMPLE_SIZE` | `100` | simulate_det modunda rastgele seçilecek görüntü sayısı |
 
 ### Görev 2 (Pozisyon Kestirimi)
 
@@ -298,15 +306,6 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `MOTION_COMP_QUALITY_LEVEL` | `0.01` | Köşe kalite eşiği |
 | `MOTION_COMP_MIN_DISTANCE` | `20` | Köşeler arası minimum mesafe |
 | `MOTION_COMP_WIN_SIZE` | `21` | LK optik akış pencere boyutu |
-
-### Rider Suppression (Bisiklet/Motosiklet Sürücüsü)
-
-| Parametre | Varsayılan | Açıklama |
-|-----------|-----------|----------|
-| `RIDER_SUPPRESS_ENABLED` | `True` | Sürücü suppression kuralını aç/kapat |
-| `RIDER_OVERLAP_THRESHOLD` | `0.35` | Person-overlap oranı eşiği |
-| `RIDER_IOU_THRESHOLD` | `0.15` | IoU yedek eşiği |
-| `RIDER_SOURCE_CLASSES` | `(1, 3, 10)` | Two-wheeler kaynak sınıf ID'leri (COCO/VisDrone) |
 
 ### Deterministiklik
 
@@ -379,6 +378,7 @@ HavaciliktaYZ/
 ├── src/
 │   ├── __init__.py
 │   ├── detection.py        # Görev 1: YOLOv8 nesne tespiti + iniş durumu
+│   ├── frame_context.py    # Ortak gri dönüşüm (detection/movement/localization)
 │   ├── movement.py         # Görev 1: Temporal hareket kararı + kamera kompanzasyonu
 │   ├── localization.py     # Görev 2: GPS + optik akış + EMA pozisyon kestirimi
 │   ├── image_matcher.py    # Görev 3: ORB/SIFT referans obje eşleştirme
@@ -400,7 +400,8 @@ HavaciliktaYZ/
 │   └── best_*.pt           # Eğitilmiş YOLOv8 modeli (Git'e dahil değil)
 │
 ├── datasets/
-│   └── task3_references/   # Görev 3 referans obje resimleri
+│   ├── task3_references/    # Görev 3 referans obje resimleri
+│   └── (herhangi alt klasör)  # Simülasyon: recursive taranır (.jpg, .png vb.); VID/DET modu için
 │
 ├── sartname/
 │   └── sartname.md         # Yarışma birleşik teknik şartnamesi
@@ -430,7 +431,7 @@ Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirme
 ### Testler
 
 ```bash
-# Tüm testleri çalıştır (pytest-timeout 30s)
+# Tüm testleri çalıştır (pytest-timeout 10s)
 python -m pytest tests/test_all.py -v
 ```
 

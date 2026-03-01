@@ -400,10 +400,10 @@ class ObjectDetector:
                 if ios[idx_b] > effective_threshold:
                     cls_a = cls_ints[i]
                     cls_b = cls_ints[b_idx]
-                    
+
                     if cls_a in landing_zone_ids and cls_b not in landing_zone_ids:
                         continue
-                    
+
                     suppress_mask[idx_b] = True
 
             is_suppressed[valid_remaining[suppress_mask]] = True
@@ -486,8 +486,6 @@ class ObjectDetector:
             filtered.append(det)
 
         return filtered
-
-
 
     @staticmethod
     def _bbox_iou(
@@ -674,7 +672,7 @@ class ObjectDetector:
         landing_w = max(0.0, landing_box[2] - landing_box[0])
         landing_h = max(0.0, landing_box[3] - landing_box[1])
         landing_area = landing_w * landing_h
-        
+
         if landing_area <= 0:
             return 0.0
 

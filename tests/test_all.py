@@ -2,13 +2,9 @@
 
 import copy
 import json
-import os
-import sys
 import time
-import types
 import unittest
-from collections import deque
-from unittest.mock import Mock, MagicMock, patch, mock_open
+from unittest.mock import Mock, patch, mock_open
 
 import numpy as np
 import pytest
@@ -327,9 +323,6 @@ def test_run_simulation_stops_on_max_frames(
     assert MockDetector.return_value.detect.call_count == 1
 
 
-
-
-
 @unittest.skipUnless(cv2 is not None and MovementEstimator is not None, "opencv/runtime deps missing")
 class TestMovementCompensation(unittest.TestCase):
     def setUp(self):
@@ -457,10 +450,10 @@ class TestIdempotencySubmit(unittest.TestCase):
         )
         first = mgr.send_result(**kw)
         second = mgr.send_result(**kw)
-        
+
         self.assertEqual(first, SendResultStatus.ACKED)
         self.assertEqual(second, SendResultStatus.ACKED)
-        
+
         self.assertEqual(mgr.session.post.call_count, 2)
 
 
@@ -509,9 +502,12 @@ class TestNetworkTimeouts(unittest.TestCase):
             detected_translation={"translation_x": 0, "translation_y": 0, "translation_z": 0},
             frame_data={"id": "f1", "url": "/frame/1"}, frame_shape=None,
         )
-        self.assertEqual(get_calls[0][1]["timeout"], (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_FRAME_META))
-        self.assertEqual(get_calls[1][1]["timeout"], (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_IMAGE))
-        self.assertEqual(mgr.session.post.call_args.kwargs["timeout"], (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_SUBMIT))
+        expected_frame = (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_FRAME_META)
+        expected_image = (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_IMAGE)
+        expected_submit = (Settings.REQUEST_CONNECT_TIMEOUT_SEC, Settings.REQUEST_READ_TIMEOUT_SEC_SUBMIT)
+        self.assertEqual(get_calls[0][1]["timeout"], expected_frame)
+        self.assertEqual(get_calls[1][1]["timeout"], expected_image)
+        self.assertEqual(mgr.session.post.call_args.kwargs["timeout"], expected_submit)
 
     def test_backoff_delay_stays_in_expected_bounds(self):
         mgr = NetworkManager(base_url="http://test", simulation_mode=False)
@@ -721,10 +717,14 @@ class TestCompetitionLoopHardening(unittest.TestCase):
         for k, v in self._orig.items():
             setattr(Settings, k, v)
 
+    def _summary_cb(self, *a, **kw):
+        self.summary_calls.append(kw)
+
     def test_duplicate_frame_dropped_before_processing(self):
+        fd = {"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}
         _FakeNetwork.frame_results = [
-            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}, is_duplicate=False),
-            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}, is_duplicate=True),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data=fd, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data=fd, is_duplicate=True),
             FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
         ]
         _FakeNetwork.timeout_snapshots = [{"fetch": 0, "image": 0, "submit": 0}] * 8
@@ -732,17 +732,20 @@ class TestCompetitionLoopHardening(unittest.TestCase):
              patch.object(main_module, "ObjectDetector", _DummyDetector), \
              patch.object(main_module, "MovementEstimator", _DummyMovement), \
              patch.object(main_module, "VisualOdometry", _DummyOdometry), \
-             patch.object(main_module, "_print_summary", side_effect=lambda *a, **kw: self.summary_calls.append(kw)):
+             patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(_FakeNetwork.download_calls, 2)
         self.assertEqual(_FakeNetwork.send_calls, 2)
         self.assertEqual(_DummyDetector.detect_calls, 2)
-        self.assertEqual(self.summary_calls[-1]["kpi_counters"]["frame_duplicate_drop"], 1)
+        self.assertEqual(
+            self.summary_calls[-1]["kpi_counters"]["frame_duplicate_drop"], 1
+        )
 
     def test_transient_fetch_timeout_recovers(self):
+        fd2 = {"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}
         _FakeNetwork.frame_results = [
             FrameFetchResult(status=FrameFetchStatus.TRANSIENT_ERROR, error_type="retries_exhausted"),
-            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data=fd2, is_duplicate=False),
             FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
         ]
         _FakeNetwork.timeout_snapshots = [
@@ -756,15 +759,17 @@ class TestCompetitionLoopHardening(unittest.TestCase):
              patch.object(main_module, "ObjectDetector", _DummyDetector), \
              patch.object(main_module, "MovementEstimator", _DummyMovement), \
              patch.object(main_module, "VisualOdometry", _DummyOdometry), \
-             patch.object(main_module, "_print_summary", side_effect=lambda *a, **kw: self.summary_calls.append(kw)):
+             patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(_FakeNetwork.send_calls, 1)
         self.assertEqual(self.summary_calls[-1]["kpi_counters"]["timeout_fetch"], 1)
 
     def test_action_result_unexpected_type_handled_safely(self):
+        fd1 = {"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}
+        fd2 = {"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}
         _FakeNetwork.frame_results = [
-            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}, is_duplicate=False),
-            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data=fd1, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data=fd2, is_duplicate=False),
             FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
         ]
         _FakeNetwork.timeout_snapshots = [{"fetch": 0, "image": 0, "submit": 0}] * 10
@@ -788,6 +793,6 @@ class TestCompetitionLoopHardening(unittest.TestCase):
              patch.object(main_module, "MovementEstimator", _DummyMovement), \
              patch.object(main_module, "VisualOdometry", _DummyOdometry), \
              patch.object(main_module, "_submit_competition_step", side_effect=mock_submit), \
-             patch.object(main_module, "_print_summary", side_effect=lambda *a, **kw: self.summary_calls.append(kw)):
+             patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(call_count[0], 2)

@@ -1,8 +1,7 @@
 import sys
-import threading
 from unittest.mock import MagicMock
 
-import pytest
+import pytest  # noqa: F401 - pytest framework
 
 mock_torch = MagicMock()
 mock_torch.cuda.is_available.return_value = False
@@ -13,5 +12,3 @@ mock_ultralytics = MagicMock()
 sys.modules['torch'] = mock_torch
 sys.modules['torchvision'] = mock_torchvision
 sys.modules['ultralytics'] = mock_ultralytics
-
-

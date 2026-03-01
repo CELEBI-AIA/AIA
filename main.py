@@ -7,7 +7,7 @@ import signal
 import sys
 import time
 from collections import Counter
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -17,16 +17,15 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config.settings import Settings
-from src.detection import ObjectDetector
-from src.localization import VisualOdometry
-from src.movement import MovementEstimator
-from src.resilience import SessionResilienceController
-from src.runtime_profile import apply_runtime_profile
-from src.send_state import apply_send_result_status
-from src.utils import Logger, Visualizer
-from src.frame_context import FrameContext
-from typing import Any
+from config.settings import Settings  # noqa: E402
+from src.detection import ObjectDetector  # noqa: E402
+from src.localization import VisualOdometry  # noqa: E402
+from src.movement import MovementEstimator  # noqa: E402
+from src.resilience import SessionResilienceController  # noqa: E402
+from src.runtime_profile import apply_runtime_profile  # noqa: E402
+from src.send_state import apply_send_result_status  # noqa: E402
+from src.utils import Logger, Visualizer  # noqa: E402
+from src.frame_context import FrameContext  # noqa: E402
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -365,7 +364,7 @@ def run_competition(log: Logger) -> None:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         fetch_future = None
         submit_future = None
-        
+
         while running:
             try:
                 abort_reason = resilience.should_abort()
@@ -399,12 +398,14 @@ def run_competition(log: Logger) -> None:
                         break
                     elif action_result == "continue":
                         continue
-                    
+
                     if not (isinstance(action_result, tuple) and len(action_result) == 2):
-                        log.error(f"Unexpected action_result type: {type(action_result)}, skipping frame")
+                        log.error(
+                            f"Unexpected action_result type: {type(action_result)}, skipping frame"
+                        )
                         continue
                     _, success_info = action_result
-                    
+
                     try:
                         gps_health = int(float(success_info["frame_data"].get("gps_health", 0)))
                     except (TypeError, ValueError):
@@ -449,15 +450,20 @@ def run_competition(log: Logger) -> None:
                         fetch_future = executor.submit(
                             _fetch_competition_step,
                             log, network, detector, movement, odometry, image_matcher,
-                            resilience, kpi_counters, transient_failures, transient_budget
+                            resilience, kpi_counters,                             transient_failures, transient_budget
                         )
-                    
+
                     if fetch_future.done():
                         fetch_res, tf_new, action, is_dup = fetch_future.result()
                         fetch_future = None
                         transient_failures = tf_new
                         if action == "continue":
-                            time.sleep(min(max(0.2, Settings.RETRY_DELAY), 5.0) if fetch_res is None else 0)
+                            delay_val = (
+                                min(max(0.2, Settings.RETRY_DELAY), 5.0)
+                                if fetch_res is None
+                                else 0
+                            )
+                            time.sleep(delay_val)
                             continue
                         elif action == "break":
                             break
@@ -465,7 +471,10 @@ def run_competition(log: Logger) -> None:
                             consecutive_duplicate_frames += 1
                             if consecutive_duplicate_frames >= CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD:
                                 kpi_counters["consecutive_duplicate_abort"] = consecutive_duplicate_frames
-                                log.error(f"Ardışık {consecutive_duplicate_frames} duplicate frame, oturum sonlandırılıyor")
+                                log.error(
+                                    f"Ardışık {consecutive_duplicate_frames} duplicate frame, "
+                                    "oturum sonlandırılıyor"
+                                )
                                 break
                         else:
                             consecutive_duplicate_frames = 0
@@ -808,7 +817,11 @@ def _fetch_competition_step(
             "frame_id": frame_id, "frame_data": frame_data, "detected_objects": [],
             "frame": None, "position": last_position,
             "degraded": degrade_mode, "pending_ttl": 1 if degrade_mode else None,
-            "detected_translation": {"translation_x": last_position["x"], "translation_y": last_position["y"], "translation_z": last_position["z"]},
+            "detected_translation": {
+                "translation_x": last_position["x"],
+                "translation_y": last_position["y"],
+                "translation_z": last_position["z"],
+            },
             "frame_shape": None, "detected_undefined_objects": [],
             "is_duplicate": fetch_result.is_duplicate,
         }
@@ -824,12 +837,17 @@ def _fetch_competition_step(
             "frame_id": frame_id, "frame_data": frame_data, "detected_objects": detected_objects,
             "frame": frame, "position": position, "degraded": degrade_mode,
             "pending_ttl": 1 if degrade_mode else None,
-            "detected_translation": {"translation_x": position["x"], "translation_y": position["y"], "translation_z": position["z"]},
+            "detected_translation": {
+                "translation_x": position["x"],
+                "translation_y": position["y"],
+                "translation_z": position["z"],
+            },
             "frame_shape": frame.shape, "detected_undefined_objects": undefined_objects,
             "is_duplicate": fetch_result.is_duplicate,
         }
 
     return pending_result, transient_failures, "process", fetch_result.is_duplicate
+
 
 def _submit_competition_step(
     log: Logger, network: Any, resilience: Any, kpi_counters: dict, pending_result: dict,
@@ -840,19 +858,19 @@ def _submit_competition_step(
     frame_id = pending_result["frame_id"]
     frame_data = pending_result["frame_data"]
     detected_objects = pending_result["detected_objects"]
-    
+
     send_status = network.send_result(
         frame_id, detected_objects, pending_result["detected_translation"],
         frame_data=frame_data, frame_shape=pending_result["frame_shape"],
         degrade=bool(pending_result.get("degraded", False)),
         detected_undefined_objects=pending_result.get("detected_undefined_objects"),
     )
-    
+
     timeout_snapshot = network.consume_timeout_counters()
     kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
     kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
     kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-    
+
     guard_snapshot = network.consume_payload_guard_counters()
     kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
     kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
@@ -865,7 +883,10 @@ def _submit_competition_step(
 
     if pending_result is None and not success_cycle:
         consecutive_permanent_rejects += 1
-        log.warn(f"Frame {frame_id}: permanent rejected, frame dropped ({consecutive_permanent_rejects}/{permanent_reject_abort_threshold})")
+        log.warn(
+            f"Frame {frame_id}: permanent rejected, frame dropped "
+            f"({consecutive_permanent_rejects}/{permanent_reject_abort_threshold})"
+        )
         if consecutive_permanent_rejects >= permanent_reject_abort_threshold:
             log.error("Consecutive permanent reject threshold reached, aborting session")
             return None, ack_failures, "break", consecutive_permanent_rejects
@@ -887,21 +908,30 @@ def _submit_competition_step(
         ack_failures += 1
         resilience.on_ack_failure()
         delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
-        log.warn(f"Frame {frame_id}: result send failed ({send_status}), waiting ACK ({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s")
+        log.warn(
+            f"Frame {frame_id}: result send failed ({send_status}), "
+            f"waiting ACK ({ack_failures}/{ack_failure_budget}); retrying in {delay:.1f}s"
+        )
         if ack_failures >= ack_failure_budget:
-            log.warn("ACK failure budget reached; session stays alive under wall-clock circuit breaker policy")
-        
+            log.warn(
+                "ACK failure budget reached; session stays alive "
+                "under wall-clock circuit breaker policy"
+            )
+
         if pending_result is not None:
             pending_ttl = pending_result.get("pending_ttl")
             if pending_ttl is not None:
                 pending_ttl = int(pending_ttl) - 1
                 pending_result["pending_ttl"] = pending_ttl
                 if pending_ttl <= 0:
-                    log.warn(f"Frame {frame_id}: stale degraded pending result dropped after TTL")
+                    log.warn(
+                        f"Frame {frame_id}: stale degraded pending result dropped after TTL"
+                    )
                     pending_result = None
-        
+
         time.sleep(delay)
         return pending_result, ack_failures, "continue", consecutive_permanent_rejects
+
 
 if __name__ == "__main__":
     main()

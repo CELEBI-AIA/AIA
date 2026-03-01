@@ -92,7 +92,7 @@ class NetworkManager:
                 )
                 if response.status_code == 200:
                     self.log.success(f"Server connection successful -> {self.base_url}")
-                    
+
                     try:
                         data = response.json()
                         if isinstance(data, dict):
@@ -108,7 +108,7 @@ class NetworkManager:
                                 self._task3_references = []
                     except ValueError:
                         pass
-                        
+
                     return True
                 self.log.warn(f"Unexpected server response: {response.status_code}")
             except requests.ConnectionError:
@@ -172,9 +172,9 @@ class NetworkManager:
                         is_duplicate=is_duplicate,
                     )
 
-        if response.status_code == 204:
-            # Sunucu tüm kareleri bitirdi, oturum sonu
-            self.log.info("Video finished (204 No Content)")
+                if response.status_code == 204:
+                    # Sunucu tüm kareleri bitirdi, oturum sonu
+                    self.log.info("Video finished (204 No Content)")
                     return FrameFetchResult(
                         status=FrameFetchStatus.END_OF_STREAM,
                         http_status=204,

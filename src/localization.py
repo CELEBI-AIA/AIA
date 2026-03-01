@@ -61,7 +61,10 @@ class VisualOdometry:
 
         self.log.info("Visual Odometry başlatıldı — Başlangıç: (0, 0, 0)")
         if Settings.FOCAL_LENGTH_PX == 800.0:
-            self.log.warn("FOCAL_LENGTH_PX=800 (varsayılan) kullanılıyor. TBD-010 kamera parametreleri yayımlandığında config/settings.py güncellenmeli.")
+            self.log.warn(
+                "FOCAL_LENGTH_PX=800 (varsayılan) kullanılıyor. "
+                "TBD-010 kamera parametreleri yayımlandığında config/settings.py güncellenmeli."
+            )
 
     def update(
         self,
@@ -90,7 +93,7 @@ class VisualOdometry:
                 self._was_gps_healthy = False
                 self._ema_dx = 0.0
                 self._ema_dy = 0.0
-                
+
                 self.log.info("GPS → Optik Akış geçişi — referans kare oluşturuldu, EMA resetlendi.")
 
             if self._prev_gray is not None and self._prev_points is not None:
@@ -136,7 +139,6 @@ class VisualOdometry:
             self.log.warn("Yetersiz köşe noktası — yeniden tespit ediliyor")
             return
 
-
         next_points, status, err = cv2.calcOpticalFlowPyrLK(
             self._prev_gray, gray, self._prev_points, None, **self._lk_params
         )
@@ -147,7 +149,7 @@ class VisualOdometry:
             return
 
         mask = status.flatten() == 1
-        
+
         if self._prev_points is None:
             return
 
@@ -198,7 +200,7 @@ class VisualOdometry:
         dz_meters = 0.0
         if 0.5 < scale_ratio < 2.0 and scale_ratio != 1.0:
             dz_meters = self.position["z"] * ((1.0 / scale_ratio) - 1.0)
-            
+
         smooth_dz = max(-cap, min(cap, dz_meters * alpha))
         self.position["x"] += smooth_dx
         self.position["y"] += smooth_dy

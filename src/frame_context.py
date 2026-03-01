@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from typing import Optional
-from config.settings import Settings
+
 
 class FrameContext:
     """Frame için ortak hesaplamalar (gray conversion). Detection, movement, localization tekrar hesaplamasın."""

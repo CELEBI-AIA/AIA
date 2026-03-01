@@ -48,10 +48,10 @@ class Settings:
     # Görev 3 (Image Matching)
     TASK3_ENABLED: bool = True
     TASK3_REFERENCE_DIR: str = str(PROJECT_ROOT / "datasets" / "task3_references")
-    TASK3_SIMILARITY_THRESHOLD: float = 0.72    
-    TASK3_FALLBACK_THRESHOLD: float = 0.66      
-    TASK3_FALLBACK_INTERVAL: int = 5            
-    TASK3_GRID_STRIDE: int = 32                 
+    TASK3_SIMILARITY_THRESHOLD: float = 0.72
+    TASK3_FALLBACK_THRESHOLD: float = 0.66
+    TASK3_FALLBACK_INTERVAL: int = 5
+    TASK3_GRID_STRIDE: int = 32
     TASK3_MAX_REFERENCES: int = 10
     TASK3_FEATURE_METHOD: str = "ORB"
 
@@ -63,7 +63,7 @@ class Settings:
 
     # İniş Durumu Kodları
     LANDING_NOT_AREA: str = "-1"    # İniş alanı değil (Taşıt/İnsan)
-    LANDING_NOT_SUITABLE: str = "0" # İniş için uygun değil
+    LANDING_NOT_SUITABLE: str = "0"  # İniş için uygun değil
     LANDING_SUITABLE: str = "1"
 
     # COCO → TEKNOFEST eşleme

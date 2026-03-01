@@ -94,7 +94,7 @@ class MovementEstimator:
         n = len(history)
         scale = self._frame_width / Settings.MOVEMENT_THRESHOLD_REF_WIDTH
         threshold = Settings.MOVEMENT_THRESHOLD_PX * scale
-        
+
         if n < Settings.MOVEMENT_MIN_HISTORY:
             if n >= 2:
                 x0, y0, cam0_x, cam0_y = history[0]
@@ -102,7 +102,7 @@ class MovementEstimator:
                 rel_dx = (x1 - x0) - (cam1_x - cam0_x)
                 rel_dy = (y1 - y0) - (cam1_y - cam0_y)
                 dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
-                if dist >= threshold * 0.9: 
+                if dist >= threshold * 0.9:
                     return "1"
             return "0"
 

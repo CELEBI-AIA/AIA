@@ -1,5 +1,14 @@
 # CHANGELOGS
 
+## 0.0.34 - 2026-03-01
+- **fix(network)**: Fixed E999 SyntaxError — `if response.status_code == 204` and 5xx branches moved inside `try` block with correct indentation.
+- **chore(lint)**: Resolved flake8 errors project-wide (W291/W293 trailing/blank whitespace, E261/E302/E303/E305, E501 line length, F401 unused imports, E731 lambda, W391).
+- **chore(config)**: Removed trailing whitespace in settings.py, fixed inline comment spacing.
+- **chore(main)**: Added noqa for path-dependent imports, fixed formatting and blank-line conventions.
+- **chore(src)**: Cleaned frame_context, detection, localization, movement; removed unused imports.
+- **chore(tests)**: Removed unused imports, fixed E303/E501/E731; replaced lambdas with `_summary_cb` helper.
+- **chore(tools)**: Fixed mock_server E302, W293.
+
 ## 0.0.33 - 2026-03-01
 - **refactor(data_loader)**: Recursive scan of datasets/; find images by extension (.jpg, .png, etc.); removed sequences/images folder structure requirement.
 - **refactor(config)**: Removed DATASET_NAME_PATTERN, added IMAGE_EXTENSIONS; supports any dataset structure.
