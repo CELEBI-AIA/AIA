@@ -204,3 +204,8 @@
 ## 0.0.01 - 2026-02-21
 - Fixed P1 mode-safety issue: selecting competition mode now forces `NetworkManager` to run with `simulation_mode=False`, even if `Settings.SIMULATION_MODE=True`.
 - Refactored network mode checks to use instance-level `self.simulation_mode` instead of global settings so runtime mode is explicit and controllable.
+
+## 0.0.19 - 2026-03-02
+- Updated `README.md` terminology from "Deterministiklik" to "Tutarlılık ve Tekrarlanabilirlik (Best-Effort)".
+- Softened wording from strict/guarantee language to variance-reduction guidance (best-effort consistency framing).
+- Revised profile guidance text to present `max` as a stability-oriented recommendation instead of a hard requirement.

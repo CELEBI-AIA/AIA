@@ -22,7 +22,7 @@
 - [Kullanım](#-kullanım)
 - [Yapılandırma](#-yapılandırma)
 - [Görev 3 Parametre Dosyası](#-görev-3-parametre-dosyası)
-- [Deterministiklik Sözleşmesi](#-deterministiklik-sözleşmesi)
+- [Tutarlılık ve Tekrarlanabilirlik (Best-Effort)](#-tutarlılık-ve-tekrarlanabilirlik-best-effort)
 - [Dosya Yapısı](#-dosya-yapısı)
 - [Audit & Sağlamlaştırma](#-audit--sağlamlaştırma)
 - [Yarışma Kuralları](#-yarışma-kuralları)
@@ -163,10 +163,10 @@ python tools/mock_server.py
 python main.py --mode competition
 ```
 
-Desteklenen deterministik profiller:
+Desteklenen tutarlılık profilleri:
 - `off`
 - `balanced` (simülasyon/iterasyon için önerilen varsayılan)
-- `max` (competition modunda zorunlu uygulanır)
+- `max` (competition modunda daha kararlı sonuç davranışı için önerilir)
 
 ### Çıktı Formatı (Sunucuya Gönderilen JSON — Şartname Bölüm 3)
 
@@ -307,11 +307,11 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `MOTION_COMP_MIN_DISTANCE` | `20` | Köşeler arası minimum mesafe |
 | `MOTION_COMP_WIN_SIZE` | `21` | LK optik akış pencere boyutu |
 
-### Deterministiklik
+### Tutarlılık ve Tekrarlanabilirlik (Best-Effort)
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
-| `DETERMINISM_SEED` | `42` | Tekrarlanabilirlik için global seed |
+| `DETERMINISM_SEED` | `42` | Run-to-run varyansını azaltmak için global seed |
 | `DETERMINISM_CPU_THREADS` | `1` | CPU thread sabitleme |
 
 ---
@@ -329,34 +329,34 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 
 ---
 
-## 🔒 Deterministiklik Sözleşmesi
+## 🔒 Tutarlılık ve Tekrarlanabilirlik (Best-Effort)
 
-Sistem çıktılarının tekrarlanabilir olması için aşağıdaki kurallar zorunludur:
+Sistem çıktılarında run-to-run varyansını azaltmak için aşağıdaki pratikler önerilir:
 
 1. **Seed Sabitleme (numpy/torch/random):**
-   - Tüm çalıştırmalarda aynı seed kullanılmalıdır.
-   - Öneri: `numpy`, `torch`, `random` için tek noktadan seed ataması yapılmalı.
+   - Aynı senaryolarda karşılaştırılabilir sonuçlar için sabit seed kullanılması önerilir.
+   - `numpy`, `torch`, `random` için tek noktadan seed ataması pratik bir yaklaşımdır.
 
 2. **Model Eval Mode:**
-   - İnference öncesi tüm modeller `eval` modunda çalıştırılmalıdır.
-   - Dropout ve BatchNorm gibi katmanların eğitim davranışı kapatılmalıdır.
+   - İnference öncesi modellerin `eval` modunda çalıştırılması önerilir.
+   - Dropout ve BatchNorm gibi katmanların eğitim davranışını kapatmak sonuç stabilitesine yardımcı olur.
 
 3. **Sabit Sürüm Pinleme:**
-   - `torch`, `torchvision`, `ultralytics`, CUDA ve cuDNN sürümleri pinlenmelidir.
-   - Üretim ortamında sürüm kayması engellenmeli, aynı bağımlılık seti korunmalıdır.
+   - `torch`, `torchvision`, `ultralytics`, CUDA ve cuDNN sürümlerini pinlemek önerilir.
+   - Üretim ortamında sürüm kaymasını azaltmak için aynı bağımlılık seti korunmalıdır.
 
 4. **JSON Sırası ve Kararlı Serileştirme:**
-   - Çıktı JSON'ları kararlı anahtar sırası ile üretilmelidir (`sort_keys=True` veya sabit alan sırası).
-   - Sayısal formatlama ve alan sırası sürümler arasında değiştirilmemelidir.
+   - Çıktı JSON'larını kararlı anahtar sırası ile üretmek (`sort_keys=True` veya sabit alan sırası) tavsiye edilir.
+   - Sayısal formatlama ve alan sırasını sürümler arasında korumak entegrasyon riskini azaltır.
 
 5. **Frame-Index Tabanlı Karar Kuralları:**
-   - Adaptasyonlar wall-clock süreye göre değil, frame index/pencere kuralına göre yapılmalıdır.
-   - Bu yaklaşım farklı donanımlarda aynı karar davranışını korur.
-   - Not: Wall-clock kullanımı yalnızca ağ dayanıklılığı orkestrasyonu (circuit breaker/degrade) için kabul edilir; model karar mantığı (`motion_status`, `landing_status`, sınıf çıktıları) frame-index tabanlı kalmalıdır.
+   - Adaptasyonları wall-clock yerine frame index/pencere kuralına bağlamak daha tutarlı sonuç üretir.
+   - Bu yaklaşım farklı donanımlarda karar sapmasını azaltır.
+   - Not: Wall-clock kullanımı ağ dayanıklılığı orkestrasyonu (circuit breaker/degrade) için kullanılabilir; model karar mantığında (`motion_status`, `landing_status`, sınıf çıktıları) frame-index yaklaşımı tercih edilir.
 
 6. **Runtime Profil Kullanımı:**
-   - Competition çalıştırmasında profil runtime tarafından `max` olarak zorunlu uygulanır.
-   - `max`: seed + deterministic backend + TTA kapalı + FP16 kapalı (FP32); sınır vakalarda run-to-run farkını azaltır.
+   - Competition çalıştırmalarında `max` profil daha kararlı davranış için önerilir.
+   - `max`: seed + deterministic backend + TTA kapalı + FP16 kapalı (FP32); sınır vakalarda run-to-run farkını azaltmayı hedefler.
    - `balanced`: seed + deterministic backend + TTA kapalı, FP16 açık; simülasyon ve hızlı iterasyon için uygundur.
 
 ---
