@@ -24,7 +24,7 @@ class MovementEstimator:
     """
     Basit merkez-nokta takibi ile taşıtların hareket durumunu belirler.
 
-    movement_status:
+    motion_status:
         - "1": Hareketli
         - "0": Hareketsiz
         - "-1": Taşıt değil
@@ -58,23 +58,21 @@ class MovementEstimator:
         self._cam_total_x += cam_dx
         self._cam_total_y += cam_dy
 
-        # Sonsuz birikim yerine precision kaybını önle (audit §1.3)
+        # Kamera kayması birikimini sınırla (sayısal hassasiyet)
         _CAM_TOTAL_CAP = 1e6
         self._cam_total_x = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_x))
         self._cam_total_y = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_y))
 
-        # Frozen frame: piksel-bazlı fark kontrolü
-        # Kamera stabil + araç hareketli → frame_diff > 1.0 → NOT frozen (history güncellenir)
-        # Gerçek donmuş/duplicate frame → frame_diff ≈ 0 → frozen (history atlanır)
-        # İlk frame → frame_diff = inf → NOT frozen
+        # Donmuş kare: piksel farkı düşükse history güncellenmez
         self._is_frozen_frame = self._frame_diff < Settings.FROZEN_FRAME_DIFF_THRESHOLD
 
         vehicles: List[Tuple[int, Dict]] = []
         for idx, det in enumerate(detections):
-            if det.get("cls") == "0":
+            # Taşıt seçimi: cls veya cls_int (str/int uyumlu)
+            cls_val = det.get("cls_int", det.get("cls"))
+            if cls_val == Settings.CLASS_TASIT or (isinstance(cls_val, str) and cls_val == "0"):
                 vehicles.append((idx, det))
             else:
-                det["movement_status"] = "-1"
                 det["motion_status"] = "-1"
 
         if not vehicles:
@@ -100,7 +98,6 @@ class MovementEstimator:
             track.missed = 0
 
             status = self._status(track.history)
-            det["movement_status"] = status
             det["motion_status"] = status
 
         return detections
@@ -117,11 +114,20 @@ class MovementEstimator:
         Threshold, çözünürlüğe göre ölçeklenir (4K'da 2×, 1080p'de 1×).
         """
         n = len(history)
-        if n < Settings.MOVEMENT_MIN_HISTORY:
-            return "0"
-
         scale = self._frame_width / Settings.MOVEMENT_THRESHOLD_REF_WIDTH
         threshold = Settings.MOVEMENT_THRESHOLD_PX * scale
+        
+        if n < Settings.MOVEMENT_MIN_HISTORY:
+            # Kısa history ile erken hareket tahmini (n>=2)
+            if n >= 2:
+                x0, y0, cam0_x, cam0_y = history[0]
+                x1, y1, cam1_x, cam1_y = history[-1]
+                rel_dx = (x1 - x0) - (cam1_x - cam0_x)
+                rel_dy = (y1 - y0) - (cam1_y - cam0_y)
+                dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
+                if dist >= threshold * 0.9: 
+                    return "1"
+            return "0"
 
         step = max(1, Settings.MOVEMENT_MIN_HISTORY - 1)
 
@@ -168,7 +174,7 @@ class MovementEstimator:
 
     def _age_tracks(self, matched_track_ids: set) -> None:
         to_delete: List[int] = []
-        # Audit 2.2 fix: strictly iterate over a static list of keys
+        # Döngü sırasında sözlük değişmesin
         for track_id in list(self._tracks.keys()):
             track = self._tracks[track_id]
             if track_id not in matched_track_ids:

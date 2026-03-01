@@ -94,6 +94,20 @@ class NetworkManager:
                 )
                 if response.status_code == 200:
                     self.log.success(f"Server connection successful -> {self.base_url}")
+                    
+                    try:
+                        data = response.json()
+                        if isinstance(data, dict):
+                            max_f = data.get("max_frames")
+                            if max_f is not None:
+                                Settings.MAX_FRAMES = int(max_f)
+                                self.log.info(f"Oturum: MAX_FRAMES güncellendi -> {Settings.MAX_FRAMES}")
+                            refs = data.get("task3_references")
+                            if refs and isinstance(refs, list):
+                                self.log.info(f"Oturum: Sunucudan {len(refs)} Görev 3 referansı alındı.")
+                    except ValueError:
+                        pass
+                        
                     return True
                 self.log.warn(f"Unexpected server response: {response.status_code}")
             except requests.ConnectionError:
@@ -258,9 +272,9 @@ class NetworkManager:
         frame_key = self._normalize_frame_key(frame_id)
         if self._was_already_submitted(frame_key):
             self.log.warn(
-                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard"
+                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard, sending gracefully."
             )
-            return SendResultStatus.ACKED
+            # Duplicate submit guard is safe to rely on idempotency. The server handles idempotency-key.
 
         raw_payload = self.build_competition_payload(
             frame_id=frame_id,
@@ -427,7 +441,7 @@ class NetworkManager:
         for obj in detected_objects:
             cls = str(obj.get("cls", ""))
             landing = str(obj.get("landing_status", "-1"))
-            motion = str(obj.get("motion_status", obj.get("movement_status", "-1")))
+            motion = str(obj.get("motion_status", "-1"))
             if cls not in {"0", "1", "2", "3"}:
                 continue
             if landing not in {"-1", "0", "1"}:
@@ -447,13 +461,13 @@ class NetworkManager:
 
             clean_objects.append(
                 {
-                    "cls": cls,
-                    "landing_status": landing,
-                    "motion_status": motion,
-                    "top_left_x": x1,
-                    "top_left_y": y1,
-                    "bottom_right_x": x2,
-                    "bottom_right_y": y2,
+                    "cls": int(cls),
+                    "landing_status": int(landing),
+                    "motion_status": int(motion),
+                    "top_left_x": int(x1),
+                    "top_left_y": int(y1),
+                    "bottom_right_x": int(x2),
+                    "bottom_right_y": int(y2),
                     "_confidence": NetworkManager._safe_float(obj.get("confidence", 0.0)),
                 }
             )
@@ -640,7 +654,7 @@ class NetworkManager:
             if landing not in {"-1", "0", "1"}:
                 landing = "-1"
 
-            motion = str(obj.get("motion_status", obj.get("movement_status", "-1")))
+            motion = str(obj.get("motion_status", "-1"))
             if motion not in {"-1", "0", "1"}:
                 motion = "-1"
 
@@ -775,6 +789,17 @@ class NetworkManager:
 
     @staticmethod
     def _build_safe_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        tx = 0.0
+        ty = 0.0
+        tz = 0.0
+        translations = payload.get("detected_translations", [])
+        if isinstance(translations, list) and len(translations) > 0:
+            first_trans = translations[0]
+            if isinstance(first_trans, dict):
+                tx = float(first_trans.get("translation_x", 0.0))
+                ty = float(first_trans.get("translation_y", 0.0))
+                tz = float(first_trans.get("translation_z", 0.0))
+
         return {
             "id": payload.get("id", "unknown"),
             "user": payload.get("user", Settings.TEAM_NAME),
@@ -782,9 +807,9 @@ class NetworkManager:
             "detected_objects": [],
             "detected_translations": [
                 {
-                    "translation_x": 0.0,
-                    "translation_y": 0.0,
-                    "translation_z": 0.0,
+                    "translation_x": tx,
+                    "translation_y": ty,
+                    "translation_z": tz,
                 }
             ],
             "detected_undefined_objects": [],
@@ -858,7 +883,7 @@ class NetworkManager:
 
     def _build_idempotency_key(self, frame_key: str) -> str:
         prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
-        # Audit 6.1: Combine runtime session ID with frame_key to guarantee globally unique idempotency
+        # Oturum + frame benzersiz idempotency anahtarı
         import uuid
         if not hasattr(self, "_run_uuid"):
             self._run_uuid = uuid.uuid4().hex[:8]

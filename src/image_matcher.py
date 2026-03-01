@@ -288,7 +288,7 @@ class ImageMatcher:
                 [frame_kp[m.trainIdx].pt for m in good_matches]
             ).reshape(-1, 1, 2)
 
-            # Dejenere/koliner nokta koruması (audit §2)
+            # Koliner noktalar homografi hesaplamasını bozar
             if len(np.unique(src_pts.reshape(-1, 2), axis=0)) < 4:
                 return None
             if len(np.unique(dst_pts.reshape(-1, 2), axis=0)) < 4:
@@ -296,17 +296,19 @@ class ImageMatcher:
 
             M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
             if M is None or M.shape != (3, 3):
-                return None
-
-            # Referans objenin köşelerini dönüştür
-            h, w = ref.h, ref.w
-            corners = np.float32(
-                [[0, 0], [w, 0], [w, h], [0, h]]
-            ).reshape(-1, 1, 2)
-            transformed = cv2.perspectiveTransform(corners, M)
+                # Homografi başarısız: eşleşen noktalardan bounding rect
+                self.log.warn("Homografi dejenere oldu, nokta bazlı bounding rect (fallback) çıkarıldı")
+                pts = dst_pts.reshape(-1, 2)
+            else:
+                # Referans objenin köşelerini dönüştür
+                h, w = ref.h, ref.w
+                corners = np.float32(
+                    [[0, 0], [w, 0], [w, h], [0, h]]
+                ).reshape(-1, 1, 2)
+                transformed = cv2.perspectiveTransform(corners, M)
+                pts = transformed.reshape(-1, 2)
 
             # Bounding box
-            pts = transformed.reshape(-1, 2)
             x1 = float(max(0, pts[:, 0].min()))
             y1 = float(max(0, pts[:, 1].min()))
             x2 = float(min(frame_shape[1] if len(frame_shape) > 1 else frame_shape[0], pts[:, 0].max()))

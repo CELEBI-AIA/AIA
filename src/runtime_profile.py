@@ -56,6 +56,8 @@ def apply_runtime_profile(profile: ProfileName, requested_profile: Optional[str]
         pass
 
     # Profile-specific runtime toggles.
+    # Gerçek uygulamalarda Settings nesnesi başlatılırken okunmalıdır.
+    log.info("Applying dynamic runtime overrides to Settings class...")
     if profile in {"balanced", "max"}:
         Settings.AUGMENTED_INFERENCE = False
     if profile == "max":

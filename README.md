@@ -80,17 +80,17 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 
 | Özellik | Detay |
 |---------|-------|
-| **Model** | YOLOv8m (Ultralytics) — COCO → TEKNOFEST sınıf eşleştirmesi |
+| **Model** | YOLOv8 (Ultralytics) — COCO/VisDrone → TEKNOFEST sınıf eşleştirmesi, custom eğitim destekli |
 | **Hız** | FP16 half-precision + model warmup → **~33 FPS** (RTX 3060) |
 | **İniş Tespiti** | Intersection-over-area + kenar temas kontrolü + perspektif marjı |
 | **Hareket Tespiti** | Temporal pencere tabanlı karar + kamera hareket kompanzasyonu |
-| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + EMA yumuşatma (ilk 1 dk GPS, sonra görsel) |
+| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + Z ekseni scale tahmini + EMA yumuşatma |
 | **Referans Obje** | ORB/SIFT feature matching + homography + degenerate guard (Görev 3) |
 | **Ağ** | Otomatik retry, timeout yönetimi, circuit breaker, idempotency guard |
 | **Debug** | Renkli konsol çıktısı, tespit görselleştirme, periyodik kayıt |
 | **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, OOM koruması |
 | **Offline** | İnternet bağlantısı gerektirmez — yarışma kurallarına uygun (şartname 6.2) |
-| **Test** | 47 birim testi, 10s timeout, tek dosyada konsolide (`tests/test_all.py`) |
+| **Test** | 47 birim testi, pytest-timeout, tek dosyada (`tests/test_all.py`) |
 
 ---
 
@@ -100,7 +100,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 
 - **Python** 3.10+
 - **NVIDIA GPU** (önerilen) + CUDA 12.x
-- **İşletim Sistemi:** Linux (Ubuntu 22.04 test edildi)
+- **İşletim Sistemi:** Linux, Windows (test edildi)
 
 ### Adımlar
 
@@ -110,19 +110,21 @@ git clone https://github.com/siimsek/HavaciliktaYZ.git
 cd HavaciliktaYZ
 
 # 2. Sanal ortam oluştur
-python3 -m venv venv
+python -m venv venv
+
+# Linux/macOS:
 source venv/bin/activate
 
-# 3. PyTorch'u CUDA ile kur (önce)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Windows:
+venv\Scripts\activate
 
-# 4. Diğer bağımlılıkları kur
+# 3. Bağımlılıkları kur (requirements.txt PyTorch CUDA URL içerir)
 pip install -r requirements.txt
 
-# 5. Model dosyasını indir (eğer yoksa)
-# YOLOv8m modeli models/ dizinine yerleştirilmeli
-mkdir -p models
-# https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8m.pt
+# 4. Model dosyası: model/ dizinine .pt dosyası yerleştir
+# Varsayılan: model/best_mAP50-0.923_mAP50-95-0.766.pt
+mkdir model
+# Custom eğitilmiş model veya YOLOv8 base model kullanılabilir
 ```
 
 ---
@@ -175,9 +177,9 @@ Desteklenen deterministik profiller:
   "frame": "/api/frames/123",
   "detected_objects": [
     {
-      "cls": "0",
-      "landing_status": "-1",
-      "motion_status": "1",
+      "cls": 0,
+      "landing_status": -1,
+      "motion_status": 1,
       "top_left_x": 150,
       "top_left_y": 200,
       "bottom_right_x": 400,
@@ -215,16 +217,18 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
+| `BASE_URL` | `http://127.0.0.1:5000` | Sunucu adresi (yarışma günü güncellenir) |
+| `TEAM_NAME` | `"Takim_ID"` | Takım kimliği (yarışma günü güncellenir) |
 | `SIMULATION_MODE` | `True` | Legacy simülasyon bayrağı (runtime CLI-first çalışır) |
 | `DEBUG` | `True` | Detaylı log + görsel çıktı |
-| `MAX_FRAMES` | `2250` | Yarışma karesi limiti |
+| `MAX_FRAMES` | `2250` | Yarışma karesi limiti (sunucudan dinamik alınabilir) |
 
 ### Model Ayarları
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
-| `CONFIDENCE_THRESHOLD` | `0.20` | Minimum tespit güven eşiği |
-| `NMS_IOU_THRESHOLD` | `0.35` | NMS IoU eşiği (çift tespit bastırma) |
+| `CONFIDENCE_THRESHOLD` | `0.40` | Minimum tespit güven eşiği |
+| `NMS_IOU_THRESHOLD` | `0.15` | NMS IoU eşiği (çift tespit bastırma) |
 | `INFERENCE_SIZE` | `1280` | Inference çözünürlüğü (piksel) |
 | `HALF_PRECISION` | `True` | FP16 hızlandırma (CUDA) |
 | `AGNOSTIC_NMS` | `True` | Sınıflar arası NMS (farklı sınıf çakışmalarını bastırır) |
@@ -247,21 +251,28 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `SAHI_ENABLED` | `True` | Parçalı inference (küçük nesneler için) |
 | `SAHI_SLICE_SIZE` | `640` | Parça boyutu (piksel) |
 | `SAHI_OVERLAP_RATIO` | `0.35` | Parçalar arası örtüşme oranı |
-| `SAHI_MERGE_IOU` | `0.35` | Birleştirme NMS IoU eşiği |
+| `SAHI_MERGE_IOU` | `0.15` | Birleştirme NMS IoU eşiği |
 
 ### Bbox Filtreleri
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
-| `MIN_BBOX_SIZE` | `10` | Minimum bbox boyutu (px) — altındakiler elenir |
-| `MAX_BBOX_SIZE` | `9999` | Devre dışı — şartname büyük nesneleri (otobüs, tren) de zorunlu kılar |
+| `MIN_BBOX_SIZE` | `20` | Minimum bbox boyutu (px) |
+| `MAX_BBOX_SIZE` | `9999` | Maksimum bbox boyutu (px) |
+
+### Görev 2 (Pozisyon Kestirimi)
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `FOCAL_LENGTH_PX` | `800.0` | Kamera odak uzunluğu (px) — yarışma kamera parametreleriyle güncellenmeli |
+| `DEFAULT_ALTITUDE` | `50.0` | Optik akış fallback irtifası (m) |
 
 ### Görev 3 (Referans Obje Tespiti)
 
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
 | `TASK3_ENABLED` | `True` | Görev 3 modülünü aç/kapat |
-| `TASK3_REFERENCE_DIR` | `datasets/task3_references` | Referans obje dizini |
+| `TASK3_REFERENCE_DIR` | `datasets/task3_references` | Referans obje dizini (veya sunucudan alınır) |
 | `TASK3_SIMILARITY_THRESHOLD` | `0.72` | Feature matching onay eşiği |
 | `TASK3_FALLBACK_THRESHOLD` | `0.66` | Fallback sweep kabul eşiği |
 | `TASK3_FALLBACK_INTERVAL` | `5` | Fallback her N karede tetiklenir |
@@ -308,13 +319,14 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 
 ## 🎛️ Görev 3 Parametre Dosyası
 
-> **⚠️ Kullanımdan Kaldırıldı:** `config/task3_params.yaml` dosyası artık kod tarafından okunmamaktadır. Tüm Görev 3 parametreleri `config/settings.py` içinde merkezi olarak tanımlıdır (`TASK3_SIMILARITY_THRESHOLD`, `TASK3_FALLBACK_THRESHOLD`, `TASK3_FALLBACK_INTERVAL`). YAML dosyası yalnızca referans amaçlı tutulmaktadır.
+`config/task3_params.yaml` dosyası **opsiyonel** olarak yüklenir. Dosya mevcutsa, içindeki değerler `Settings` üzerine yazılır. YAML yoksa veya hata varsa `config/settings.py` sabitleri kullanılır.
 
-| Settings Parametresi | Değer | YAML Karşılığı |
-|---------------------|-------|----------------|
+| Settings Parametresi | Varsayılan | YAML Anahtarı |
+|---------------------|------------|---------------|
 | `TASK3_SIMILARITY_THRESHOLD` | `0.72` | `t_confirm` |
 | `TASK3_FALLBACK_THRESHOLD` | `0.66` | `t_fallback` |
 | `TASK3_FALLBACK_INTERVAL` | `5` | `n_fallback_interval` |
+| `TASK3_GRID_STRIDE` | `32` | `grid_stride` |
 
 ---
 
@@ -362,7 +374,7 @@ HavaciliktaYZ/
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py         # Merkezi yapılandırma (tüm görevler)
-│   └── task3_params.yaml   # (Deprecated) Görev 3 referans parametreleri
+│   └── task3_params.yaml   # Görev 3 parametreleri (opsiyonel override)
 │
 ├── src/
 │   ├── __init__.py
@@ -384,8 +396,8 @@ HavaciliktaYZ/
 │   ├── conftest.py         # ML mock'ları + 10s global timeout
 │   └── test_all.py         # 47 konsolide birim testi
 │
-├── models/
-│   └── yolov8m.pt          # YOLOv8 medium modeli (Git'e dahil değil)
+├── model/
+│   └── best_*.pt           # Eğitilmiş YOLOv8 modeli (Git'e dahil değil)
 │
 ├── datasets/
 │   └── task3_references/   # Görev 3 referans obje resimleri
@@ -410,15 +422,19 @@ Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirme
 | 3 | **Kararlı sıralama** | `detection.py` | NMS ve containment suppression'da `kind="stable"` |
 | 4 | **Float birikim sınırı** | `movement.py` | `_cam_total_x/y` ±1e6 ile sınırlandı |
 | 5 | **GPS simülasyonu** | `data_loader.py` | Deterministik döngü yerine %33 rastgele degradasyon |
-| 6 | **Homography koruması** | `image_matcher.py` | Dejenere/koliner nokta kontrolü |
-| 7 | **Config temizliği** | — | `task3_params.yaml` kullanımdan kaldırıldı (dead code) |
+| 6 | **Homography koruması** | `image_matcher.py` | Dejenere/koliner nokta kontrolü + fallback bounding rect |
+| 7 | **task3_params.yaml** | `config/settings.py` | YAML opsiyonel yükleme; mevcutsa Görev 3 parametrelerini override eder |
+| 8 | **Fallback pozisyon** | `main.py` | Görüntü indirilemezse son bilinen pozisyon (0,0,0 yerine) |
+| 9 | **Circuit breaker** | `resilience.py` | Oturum iptali yok; degrade modunda devam, ağ düzelince toparlanma |
 
 ### Testler
 
 ```bash
-# Tüm testleri çalıştır (47 test, ~6 saniye, 10s timeout)
+# Tüm testleri çalıştır (pytest-timeout 30s)
 python -m pytest tests/test_all.py -v
 ```
+
+Gereksinimler: `pytest`, `pytest-timeout`, `PyYAML` (`requirements.txt` içinde)
 
 ---
 

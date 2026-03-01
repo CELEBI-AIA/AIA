@@ -1,5 +1,4 @@
-# TEKNOFEST Havacılıkta Yapay Zeka - Runtime dependencies (pinned)
-# Audit 4.1 & 10.2: Pin exact pip index url for reproducible CUDA builds without relying on README
+# TEKNOFEST Havacılıkta Yapay Zeka - Runtime dependencies
 --extra-index-url https://download.pytorch.org/whl/cu121
 
 torch==2.2.2+cu121
@@ -9,3 +8,10 @@ opencv-python-headless==4.10.0.84
 numpy==1.26.4
 requests==2.32.3
 colorama==0.4.6
+
+# Test bağımlılıkları (geliştirme / CI)
+pytest>=7.0.0
+pytest-timeout>=2.0.0
+
+# task3_params.yaml yüklemesi için
+PyYAML>=6.0

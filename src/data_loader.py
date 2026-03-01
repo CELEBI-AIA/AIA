@@ -247,7 +247,7 @@ class DatasetLoader:
                     # İlk 1 dakika — kesinlikle sağlıklı
                     gps_health = 1
                 else:
-                    # 450+ frame: rastgele sağlıksız geçişler (audit §1.1)
+                    # 450+ kare: GPS simülasyonu (rastgele sağlıksız)
                     # %33 olasılıkla sağlıksız — şartname "geçebilir" der
                     gps_health = 0 if random.random() < 0.33 else 1
             else:

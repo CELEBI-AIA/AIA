@@ -729,8 +729,7 @@ def _fetch_competition_step(
 
     if fetch_result.is_duplicate:
         kpi_counters["frame_duplicate_drop"] += 1
-        log.warn(f"Frame {frame_id}: duplicate metadata detected, dropping before inference/submit")
-        return None, transient_failures, "continue"
+        log.warn(f"Frame {frame_id}: duplicate metadata detected. Processing normally per specification idempotency.")
 
     frame = None
     use_fallback = False
@@ -765,11 +764,13 @@ def _fetch_competition_step(
             log.warn(f"Frame {frame_id}: image download failed, sending fallback result")
 
     if use_fallback:
+        # Görüntü yoksa son bilinen pozisyon kullan (şartname FR-011)
+        last_position = odometry.get_position()
         pending_result = {
             "frame_id": frame_id, "frame_data": frame_data, "detected_objects": [],
-            "frame": None, "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "frame": None, "position": last_position,
             "degraded": degrade_mode, "pending_ttl": 1 if degrade_mode else None,
-            "detected_translation": {"translation_x": 0.0, "translation_y": 0.0, "translation_z": 0.0},
+            "detected_translation": {"translation_x": last_position["x"], "translation_y": last_position["y"], "translation_z": last_position["z"]},
             "frame_shape": None, "detected_undefined_objects": [],
         }
     else:

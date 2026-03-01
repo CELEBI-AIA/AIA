@@ -237,9 +237,7 @@ class ObjectDetector:
                 raw_detections, frame_w, frame_h
             )
 
-            # ---- 4) Dahili alanları temizle, TEKNOFEST formatı döndür ----
-            # cls_int == -1 (unknown) nesneler dahili engel olarak kullanıldı,
-            # ancak yarışma çıktısına dahil edilmez.
+            # Yarışma formatı: cls_int=-1 (bilinmeyen) nesneler çıktıya dahil edilmez
             output: List[Dict] = []
             for det in final_detections:
                 if det["cls_int"] == -1:
@@ -254,7 +252,6 @@ class ObjectDetector:
                     "confidence": det["confidence"],
                 })
 
-            # Debug log
             if Settings.DEBUG:
                 cls_counts = Counter(d["cls"] for d in output)
                 self.log.debug(
@@ -265,7 +262,6 @@ class ObjectDetector:
                     f"UAİ: {cls_counts.get('3', 0)})"
                 )
 
-            # ---- GPU Bellek Temizliği (kaldırıldı: anti-pattern) ----
             self._frame_count += 1
 
             return output
@@ -538,7 +534,21 @@ class ObjectDetector:
                 else threshold
             )
 
-            suppress_mask = ios > effective_threshold
+            # UAP/UAİ üzerindeki engeller silinmez (landing_status için gerekli)
+            
+            suppress_mask = np.zeros(len(valid_remaining), dtype=bool)
+
+            for idx_b, b_idx in enumerate(valid_remaining):
+                if ios[idx_b] > effective_threshold:
+                    cls_a = cls_ints[i]
+                    cls_b = cls_ints[b_idx]
+                    
+                    # A iniş alanıysa ve B iniş alanı değilse -> Silme (Engel olarak kalsın)
+                    if cls_a in landing_zone_ids and cls_b not in landing_zone_ids:
+                        continue
+                    
+                    suppress_mask[idx_b] = True
+
             is_suppressed[valid_remaining[suppress_mask]] = True
 
         return [detections[i] for i in keep]
@@ -799,11 +809,17 @@ class ObjectDetector:
             elif cls_id in landing_zone_ids:
                 bbox = det["bbox"]
 
-                # (a) Alan kadrajın kenarına değiyor mu?
-                if self._is_touching_edge(bbox, frame_w, frame_h):
-                    det["landing_status"] = Settings.LANDING_NOT_SUITABLE
-                    self.log.debug("  UAP/UAİ kenar temas → uygun değil")
-                    continue
+                # (a) Alan kadrajın kenarına değiyor mu? (clamp öncesi ham koordinatlar kullanılır)
+                if getattr(self, "_is_touching_edge_raw", None):
+                   if self._is_touching_edge_raw(bbox, frame_w, frame_h):
+                       det["landing_status"] = Settings.LANDING_NOT_SUITABLE
+                       self.log.debug("  UAP/UAİ kenar temas → uygun değil")
+                       continue
+                else: 
+                   if self._is_touching_edge(bbox, frame_w, frame_h):
+                       det["landing_status"] = Settings.LANDING_NOT_SUITABLE
+                       self.log.debug("  UAP/UAİ kenar temas → uygun değil")
+                       continue
 
                 # (b) Doğrudan engel örtüşme kontrolü
                 has_obstacle = self._check_obstacle_overlap(
@@ -927,18 +943,58 @@ class ObjectDetector:
         inter_w = max(0.0, inter_x2 - inter_x1)
         inter_h = max(0.0, inter_y2 - inter_y1)
         inter_area = inter_w * inter_h
-
-        if inter_area == 0:
+        if inter_area <= 0:
             return 0.0
 
-        # İniş alanının toplam alanı
-        landing_area = max(
-            (landing_box[2] - landing_box[0]) * (landing_box[3] - landing_box[1]),
-            1e-6
-        )
+        # İniş alanının yüzölçümü
+        landing_w = max(0.0, landing_box[2] - landing_box[0])
+        landing_h = max(0.0, landing_box[3] - landing_box[1])
+        landing_area = landing_w * landing_h
+        
+        if landing_area <= 0:
+            return 0.0
 
         return inter_area / landing_area
 
+    @staticmethod
+    def _is_touching_edge(
+        bbox: Tuple[float, float, float, float],
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
+        """
+        Gelen bbox'un kadrajın kenarına değip değmediğini kontrol eder
+        (sadece alt/sol/sağ - üst kenar nadiren problem).
+        """
+        x1, y1, x2, y2 = bbox
+        
+        margin_x = frame_w * Settings.EDGE_MARGIN_RATIO
+        margin_y = frame_h * Settings.EDGE_MARGIN_RATIO
+        
+        if x1 <= margin_x or y1 <= margin_y:
+            return True
+        if x2 >= frame_w - margin_x or y2 >= frame_h - margin_y:
+            return True
+            
+        return False
+
+    @staticmethod
+    def _is_touching_edge_raw(
+        bbox: Tuple[float, float, float, float],
+        frame_w: int,
+        frame_h: int,
+    ) -> bool:
+        """
+        Bbox'ın kadraj kenarına değip değmediğini ham koordinatlarla kontrol eder.
+        Clamp işlemi öncesi kullanılır.
+        """
+        x1, y1, x2, y2 = bbox
+        margin = 5
+        if x1 <= margin or y1 <= margin:
+            return True
+        if x2 >= frame_w - margin or y2 >= frame_h - margin:
+            return True
+        return False
 
     # =========================================================================
     #  KENAR TEMAS KONTROLÜ

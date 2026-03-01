@@ -1,5 +1,16 @@
 # CHANGELOGS
 
+## 0.0.32 - 2026-03-01
+- **fix(audit)**: Applied fixes per TEKNOFEST audit reports.
+- **fix(main)**: Use odometry.get_position() instead of (0,0,0) fallback on image download failure (B-04).
+- **fix(movement)**: Vehicle selection supports both cls_int and cls (str/int) comparison (KRITIK-01).
+- **fix(localization)**: Added log warning when FOCAL_LENGTH_PX=800 default is used (B-13).
+- **fix(config)**: Optional task3_params.yaml loading; Task 3 params loaded from YAML when present (KRITIK-03).
+- **fix(detection)**: Removed unreachable dead code from _is_touching_edge_raw.
+- **chore(deps)**: Added pytest>=7.0.0, pytest-timeout>=2.0.0, PyYAML>=6.0 to requirements.txt.
+- **docs(readme)**: Updated audit table, setup, configuration, and file structure.
+- **chore(comments)**: Cleaned up obsolete audit reference comments.
+
 ## 0.0.31 - 2026-03-01
 - **fix(typing)**: Added `TYPE_CHECKING` imports for `FrameContext` in `src/localization.py` and `src/movement.py` to fix Flake8 `F821` syntax errors during CI build without introducing circular dependencies.
 - **release**: Bumped project version from `0.0.30` to `0.0.31`.

@@ -100,6 +100,9 @@ class VisualOdometry:
         )
 
         self.log.info("Visual Odometry başlatıldı — Başlangıç: (0, 0, 0)")
+        # Varsayılan odak uzunluğu — kamera parametreleri yayımlandığında config güncellenmeli
+        if Settings.FOCAL_LENGTH_PX == 800.0:
+            self.log.warn("FOCAL_LENGTH_PX=800 (varsayılan) kullanılıyor. TBD-010 kamera parametreleri yayımlandığında config/settings.py güncellenmeli.")
 
     # =========================================================================
     #  ANA GÜNCELLEME FONKSİYONU
@@ -153,14 +156,20 @@ class VisualOdometry:
                     self._prev_gray if self._prev_gray is not None else gray
                 )
                 self._was_gps_healthy = False
-                self.log.info("GPS → Optik Akış geçişi — referans kare oluşturuldu")
+                
+                # GPS→OF geçişinde EMA sıfırla (sürüklenme önleme)
+                self._ema_dx = 0.0
+                self._ema_dy = 0.0
+                
+                self.log.info("GPS → Optik Akış geçişi — referans kare oluşturuldu, EMA resetlendi.")
 
             if self._prev_gray is not None and self._prev_points is not None:
                 self._update_from_optical_flow(gray, server_data)
             else:
+                # GPS=0 ilk kare: referans henüz yok, pozisyon korunur
                 self.log.warn(
-                    "GPS yok ve referans kare henüz oluşmadı — "
-                    "pozisyon güncellenemiyor"
+                    "GPS mevcut değil ve henüz referans kare oluşmadı — "
+                    "GPS yok, referans kare henüz oluşmadı — pozisyon (0,0,0) korunuyor."
                 )
                 self._update_reference_frame(gray)
 
@@ -231,9 +240,6 @@ class VisualOdometry:
             self.log.warn("Yetersiz köşe noktası — yeniden tespit ediliyor")
             return
 
-        if self._prev_points is None:
-            self._update_reference_frame(gray)
-            return
 
         # ------ 1) Lucas-Kanade ile noktaları takip et ------
         next_points, status, err = cv2.calcOpticalFlowPyrLK(
@@ -263,6 +269,20 @@ class VisualOdometry:
         dx_pixels = float(np.median(good_new[:, 0] - good_old[:, 0]))
         dy_pixels = float(np.median(good_new[:, 1] - good_old[:, 1]))
 
+        # Z ekseni: görüntü alanı büyümesinden scale tahmini
+        scale_ratio = 1.0
+        if len(good_new) >= 3:
+            good_old_pts = good_old[:, np.newaxis, :]
+            good_new_pts = good_new[:, np.newaxis, :]
+            dist_old = np.sqrt(np.sum((good_old_pts - good_old[np.newaxis, :, :]) ** 2, axis=-1))
+            dist_new = np.sqrt(np.sum((good_new_pts - good_new[np.newaxis, :, :]) ** 2, axis=-1))
+            iu = np.triu_indices(len(good_old), k=1)
+            old_vals = dist_old[iu]
+            new_vals = dist_new[iu]
+            valid = old_vals > 5.0
+            if np.any(valid):
+                scale_ratio = float(np.median(new_vals[valid] / old_vals[valid]))
+
         # ------ 4) Piksel → Metre dönüşümü ------
         # Son bilinen GPS irtifasını kullan (sabit 50m yerine)
         raw_alt = server_data.get("translation_z", None)
@@ -288,13 +308,21 @@ class VisualOdometry:
         smooth_dx = max(-cap, min(cap, self._ema_dx))
         smooth_dy = max(-cap, min(cap, self._ema_dy))
 
+        # Z Ekseni Hareketi Hesaplama (Pinhole Kamera İrtifa = 1 / Ölçek)
+        dz_meters = 0.0
+        if 0.5 < scale_ratio < 2.0 and scale_ratio != 1.0:
+            dz_meters = self.position["z"] * ((1.0 / scale_ratio) - 1.0)
+            
+        smooth_dz = max(-cap, min(cap, dz_meters * alpha))
+
         # ------ 7) Pozisyonu güncelle ------
         self.position["x"] += smooth_dx
         self.position["y"] += smooth_dy
+        self.position["z"] += smooth_dz
 
         self.log.debug(
-            f"Optik Akış → dX:{dx_meters:.3f}m dY:{dy_meters:.3f}m | "
-            f"Piksel: ({dx_pixels:.1f}, {dy_pixels:.1f}) | "
+            f"Optik Akış → dX:{dx_meters:.3f}m dY:{dy_meters:.3f}m dZ:{dz_meters:.3f}m | "
+            f"Piksel: ({dx_pixels:.1f}, {dy_pixels:.1f}) | Scale: {scale_ratio:.3f} | "
             f"İrtifa: {altitude:.1f}m | "
             f"Takip: {len(good_new)}/{len(self._prev_points)} nokta"
         )

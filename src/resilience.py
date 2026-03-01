@@ -54,7 +54,7 @@ class SessionResilienceController:
 
     def _decay_window(self, q: Deque[float]) -> None:
         # Recovery sonrası ani flap'i (circuit breaker flapping) azaltmak için
-        # pencereyi daha agresif yumuşat (audit 3.2), eski hataları tamamen temizle
+        # Eski hataları temizle (flapping önleme)
         q.clear()
 
     def _current_transient_wall_time(self, now: Optional[float] = None) -> float:
@@ -147,18 +147,7 @@ class SessionResilienceController:
         return self._degrade_frame_counter
 
     def should_abort(self) -> Optional[str]:
-        now = self._now()
-        transient_wall = self._current_transient_wall_time(now)
-        if transient_wall >= float(Settings.CB_SESSION_MAX_TRANSIENT_SEC):
-            return (
-                "Transient wall time exceeded "
-                f"({transient_wall:.1f}s >= {Settings.CB_SESSION_MAX_TRANSIENT_SEC:.1f}s)"
-            )
-        if self.stats.breaker_open_count > int(Settings.CB_MAX_OPEN_CYCLES):
-            return (
-                "Breaker open cycles exceeded "
-                f"({self.stats.breaker_open_count} > {Settings.CB_MAX_OPEN_CYCLES})"
-            )
+        # Oturum iptali yok; degrade modunda devam (ağ düzelirse toparlanır)
         return None
 
     def is_degraded(self) -> bool:

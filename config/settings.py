@@ -16,7 +16,6 @@ import os
 # =============================================================================
 #  PROJE KÖK DİZİNİ
 # =============================================================================
-# Bu dosyanın iki üst dizini = proje kökü (HavaciliktaYZ/)
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
 
@@ -54,13 +53,11 @@ class Settings:
     # Custom trained model (YOLOv11m finetuned on UAI, UAP, car, human)
     MODEL_PATH: str = os.path.join(str(PROJECT_ROOT), "model", "best_mAP50-0.923_mAP50-95-0.766.pt")
 
-    # Tespit Güven Eşiği (0.0 - 1.0)
-    # 0.40 = Increased confidence threshold to prevent false positives like poles detected as humans or random background objects as vehicles
+    # Tespit güven eşiği (0.0–1.0)
     CONFIDENCE_THRESHOLD: float = 0.40
 
-    # NMS IoU Eşiği (Non-Maximum Suppression)
-    # 0.25 = Very aggressive suppression to merge multi-part human/vehicle detections (e.g. legs + torso, or hood + bumper)
-    NMS_IOU_THRESHOLD: float = 0.25
+    # NMS IoU — çift kutuları bastırmak için
+    NMS_IOU_THRESHOLD: float = 0.15
 
     # Cihaz Seçimi (cuda: GPU, cpu: İşlemci)
     DEVICE: str = "cuda"
@@ -68,9 +65,7 @@ class Settings:
     # FP16 Yarı Hassasiyet — RTX 3060'ta ~%40 hız artışı sağlar
     HALF_PRECISION: bool = True
 
-    # Inference Çözünürlüğü (piksel)
-    # 1280 = drone görüntüleri için en iyi (uzaktaki insanlar/araçlar)
-    # Yarışma offline — gerçek zamanlı hız kısıtı yok, kalite öncelikli
+    # Inference çözünürlüğü (piksel)
     INFERENCE_SIZE: int = 1280
 
     # Sınıflar arası NMS — aynı bölgede farklı sınıf çakışmalarını da bastırır
@@ -89,12 +84,10 @@ class Settings:
     CLAHE_CLIP_LIMIT: float = 2.0
     CLAHE_TILE_SIZE: int = 8
 
-    # Minimum bbox boyutu (piksel) — altındakiler false positive sayılır
-    # Increased to 20px to effectively filter out tiny noise (like individual legs/feet or small poles)
+    # Minimum bbox boyutu (piksel)
     MIN_BBOX_SIZE: int = 20
 
-    # Maksimum bbox boyutu (piksel) — şartname büyük nesneleri de tespit etmeyi zorunlu kılıyor
-    # (otobüs, tren, gemi vb.) Bu nedenle pratikte devre dışı bırakıldı.
+    # Maksimum bbox boyutu (piksel)
     MAX_BBOX_SIZE: int = 9999
 
     # =========================================================================
@@ -105,7 +98,8 @@ class Settings:
     SAHI_ENABLED: bool = True
     SAHI_SLICE_SIZE: int = 640       # Her parçanın boyutu (piksel)
     SAHI_OVERLAP_RATIO: float = 0.35 # Parçalar arası örtüşme (%35) - Kenarları yakalar
-    SAHI_MERGE_IOU: float = 0.25     # Birleştirme NMS IoU eşiği (Çift tespitleri önler)
+    # Çift tespitleri bastırmak için
+    SAHI_MERGE_IOU: float = 0.15
 
     # Model ısınma tekrar sayısı (ilk kare gecikmesini önler)
     WARMUP_ITERATIONS: int = 3
@@ -115,10 +109,10 @@ class Settings:
     # =========================================================================
     TASK3_ENABLED: bool = True
     TASK3_REFERENCE_DIR: str = str(PROJECT_ROOT / "datasets" / "task3_references")
-    TASK3_SIMILARITY_THRESHOLD: float = 0.72    # task3_params.yaml: t_confirm
-    TASK3_FALLBACK_THRESHOLD: float = 0.66      # task3_params.yaml: t_fallback
-    TASK3_FALLBACK_INTERVAL: int = 5            # Her N karede fallback sweep
-    TASK3_GRID_STRIDE: int = 32                 # Sliding window adımı (piksel)
+    TASK3_SIMILARITY_THRESHOLD: float = 0.72    
+    TASK3_FALLBACK_THRESHOLD: float = 0.66      
+    TASK3_FALLBACK_INTERVAL: int = 5            
+    TASK3_GRID_STRIDE: int = 32                 
     TASK3_MAX_REFERENCES: int = 10              # Oturum başına maks referans obje
     TASK3_FEATURE_METHOD: str = "ORB"           # "ORB" veya "SIFT"
 
@@ -356,3 +350,26 @@ class Settings:
         "2": 10,
         "3": 10,
     }
+
+
+# =============================================================================
+#  TASK3_PARAMS.YAML OPSİYONEL YÜKLEMESİ
+# =============================================================================
+# task3_params.yaml varsa Görev 3 parametrelerini yükle.
+_TASK3_YAML_PATH: Path = Path(__file__).resolve().parent / "task3_params.yaml"
+if _TASK3_YAML_PATH.is_file():
+    try:
+        import yaml
+        with open(_TASK3_YAML_PATH, encoding="utf-8") as f:
+            _task3_override = yaml.safe_load(f)
+        if isinstance(_task3_override, dict):
+            if "t_confirm" in _task3_override:
+                Settings.TASK3_SIMILARITY_THRESHOLD = float(_task3_override["t_confirm"])
+            if "t_fallback" in _task3_override:
+                Settings.TASK3_FALLBACK_THRESHOLD = float(_task3_override["t_fallback"])
+            if "n_fallback_interval" in _task3_override:
+                Settings.TASK3_FALLBACK_INTERVAL = int(_task3_override["n_fallback_interval"])
+            if "grid_stride" in _task3_override:
+                Settings.TASK3_GRID_STRIDE = int(_task3_override["grid_stride"])
+    except (ImportError, OSError, ValueError, TypeError):
+        pass
