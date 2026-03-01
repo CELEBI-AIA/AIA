@@ -254,8 +254,11 @@ class VisualOdometry:
         raw_alt = server_data.get("translation_z", None)
         try:
             altitude = float(raw_alt)
+            if np.isnan(altitude):
+                altitude = 0.0
         except (TypeError, ValueError):
             altitude = 0.0
+
         if altitude <= 0:
             altitude = self._last_gps_altitude
 
