@@ -170,9 +170,9 @@ class Settings:
     MOTION_COMP_WIN_SIZE: int = 21
 
     # GPS=0 latency compensation (feature flag)
-    LATENCY_COMP_ENABLED: bool = False
+    LATENCY_COMP_ENABLED: bool = True
     LATENCY_COMP_MAX_MS: float = 120.0
-    LATENCY_COMP_MAX_DELTA_M: float = 2.0
+    LATENCY_COMP_MAX_DELTA_M: float = 0.3
     LATENCY_COMP_EMA_ALPHA: float = 0.35
 
     # Yarışma limitleri
