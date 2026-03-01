@@ -263,6 +263,82 @@ def _print_simulation_result(
     )
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_gps_health(frame_data: Dict[str, Any]) -> int:
+    try:
+        return int(float(frame_data.get("gps_health", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_latency_compensation_if_needed(
+    log: Logger,
+    odometry: VisualOdometry,
+    pending_result: Dict[str, Any],
+    kpi_counters: Dict[str, Any],
+) -> tuple[Dict[str, float], Dict[str, float]]:
+    base_translation = dict(pending_result["detected_translation"])
+    base_position = dict(pending_result.get("position", {}))
+
+    if not Settings.LATENCY_COMP_ENABLED:
+        return base_translation, base_position
+
+    frame_data = pending_result.get("frame_data") or {}
+    if _safe_gps_health(frame_data) != 0:
+        return base_translation, base_position
+
+    frame_fetch_monotonic = pending_result.get("frame_fetch_monotonic")
+    if frame_fetch_monotonic is None:
+        return base_translation, base_position
+
+    dt_sec = max(0.0, time.monotonic() - _safe_float(frame_fetch_monotonic))
+    max_dt_sec = max(0.0, _safe_float(Settings.LATENCY_COMP_MAX_MS)) / 1000.0
+    max_delta_m = max(0.0, _safe_float(Settings.LATENCY_COMP_MAX_DELTA_M))
+
+    projection_base = dict(pending_result.get("base_position", base_position))
+    projected_position, applied_delta_m, used_dt_sec = odometry.project_position_with_latency(
+        position=projection_base,
+        dt_sec=dt_sec,
+        max_dt_sec=max_dt_sec,
+        max_delta_m=max_delta_m,
+    )
+
+    if applied_delta_m <= 0.0:
+        return base_translation, base_position
+
+    kpi_counters["compensation_apply_count"] = int(kpi_counters.get("compensation_apply_count", 0)) + 1
+    kpi_counters["compensation_sum_delta_m"] = _safe_float(
+        kpi_counters.get("compensation_sum_delta_m", 0.0)
+    ) + applied_delta_m
+    apply_count = max(1, int(kpi_counters["compensation_apply_count"]))
+    kpi_counters["compensation_avg_delta_m"] = (
+        _safe_float(kpi_counters["compensation_sum_delta_m"]) / apply_count
+    )
+    kpi_counters["compensation_max_delta_m"] = max(
+        _safe_float(kpi_counters.get("compensation_max_delta_m", 0.0)),
+        applied_delta_m,
+    )
+
+    frame_id = pending_result.get("frame_id", "unknown")
+    log.debug(
+        f"Frame {frame_id}: latency compensation applied "
+        f"(dt={dt_sec * 1000.0:.1f}ms, used={used_dt_sec * 1000.0:.1f}ms, delta={applied_delta_m:.3f}m)"
+    )
+
+    compensated_translation = {
+        "translation_x": projected_position["x"],
+        "translation_y": projected_position["y"],
+        "translation_z": projected_position["z"],
+    }
+    return compensated_translation, projected_position
+
+
 def run_competition(log: Logger) -> None:
     from src.network import NetworkManager
 
@@ -347,6 +423,10 @@ def run_competition(log: Logger) -> None:
         "timeout_image": 0,
         "timeout_submit": 0,
         "consecutive_duplicate_abort": 0,
+        "compensation_apply_count": 0,
+        "compensation_sum_delta_m": 0.0,
+        "compensation_avg_delta_m": 0.0,
+        "compensation_max_delta_m": 0.0,
     }
     pending_result: Optional[Dict] = None
 
@@ -382,7 +462,7 @@ def run_competition(log: Logger) -> None:
                 if pending_result is not None and submit_future is None:
                     submit_future = executor.submit(
                         _submit_competition_step,
-                        log, network, resilience, kpi_counters, pending_result,
+                        log, network, resilience, odometry, kpi_counters, pending_result,
                         ack_failures, ack_failure_budget,
                         consecutive_permanent_rejects, PERMANENT_REJECT_ABORT_THRESHOLD,
                     )
@@ -406,10 +486,7 @@ def run_competition(log: Logger) -> None:
                         continue
                     _, success_info = action_result
 
-                    try:
-                        gps_health = int(float(success_info["frame_data"].get("gps_health", 0)))
-                    except (TypeError, ValueError):
-                        gps_health = 0
+                    gps_health = _safe_gps_health(success_info["frame_data"])
 
                     if gps_health == 1:
                         kpi_counters["mode_gps"] += 1
@@ -578,6 +655,12 @@ def _print_summary(
             f"{kpi_counters.get('timeout_fetch', 0)}/"
             f"{kpi_counters.get('timeout_image', 0)}/"
             f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+        log.info(
+            "KPI Compensation: "
+            f"Apply Count={kpi_counters.get('compensation_apply_count', 0)} | "
+            f"Avg Delta={_safe_float(kpi_counters.get('compensation_avg_delta_m', 0.0)):.3f}m | "
+            f"Max Delta={_safe_float(kpi_counters.get('compensation_max_delta_m', 0.0)):.3f}m"
         )
         log.info(
             f"Payload Size   : Max {val_str(kpi_counters.get('max_payload_bytes'))} bytes "
@@ -803,6 +886,7 @@ def _fetch_competition_step(
     transient_failures = 0
     degrade_mode = Settings.DEGRADE_FETCH_ONLY_ENABLED and resilience.is_degraded()
     frame_id = frame_data.get("frame_id", "unknown")
+    frame_fetch_monotonic = time.monotonic()
 
     if fetch_result.is_duplicate:
         kpi_counters["frame_duplicate_drop"] += 1
@@ -855,6 +939,8 @@ def _fetch_competition_step(
                 "translation_y": last_position["y"],
                 "translation_z": last_position["z"],
             },
+            "base_position": dict(last_position),
+            "frame_fetch_monotonic": frame_fetch_monotonic,
             "frame_shape": None, "detected_undefined_objects": [],
             "is_duplicate": fetch_result.is_duplicate,
         }
@@ -875,6 +961,8 @@ def _fetch_competition_step(
                 "translation_y": position["y"],
                 "translation_z": position["z"],
             },
+            "base_position": dict(position),
+            "frame_fetch_monotonic": frame_fetch_monotonic,
             "frame_shape": frame.shape, "detected_undefined_objects": undefined_objects,
             "is_duplicate": fetch_result.is_duplicate,
         }
@@ -883,7 +971,7 @@ def _fetch_competition_step(
 
 
 def _submit_competition_step(
-    log: Logger, network: Any, resilience: Any, kpi_counters: dict, pending_result: dict,
+    log: Logger, network: Any, resilience: Any, odometry: VisualOdometry, kpi_counters: dict, pending_result: dict,
     ack_failures: int, ack_failure_budget: int,
     consecutive_permanent_rejects: int, permanent_reject_abort_threshold: int,
 ):
@@ -891,9 +979,15 @@ def _submit_competition_step(
     frame_id = pending_result["frame_id"]
     frame_data = pending_result["frame_data"]
     detected_objects = pending_result["detected_objects"]
+    detected_translation, position_for_success = _apply_latency_compensation_if_needed(
+        log=log,
+        odometry=odometry,
+        pending_result=pending_result,
+        kpi_counters=kpi_counters,
+    )
 
     send_status = network.send_result(
-        frame_id, detected_objects, pending_result["detected_translation"],
+        frame_id, detected_objects, detected_translation,
         frame_data=frame_data, frame_shape=pending_result["frame_shape"],
         degrade=bool(pending_result.get("degraded", False)),
         detected_undefined_objects=pending_result.get("detected_undefined_objects"),
@@ -929,6 +1023,7 @@ def _submit_competition_step(
         ack_failures = 0
         consecutive_permanent_rejects = 0
         resilience.on_success_cycle()
+        pending_result_snapshot["position"] = position_for_success
         success_info = {
             "frame_for_debug": pending_result_snapshot.get("frame"),
             "detected_objects": detected_objects,
