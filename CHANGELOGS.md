@@ -1,5 +1,10 @@
 # CHANGELOGS
 
+## 0.0.31 - 2026-03-01
+- **fix(typing)**: Added `TYPE_CHECKING` imports for `FrameContext` in `src/localization.py` and `src/movement.py` to fix Flake8 `F821` syntax errors during CI build without introducing circular dependencies.
+- **release**: Bumped project version from `0.0.30` to `0.0.31`.
+
+
 ## 0.0.30 - 2026-03-01
 - **fix(tests)**: Updated `MovementEstimator.annotate` mock and test calls to use `frame_ctx` instead of `frame`.
 - **fix(tests)**: Updated `TestRiderSuppression` overlapping coordinates to correctly test the new comprehensive vehicle suppression logic.

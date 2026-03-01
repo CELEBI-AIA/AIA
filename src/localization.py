@@ -18,7 +18,10 @@ Kullanım:
     position = vo.update(frame, server_data)
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.frame_context import FrameContext
 
 import cv2
 import numpy as np

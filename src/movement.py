@@ -4,7 +4,10 @@ Taşıt hareketlilik (movement_status) kestirimi için hafif takip modülü.
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.frame_context import FrameContext
 
 import cv2
 import numpy as np
