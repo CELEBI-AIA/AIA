@@ -664,6 +664,18 @@ def parse_args() -> argparse.Namespace:
         default="balanced",
         help="Runtime determinism profile",
     )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Competition server base URL override (or use AIA_BASE_URL env var)",
+    )
+    parser.add_argument(
+        "--team-name",
+        type=str,
+        default=None,
+        help="Team name override for outbound payloads (or use AIA_TEAM_NAME env var)",
+    )
     parser.add_argument("--show", action="store_true", help="Show simulation window")
     parser.add_argument("--save", action="store_true", help="Save simulation images")
     parser.add_argument("--seed", type=int, default=None, help="Deterministik simülasyon için rastgele seed")
@@ -671,9 +683,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_runtime_overrides(args: argparse.Namespace, log: Logger) -> None:
+    base_url_cli = (args.base_url or "").strip()
+    base_url_env = (os.getenv("AIA_BASE_URL", "") or "").strip()
+    team_name_cli = (args.team_name or "").strip()
+    team_name_env = (os.getenv("AIA_TEAM_NAME", "") or "").strip()
+
+    base_url_override = base_url_cli or base_url_env
+    team_name_override = team_name_cli or team_name_env
+
+    if base_url_override:
+        Settings.BASE_URL = base_url_override.rstrip("/")
+        src = "CLI --base-url" if base_url_cli else "ENV AIA_BASE_URL"
+        log.info(f"Runtime override: BASE_URL <- {Settings.BASE_URL} ({src})")
+
+    if team_name_override:
+        Settings.TEAM_NAME = team_name_override
+        src = "CLI --team-name" if team_name_cli else "ENV AIA_TEAM_NAME"
+        log.info(f"Runtime override: TEAM_NAME <- {Settings.TEAM_NAME} ({src})")
+
+
 def main() -> None:
     log = Logger("Main")
     args = parse_args()
+    apply_runtime_overrides(args, log)
 
     requested_profile = args.deterministic_profile
     effective_profile = requested_profile

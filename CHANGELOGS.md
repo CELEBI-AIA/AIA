@@ -209,3 +209,9 @@
 - Updated `README.md` terminology from "Deterministiklik" to "Tutarlılık ve Tekrarlanabilirlik (Best-Effort)".
 - Softened wording from strict/guarantee language to variance-reduction guidance (best-effort consistency framing).
 - Revised profile guidance text to present `max` as a stability-oriented recommendation instead of a hard requirement.
+
+## 0.0.20 - 2026-03-02
+- Added runtime environment switching overrides in `main.py` to reduce competition-day config risk without code edits.
+- Added `--base-url` and `--team-name` CLI flags.
+- Added `AIA_BASE_URL` and `AIA_TEAM_NAME` environment variable support (CLI takes precedence).
+- Runtime now logs active override source for traceability.
