@@ -41,13 +41,16 @@ class MovementEstimator:
         self._is_frozen_frame: bool = False
         self._frame_diff: float = float("inf")
 
-    def annotate(self, detections: List[Dict], frame: Optional[np.ndarray] = None) -> List[Dict]:
-        if frame is not None:
-            self._frame_width = frame.shape[1]
+    def annotate(self, detections: List[Dict], frame_ctx: Optional["FrameContext"] = None) -> List[Dict]:
+        if frame_ctx is not None:
+            if isinstance(frame_ctx, np.ndarray):
+                self._frame_width = frame_ctx.shape[1]
+            else:
+                self._frame_width = frame_ctx.frame.shape[1]
 
         cam_dx = cam_dy = 0.0
-        if Settings.MOTION_COMP_ENABLED and frame is not None:
-            cam_dx, cam_dy = self._estimate_camera_shift(frame)
+        if Settings.MOTION_COMP_ENABLED and frame_ctx is not None:
+            cam_dx, cam_dy = self._estimate_camera_shift(frame_ctx)
         self._cam_shift_hist.append((cam_dx, cam_dy))
         self._cam_total_x += cam_dx
         self._cam_total_y += cam_dy
@@ -162,7 +165,9 @@ class MovementEstimator:
 
     def _age_tracks(self, matched_track_ids: set) -> None:
         to_delete: List[int] = []
-        for track_id, track in list(self._tracks.items()):
+        # Audit 2.2 fix: strictly iterate over a static list of keys
+        for track_id in list(self._tracks.keys()):
+            track = self._tracks[track_id]
             if track_id not in matched_track_ids:
                 track.missed += 1
                 if track.missed > Settings.MOVEMENT_MAX_MISSED_FRAMES:
@@ -187,12 +192,15 @@ class MovementEstimator:
             (float(det.get("top_left_y", 0)) + float(det.get("bottom_right_y", 0))) / 2.0,
         )
 
-    def _estimate_camera_shift(self, frame: np.ndarray) -> Tuple[float, float]:
+    def _estimate_camera_shift(self, frame_ctx: "FrameContext") -> Tuple[float, float]:
         """
         Frame-to-frame global kamera kaymasını medyan optik akış ile tahmin eder.
         Ayrıca piksel-bazlı frame farkını hesaplar (frozen frame tespiti için).
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if isinstance(frame_ctx, np.ndarray):
+            gray = cv2.cvtColor(frame_ctx, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame_ctx.gray
         if self._prev_gray is None:
             self._prev_gray = gray
             self._prev_points = cv2.goodFeaturesToTrack(
@@ -223,6 +231,9 @@ class MovementEstimator:
                     minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
                 )
                 return 0.0, 0.0
+
+        if self._prev_points is None:
+            return 0.0, 0.0
 
         win = Settings.MOTION_COMP_WIN_SIZE
         next_pts, status, _ = cv2.calcOpticalFlowPyrLK(

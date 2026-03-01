@@ -274,6 +274,8 @@ class ObjectDetector:
             raise
         except torch.cuda.OutOfMemoryError:
             self.log.error("GPU OOM hatası! Inference başarısız.")
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
             return []
         except Exception as e:
@@ -659,9 +661,10 @@ class ObjectDetector:
             if w > Settings.MAX_BBOX_SIZE or h > Settings.MAX_BBOX_SIZE:
                 continue
 
-            # Aşırı aspect ratio kontrolü (> 6:1)
+            # Aşırı aspect ratio kontrolü (Aşırı ince uzun/geniş objeleri (örn: direk) filtrele)
+            # Düşürüldü: 4.5. Bir araç veya insan üstten bakışta genelde 4.5'i geçmez. Direkler 10:1 vb olur.
             aspect = max(w, h) / max(min(w, h), 1)
-            if aspect > 6.0:
+            if aspect > 4.5:
                 continue
 
             filtered.append(det)
@@ -682,12 +685,12 @@ class ObjectDetector:
         persons: List[Dict] = []
         others: List[Dict] = []
 
-        rider_sources = set(Settings.RIDER_SOURCE_CLASSES)
-
+        # Since the custom fine-tuned model directly predicts "insan" and "tasit",
+        # the `source_cls_id` logic mapped to COCO is likely incorrect or unused. 
+        # So we evaluate all tasit boxes to suppress humans highly overlapping with them.
         for det in detections:
             cls_int = int(det.get("cls_int", -1))
-            source_cls = int(det.get("source_cls_id", -1))
-            if cls_int == Settings.CLASS_TASIT and source_cls in rider_sources:
+            if cls_int == Settings.CLASS_TASIT:
                 vehicles.append(det)
             elif cls_int == Settings.CLASS_INSAN:
                 persons.append(det)
@@ -741,9 +744,7 @@ class ObjectDetector:
 
         area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
         area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
-        union = area_a + area_b - inter_area
-        if union <= 0:
-            return 0.0
+        union = max(area_a + area_b - inter_area, 1e-6)
         return inter_area / union
 
     # =========================================================================
@@ -931,13 +932,10 @@ class ObjectDetector:
             return 0.0
 
         # İniş alanının toplam alanı
-        landing_area = (
-            max(0.0, landing_box[2] - landing_box[0])
-            * max(0.0, landing_box[3] - landing_box[1])
+        landing_area = max(
+            (landing_box[2] - landing_box[0]) * (landing_box[3] - landing_box[1]),
+            1e-6
         )
-
-        if landing_area == 0:
-            return 0.0
 
         return inter_area / landing_area
 

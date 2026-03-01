@@ -1,5 +1,13 @@
 # CHANGELOGS
 
+## 0.0.30 - 2026-03-01
+- **fix(tests)**: Updated `MovementEstimator.annotate` mock and test calls to use `frame_ctx` instead of `frame`.
+- **fix(tests)**: Updated `TestRiderSuppression` overlapping coordinates to correctly test the new comprehensive vehicle suppression logic.
+- **fix(main)**: Fixed `NameError` crash in competition loop exception handling by explicitly capturing `pending_result_snapshot`.
+- **fix(main)**: Prevented `run_competition` from indefinitely swallowing exceptions and hanging when running under `pytest`.
+- **chore(tests)**: Deleted duplicate and obsolete mock-based test runner (`run_mocked_tests.py`) in favor of centralized robust `pytest` suite.
+- **release**: Bumped project version from `0.0.29` to `0.0.30`.
+
 ## 0.0.29 - 2026-03-01
 - **fix(movement)**: Hardened `_age_tracks` dict iteration with `list()` wrapper to prevent `RuntimeError` on future mutation (§2.2).
 - **fix(movement)**: Added explicit `None` guard after `goodFeaturesToTrack` fallback in `_estimate_camera_shift` to prevent `TypeError` crash (§2.3).

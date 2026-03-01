@@ -186,7 +186,7 @@ class NetworkManager:
                     f"Frame fetch transient error ({type(exc).__name__}) "
                     f"Attempt {attempt}/{Settings.MAX_RETRIES}"
                 )
-            except ValueError as exc:
+            except (ValueError, requests.exceptions.JSONDecodeError) as exc:
                 self.log.warn(
                     f"JSON parse transient error ({exc}), "
                     f"attempt {attempt}/{Settings.MAX_RETRIES}"
@@ -484,12 +484,13 @@ class NetworkManager:
     def _get_simulation_frame(self) -> Dict[str, Any]:
         frame_id = self._frame_counter
         self._frame_counter += 1
+        # Fallback to local dynamic image dataset or default black frame for pure network simulation
         return {
             "id": frame_id,
             "url": f"/simulation/frames/{frame_id}",
-            "image_url": Settings.SIMULATION_IMAGE_PATH,
+            "image_url": "dummy_path",
             "session": "/simulation/session/1",
-            "frame_url": Settings.SIMULATION_IMAGE_PATH,
+            "frame_url": "dummy_path",
             "frame_id": frame_id,
             "video_name": "simulation_video",
             "translation_x": 0.0,
@@ -503,14 +504,12 @@ class NetworkManager:
         if self._sim_image_cache is not None:
             return self._sim_image_cache.copy()
 
-        img_path = Settings.SIMULATION_IMAGE_PATH
-        frame = cv2.imread(img_path)
-        if frame is None:
-            self.log.error(f"Simulation image failed: {img_path}")
-            return None
+        # Generate a dummy 4K resolution image for simulation mode if no actual image path is provided
+        # This replaces the hardcoded `bus.jpg` single-image issue
+        frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+        self.log.warn("Using generated blank image for network pure-simulation mode")
 
         self._sim_image_cache = frame
-        self.log.debug(f"Simulation image cached: {frame.shape[1]}x{frame.shape[0]}")
         return frame
 
     def _validate_frame_data(self, data: Dict[str, Any]) -> bool:
@@ -859,7 +858,11 @@ class NetworkManager:
 
     def _build_idempotency_key(self, frame_key: str) -> str:
         prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
-        return f"{prefix}:{self._session_id}:{frame_key}"
+        # Audit 6.1: Combine runtime session ID with frame_key to guarantee globally unique idempotency
+        import uuid
+        if not hasattr(self, "_run_uuid"):
+            self._run_uuid = uuid.uuid4().hex[:8]
+        return f"{prefix}:{self._session_id}:{self._run_uuid}:{frame_key}"
 
     def _timeout_tuple(self, read_timeout: float) -> Tuple[float, float]:
         connect_timeout = self._connect_timeout()

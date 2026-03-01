@@ -53,10 +53,9 @@ class SessionResilienceController:
             q.popleft()
 
     def _decay_window(self, q: Deque[float]) -> None:
-        # Recovery sonrası ani flap'i azaltmak için pencereyi yumuşat.
-        remove_count = len(q) // 2
-        for _ in range(remove_count):
-            q.popleft()
+        # Recovery sonrası ani flap'i (circuit breaker flapping) azaltmak için
+        # pencereyi daha agresif yumuşat (audit 3.2), eski hataları tamamen temizle
+        q.clear()
 
     def _current_transient_wall_time(self, now: Optional[float] = None) -> float:
         ts = self.stats.transient_wall_time_sec

@@ -104,7 +104,7 @@ class VisualOdometry:
 
     def update(
         self,
-        frame: np.ndarray,
+        frame_ctx: "FrameContext",
         server_data: Dict,
     ) -> Dict[str, float]:
         """
@@ -120,7 +120,7 @@ class VisualOdometry:
         Referans kare sadece GPS→OF geçişinde bir kez oluşturulur.
 
         Args:
-            frame: BGR formatlı OpenCV görüntüsü.
+            frame_ctx: FrameContext objesi (paylaşımlı işlemler için).
             server_data: Sunucudan gelen kare verisi.
 
         Returns:
@@ -128,8 +128,11 @@ class VisualOdometry:
         """
         gps_health = server_data.get("gps_health", 0)
 
-        # Kareyi gri tonlamaya çevir (Optik Akış için)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Merkezi FrameContext objesinden gri kareyi al (tekrar tekrar çevrilmesini önler)
+        if isinstance(frame_ctx, np.ndarray):
+            gray = cv2.cvtColor(frame_ctx, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame_ctx.gray
 
         if gps_health == 1:
             # ========== GPS SAĞLIKLI: Sunucu verisini kullan ==========
@@ -225,6 +228,10 @@ class VisualOdometry:
             self.log.warn("Yetersiz köşe noktası — yeniden tespit ediliyor")
             return
 
+        if self._prev_points is None:
+            self._update_reference_frame(gray)
+            return
+
         # ------ 1) Lucas-Kanade ile noktaları takip et ------
         next_points, status, err = cv2.calcOpticalFlowPyrLK(
             self._prev_gray, gray, self._prev_points, None, **self._lk_params
@@ -237,6 +244,10 @@ class VisualOdometry:
 
         # ------ 2) Başarılı takip edilen noktaları filtrele ------
         mask = status.flatten() == 1
+        
+        if self._prev_points is None:
+            return
+
         good_old = self._prev_points[mask].reshape(-1, 2)
         good_new = next_points[mask].reshape(-1, 2)
 

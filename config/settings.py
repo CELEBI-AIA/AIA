@@ -10,6 +10,7 @@ Kullanım:
 """
 
 from pathlib import Path
+import os
 
 
 # =============================================================================
@@ -50,17 +51,16 @@ class Settings:
     # =========================================================================
 
     # YOLOv8 Model Dosyası (yerel diskten yüklenir - OFFLINE MODE)
-    # yolov8m = Medium model (25.9M param, mAP50: 50.2)
-    # s modelden ~%12 daha doğru — yarışma hızı (7.5 FPS) buna izin verir
-    MODEL_PATH: str = str(PROJECT_ROOT / "models" / "yolov8m.pt")
+    # Custom trained model (YOLOv11m finetuned on UAI, UAP, car, human)
+    MODEL_PATH: str = os.path.join(str(PROJECT_ROOT), "model", "best_mAP50-0.923_mAP50-95-0.766.pt")
 
     # Tespit Güven Eşiği (0.0 - 1.0)
-    # 0.20 = Çatı/Bina gibi yanlış pozitifleri azaltır
-    CONFIDENCE_THRESHOLD: float = 0.20
+    # 0.40 = Increased confidence threshold to prevent false positives like poles detected as humans or random background objects as vehicles
+    CONFIDENCE_THRESHOLD: float = 0.40
 
     # NMS IoU Eşiği (Non-Maximum Suppression)
-    # Daha düşük (0.35) = daha agresif bastırma → çift tespitleri (kaput/tampon) birleştirir
-    NMS_IOU_THRESHOLD: float = 0.35
+    # 0.25 = Very aggressive suppression to merge multi-part human/vehicle detections (e.g. legs + torso, or hood + bumper)
+    NMS_IOU_THRESHOLD: float = 0.25
 
     # Cihaz Seçimi (cuda: GPU, cpu: İşlemci)
     DEVICE: str = "cuda"
@@ -90,8 +90,8 @@ class Settings:
     CLAHE_TILE_SIZE: int = 8
 
     # Minimum bbox boyutu (piksel) — altındakiler false positive sayılır
-    # 10px = Uzaktaki insan için alt sınır. Daha küçüğü (kol/bacak) elenir.
-    MIN_BBOX_SIZE: int = 10
+    # Increased to 20px to effectively filter out tiny noise (like individual legs/feet or small poles)
+    MIN_BBOX_SIZE: int = 20
 
     # Maksimum bbox boyutu (piksel) — şartname büyük nesneleri de tespit etmeyi zorunlu kılıyor
     # (otobüs, tren, gemi vb.) Bu nedenle pratikte devre dışı bırakıldı.
@@ -105,7 +105,7 @@ class Settings:
     SAHI_ENABLED: bool = True
     SAHI_SLICE_SIZE: int = 640       # Her parçanın boyutu (piksel)
     SAHI_OVERLAP_RATIO: float = 0.35 # Parçalar arası örtüşme (%35) - Kenarları yakalar
-    SAHI_MERGE_IOU: float = 0.35     # Birleştirme NMS IoU eşiği (Çift tespitleri önler)
+    SAHI_MERGE_IOU: float = 0.25     # Birleştirme NMS IoU eşiği (Çift tespitleri önler)
 
     # Model ısınma tekrar sayısı (ilk kare gecikmesini önler)
     WARMUP_ITERATIONS: int = 3
@@ -263,19 +263,16 @@ class Settings:
     # =========================================================================
 
     # Log Dizini
-    LOG_DIR: str = str(PROJECT_ROOT / "logs")
+    LOG_DIR: str = os.path.join(str(PROJECT_ROOT), "logs")
 
     # Geçici Kare Dosyası
-    TEMP_FRAME_PATH: str = str(PROJECT_ROOT / "temp_frame.jpg")
+    TEMP_FRAME_PATH: str = os.path.join(str(PROJECT_ROOT), "temp_frame.jpg")
 
     # Debug Çıktı Dizini
-    DEBUG_OUTPUT_DIR: str = str(PROJECT_ROOT / "debug_output")
-
-    # Simülasyon Test Görseli (eski statik mod için)
-    SIMULATION_IMAGE_PATH: str = str(PROJECT_ROOT / "bus.jpg")
+    DEBUG_OUTPUT_DIR: str = os.path.join(str(PROJECT_ROOT), "debug_output")
 
     # Veri Seti Dizini
-    DATASETS_DIR: str = str(PROJECT_ROOT / "datasets")
+    DATASETS_DIR: str = os.path.join(str(PROJECT_ROOT), "datasets")
 
     # Simülasyon DET modu: rastgele seçilecek fotoğraf sayısı
     SIMULATION_DET_SAMPLE_SIZE: int = 100

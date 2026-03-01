@@ -26,6 +26,7 @@ from src.resilience import SessionResilienceController
 from src.runtime_profile import apply_runtime_profile
 from src.send_state import apply_send_result_status
 from src.utils import Logger, Visualizer
+from src.frame_context import FrameContext
 from typing import Any
 
 BANNER = """
@@ -183,9 +184,10 @@ def _process_simulation_step(
     server_data = frame_info["server_data"]
     gps_health = frame_info["gps_health"]
 
+    frame_ctx = FrameContext(frame)
     detected_objects = detector.detect(frame)
-    detected_objects = movement.annotate(detected_objects, frame=frame)
-    position = odometry.update(frame, server_data)
+    detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
+    position = odometry.update(frame_ctx, server_data)
 
     if image_matcher is not None:
         _ = image_matcher.match(frame)
@@ -329,7 +331,13 @@ def run_competition(log: Logger) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    import concurrent.futures
+
     try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        fetch_future = None
+        submit_future = None
+        
         while running:
             try:
                 abort_reason = resilience.should_abort()
@@ -343,41 +351,30 @@ def run_competition(log: Logger) -> None:
                     )
                     break
 
-                if pending_result is None:
-                    fetch_res, tf_new, action = _fetch_competition_step(
-                        log, network, detector, movement, odometry, image_matcher,
-                        resilience, kpi_counters, transient_failures, transient_budget
-                    )
-                    transient_failures = tf_new
-                    if action == "continue":
-                        time.sleep(min(max(0.2, Settings.RETRY_DELAY), 5.0) if fetch_res is None else 0)
-                        continue
-                    elif action == "break":
-                        break
-                    
-                    pending_result = fetch_res
-
-                # GÖNDERME
-                if pending_result is not None:
-                    frame_for_debug = pending_result["frame"]
-                    detected_objects = pending_result["detected_objects"]
-                    position = pending_result["position"]
-                    frame_id = pending_result["frame_id"]
-                    frame_data = pending_result["frame_data"]
-
-                    pending_result, ack_new, action = _submit_competition_step(
+                # Wait for any pending submissions before fetching next
+                if pending_result is not None and submit_future is None:
+                    # GÖNDERME in background
+                    submit_future = executor.submit(
+                        _submit_competition_step,
                         log, network, resilience, kpi_counters, pending_result,
                         ack_failures, ack_failure_budget
                     )
-                    ack_failures = ack_new
-                    if action == "break":
-                        break
-                    elif action == "continue":
-                        continue
 
-                    # Metrics & Visuals on success
+                if submit_future is not None and submit_future.done():
+                    pending_result, ack_new, action_result = submit_future.result()
+                    submit_future = None
+                    ack_failures = ack_new
+                    if action_result == "break":
+                        break
+                    elif action_result == "continue":
+                        # We still need to retry the submit
+                        continue
+                    
+                    # If we reach here, it means we got ("process", success_info)
+                    _, success_info = action_result
+                    
                     try:
-                        gps_health = int(float(frame_data.get("gps_health", 0)))
+                        gps_health = int(float(success_info["frame_data"].get("gps_health", 0)))
                     except (TypeError, ValueError):
                         gps_health = 0
 
@@ -386,12 +383,12 @@ def run_competition(log: Logger) -> None:
                     else:
                         kpi_counters["mode_of"] += 1
 
-                    if Settings.DEBUG and visualizer is not None and frame_for_debug is not None:
+                    if Settings.DEBUG and visualizer is not None and success_info["frame_for_debug"] is not None:
                         visualizer.draw_detections(
-                            frame_for_debug,
-                            detected_objects,
-                            frame_id=str(frame_id),
-                            position=position,
+                            success_info["frame_for_debug"],
+                            success_info["detected_objects"],
+                            frame_id=str(success_info["frame_id"]),
+                            position=success_info["position"],
                         )
 
                     fps_counter.tick()
@@ -400,21 +397,59 @@ def run_competition(log: Logger) -> None:
                     if fps_counter.frame_count % interval == 0:
                         _print_competition_result(
                             log=log,
-                            frame_id=frame_id,
-                            detected_objects=detected_objects,
+                            frame_id=success_info["frame_id"],
+                            detected_objects=success_info["detected_objects"],
                             send_status="SUCCESS",
-                            position=position,
+                            position=success_info["position"],
                             gps_health=gps_health,
                         )
 
                     if Settings.LOOP_DELAY > 0:
                         time.sleep(Settings.LOOP_DELAY)
 
+                elif pending_result is None:
+                    if fetch_future is None:
+                        # Start fetch in background
+                        fetch_future = executor.submit(
+                            _fetch_competition_step,
+                            log, network, detector, movement, odometry, image_matcher,
+                            resilience, kpi_counters, transient_failures, transient_budget
+                        )
+                    
+                    if fetch_future.done():
+                        fetch_res, tf_new, action = fetch_future.result()
+                        fetch_future = None
+                        transient_failures = tf_new
+                        if action == "continue":
+                            time.sleep(min(max(0.2, Settings.RETRY_DELAY), 5.0) if fetch_res is None else 0)
+                            continue
+                        elif action == "break":
+                            break
+                        
+                        pending_result = fetch_res
+                    else:
+                        # Wait a bit to not burn CPU while waiting for network
+                        time.sleep(0.01)
+                        continue
+
+                # Metrics & Visuals on success
+                if pending_result is None and submit_future is None and fetch_future is None:
+                    # Note: We just successfully submitted because pending_result was cleared.
+                    # Wait, submit_future clears pending_result? No, submit_future result returns
+                    # `pending_result = None` on success. We need to grab values before it is cleared.
+                    pass # We handle visuals right after success in the submit block now
+
+                if submit_future is None and pending_result is None:
+                    pass # Handled below
+
             except KeyboardInterrupt:
                 log.warn("Interrupted by user")
                 break
             except Exception as exc:
                 log.error(f"Runtime error: {exc}")
+                if "pytest" in sys.modules and getattr(sys, "last_type", None) is None:
+                    # Don't swallow errors indefinitely if running under pytest
+                    raise
                 time.sleep(0.5)
 
     finally:
@@ -738,12 +773,13 @@ def _fetch_competition_step(
             "frame_shape": None, "detected_undefined_objects": [],
         }
     else:
+        frame_ctx = FrameContext(frame)
         detected_objects = detector.detect(frame)
-        detected_objects = movement.annotate(detected_objects, frame=frame)
+        detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
         undefined_objects = []
         if image_matcher is not None:
             undefined_objects = image_matcher.match(frame)
-        position = odometry.update(frame, frame_data)
+        position = odometry.update(frame_ctx, frame_data)
         pending_result = {
             "frame_id": frame_id, "frame_data": frame_data, "detected_objects": detected_objects,
             "frame": frame, "position": position, "degraded": degrade_mode,
@@ -779,6 +815,9 @@ def _submit_competition_step(
     kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
     kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
 
+    # Snapshot before apply_send_result_status clears pending_result on success
+    pending_result_snapshot = dict(pending_result)
+
     pending_result, should_abort_session, success_cycle = apply_send_result_status(
         send_status=send_status, pending_result=pending_result, kpi_counters=kpi_counters,
     )
@@ -790,7 +829,15 @@ def _submit_competition_step(
     if success_cycle:
         ack_failures = 0
         resilience.on_success_cycle()
-        return pending_result, ack_failures, "process"
+        # On success, we also want to return the display/log data before pending_result was cleared.
+        success_info = {
+            "frame_for_debug": pending_result_snapshot.get("frame"),
+            "detected_objects": detected_objects,
+            "position": pending_result_snapshot.get("position"),
+            "frame_id": frame_id,
+            "frame_data": frame_data
+        }
+        return pending_result, ack_failures, ("process", success_info)
     else:
         ack_failures += 1
         resilience.on_ack_failure()

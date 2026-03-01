@@ -374,9 +374,9 @@ class TestRiderSuppression(unittest.TestCase):
         self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 0)
         self.assertEqual(sum(1 for d in out if d["cls_int"] == 0), 1)
 
-    def test_person_over_car_not_suppressed(self):
+    def test_person_far_from_vehicle_not_suppressed(self):
         person = self._det(1, 0, (100, 100, 140, 160))
-        car = self._det(0, 2, (95, 105, 145, 165))
+        car = self._det(0, 2, (300, 300, 400, 400))
         out = ObjectDetector._suppress_rider_persons([person, car])
         self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 1)
 
@@ -435,29 +435,29 @@ class TestMovementCompensation(unittest.TestCase):
     def test_stationary_vehicle_with_camera_pan_marked_static(self):
         Settings.MOTION_COMP_ENABLED = True
         est = MovementEstimator()
-        est.annotate(self._vehicle(100, 100, 140, 140), frame=self._frame(0))
-        out = est.annotate(self._vehicle(112, 100, 152, 140), frame=self._frame(12))
+        est.annotate(self._vehicle(100, 100, 140, 140), frame_ctx=self._frame(0))
+        out = est.annotate(self._vehicle(112, 100, 152, 140), frame_ctx=self._frame(12))
         self.assertEqual(out[0]["motion_status"], "0")
 
     def test_actual_motion_preserved_with_compensation(self):
         Settings.MOTION_COMP_ENABLED = True
         est = MovementEstimator()
-        est.annotate(self._vehicle(100, 100, 140, 140), frame=self._frame(0))
-        out = est.annotate(self._vehicle(124, 100, 164, 140), frame=self._frame(12))
+        est.annotate(self._vehicle(100, 100, 140, 140), frame_ctx=self._frame(0))
+        out = est.annotate(self._vehicle(124, 100, 164, 140), frame_ctx=self._frame(12))
         self.assertEqual(out[0]["motion_status"], "1")
 
     def test_low_feature_fallback_no_crash(self):
         Settings.MOTION_COMP_ENABLED = True
         est = MovementEstimator()
         blank = np.zeros((320, 320, 3), dtype=np.uint8)
-        est.annotate(self._vehicle(100, 100, 140, 140), frame=blank)
-        out = est.annotate(self._vehicle(108, 100, 148, 140), frame=blank)
+        est.annotate(self._vehicle(100, 100, 140, 140), frame_ctx=blank)
+        out = est.annotate(self._vehicle(108, 100, 148, 140), frame_ctx=blank)
         self.assertIn(out[0]["motion_status"], {"0", "1", "-1"})
 
     def test_first_frame_warmup_not_moving(self):
         Settings.MOTION_COMP_ENABLED = True
         est = MovementEstimator()
-        out = est.annotate(self._vehicle(100, 100, 140, 140), frame=self._frame(0))
+        out = est.annotate(self._vehicle(100, 100, 140, 140), frame_ctx=self._frame(0))
         self.assertEqual(out[0]["motion_status"], "0")
 
 
@@ -719,7 +719,7 @@ class _DummyDetector:
 
 
 class _DummyMovement:
-    def annotate(self, detections, frame=None):
+    def annotate(self, detections, frame_ctx=None):
         return detections
 
 

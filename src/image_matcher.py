@@ -295,7 +295,7 @@ class ImageMatcher:
                 return None
 
             M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if M is None:
+            if M is None or M.shape != (3, 3):
                 return None
 
             # Referans objenin köşelerini dönüştür
