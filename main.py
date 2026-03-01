@@ -1,7 +1,5 @@
-"""
-TEKNOFEST Havacılıkta Yapay Zeka - Ana Orkestrasyon Dosyası
-============================================================
-"""
+"""TEKNOFEST Havacılıkta Yapay Zeka — Ana orkestrasyon.
+Simülasyon: datasets/ içinden kare yükler. Yarışma: sunucudan frame alır, sonuç gönderir."""
 
 import argparse
 import os
@@ -12,6 +10,7 @@ from collections import Counter
 from typing import Dict, Optional
 
 import cv2
+import numpy as np
 import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -81,13 +80,15 @@ def run_simulation(
     prefer_vid: bool = True,
     show: bool = False,
     save: bool = False,
+    seed: Optional[int] = None,
+    sequence: Optional[str] = None,
 ) -> None:
     from src.data_loader import DatasetLoader
 
     log.info("Initializing modules...")
 
     try:
-        loader = DatasetLoader(prefer_vid=prefer_vid)
+        loader = DatasetLoader(prefer_vid=prefer_vid, seed=seed, sequence=sequence)
         if not loader.is_ready:
             log.error("Dataset loading failed, exiting.")
             return
@@ -97,7 +98,6 @@ def run_simulation(
         movement = MovementEstimator()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
-        # Görev 3 — Referans obje eşleştirme
         image_matcher = None
         if Settings.TASK3_ENABLED:
             from src.image_matcher import ImageMatcher
@@ -222,7 +222,7 @@ def _process_simulation_step(
                     log.info("Window closed by user (q/ESC)")
                     return True
             except cv2.error:
-                pass  # Headless ortamda GUI mevcut değil — sessizce atla
+                pass
 
         if save:
             save_path = os.path.join(
@@ -276,12 +276,10 @@ def run_competition(log: Logger) -> None:
         movement = MovementEstimator()
         fps_counter = FPSCounter(report_interval=Settings.FPS_REPORT_INTERVAL)
 
-        # Görev 3 — Referans obje eşleştirme
         image_matcher = None
         if Settings.TASK3_ENABLED:
             from src.image_matcher import ImageMatcher
             image_matcher = ImageMatcher()
-            # Yarışma modunda referanslar sunucudan veya local dizinden yüklenir
             loaded = image_matcher.load_references_from_directory()
             if loaded == 0:
                 log.warn("Görev 3: Referans obje bulunamadı, detected_undefined_objects boş gönderilecek")
@@ -299,11 +297,40 @@ def run_competition(log: Logger) -> None:
         log.error("Server session start failed")
         return
 
+    server_refs = network.get_task3_references()
+    if image_matcher is not None and server_refs:
+        ref_list = []
+        for r in server_refs:
+            if not isinstance(r, dict):
+                continue
+            obj_id = int(r.get("object_id", len(ref_list) + 1))
+            if "path" in r and r["path"]:
+                p = r["path"]
+                if not os.path.isabs(p):
+                    p = os.path.join(PROJECT_ROOT, p)
+                ref_list.append({"object_id": obj_id, "path": p, "label": f"ref_{obj_id}"})
+            elif "image_base64" in r and r["image_base64"]:
+                try:
+                    import base64
+                    arr = np.frombuffer(base64.b64decode(r["image_base64"]), dtype=np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        ref_list.append({"object_id": obj_id, "image": img, "label": f"ref_{obj_id}"})
+                except Exception:
+                    pass
+        if ref_list:
+            loaded = image_matcher.load_references(ref_list)
+            log.info(f"Görev 3: Sunucudan {loaded} referans obje yüklendi")
+
     running = True
     transient_failures = 0
     transient_budget = max(10, Settings.MAX_RETRIES * 5)
     ack_failures = 0
     ack_failure_budget = max(20, Settings.MAX_RETRIES * 10)
+    consecutive_permanent_rejects = 0
+    PERMANENT_REJECT_ABORT_THRESHOLD = 5
+    consecutive_duplicate_frames = 0
+    CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD = 5
     resilience = SessionResilienceController(log=log)
 
     kpi_counters: Dict[str, int] = {
@@ -320,6 +347,7 @@ def run_competition(log: Logger) -> None:
         "timeout_fetch": 0,
         "timeout_image": 0,
         "timeout_submit": 0,
+        "consecutive_duplicate_abort": 0,
     }
     pending_result: Optional[Dict] = None
 
@@ -351,26 +379,30 @@ def run_competition(log: Logger) -> None:
                     )
                     break
 
-                # Wait for any pending submissions before fetching next
+                # Bekleyen sonuç varsa önce gönder (fetch ile çakışmayı önle)
                 if pending_result is not None and submit_future is None:
-                    # GÖNDERME in background
                     submit_future = executor.submit(
                         _submit_competition_step,
                         log, network, resilience, kpi_counters, pending_result,
-                        ack_failures, ack_failure_budget
+                        ack_failures, ack_failure_budget,
+                        consecutive_permanent_rejects, PERMANENT_REJECT_ABORT_THRESHOLD,
                     )
 
                 if submit_future is not None and submit_future.done():
-                    pending_result, ack_new, action_result = submit_future.result()
+                    result = submit_future.result()
+                    pending_result = result[0]
+                    ack_failures = result[1]
+                    action_result = result[2]
+                    consecutive_permanent_rejects = result[3]
                     submit_future = None
-                    ack_failures = ack_new
                     if action_result == "break":
                         break
                     elif action_result == "continue":
-                        # We still need to retry the submit
                         continue
                     
-                    # If we reach here, it means we got ("process", success_info)
+                    if not (isinstance(action_result, tuple) and len(action_result) == 2):
+                        log.error(f"Unexpected action_result type: {type(action_result)}, skipping frame")
+                        continue
                     _, success_info = action_result
                     
                     try:
@@ -407,9 +439,13 @@ def run_competition(log: Logger) -> None:
                     if Settings.LOOP_DELAY > 0:
                         time.sleep(Settings.LOOP_DELAY)
 
+                elif submit_future is not None and not submit_future.done():
+                    time.sleep(0.01)
+                    continue
+
                 elif pending_result is None:
+                    # Yeni frame al
                     if fetch_future is None:
-                        # Start fetch in background
                         fetch_future = executor.submit(
                             _fetch_competition_step,
                             log, network, detector, movement, odometry, image_matcher,
@@ -417,7 +453,7 @@ def run_competition(log: Logger) -> None:
                         )
                     
                     if fetch_future.done():
-                        fetch_res, tf_new, action = fetch_future.result()
+                        fetch_res, tf_new, action, is_dup = fetch_future.result()
                         fetch_future = None
                         transient_failures = tf_new
                         if action == "continue":
@@ -425,22 +461,18 @@ def run_competition(log: Logger) -> None:
                             continue
                         elif action == "break":
                             break
-                        
+                        if is_dup:
+                            consecutive_duplicate_frames += 1
+                            if consecutive_duplicate_frames >= CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD:
+                                kpi_counters["consecutive_duplicate_abort"] = consecutive_duplicate_frames
+                                log.error(f"Ardışık {consecutive_duplicate_frames} duplicate frame, oturum sonlandırılıyor")
+                                break
+                        else:
+                            consecutive_duplicate_frames = 0
                         pending_result = fetch_res
                     else:
-                        # Wait a bit to not burn CPU while waiting for network
                         time.sleep(0.01)
                         continue
-
-                # Metrics & Visuals on success
-                if pending_result is None and submit_future is None and fetch_future is None:
-                    # Note: We just successfully submitted because pending_result was cleared.
-                    # Wait, submit_future clears pending_result? No, submit_future result returns
-                    # `pending_result = None` on success. We need to grab values before it is cleared.
-                    pass # We handle visuals right after success in the submit block now
-
-                if submit_future is None and pending_result is None:
-                    pass # Handled below
 
             except KeyboardInterrupt:
                 log.warn("Interrupted by user")
@@ -448,7 +480,6 @@ def run_competition(log: Logger) -> None:
             except Exception as exc:
                 log.error(f"Runtime error: {exc}")
                 if "pytest" in sys.modules and getattr(sys, "last_type", None) is None:
-                    # Don't swallow errors indefinitely if running under pytest
                     raise
                 time.sleep(0.5)
 
@@ -626,6 +657,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--show", action="store_true", help="Show simulation window")
     parser.add_argument("--save", action="store_true", help="Save simulation images")
+    parser.add_argument("--seed", type=int, default=None, help="Deterministik simülasyon için rastgele seed")
+    parser.add_argument("--sequence", type=str, default=None, help="VID modunda seçilecek sekans adı (örn. uav0000123)")
     return parser.parse_args()
 
 
@@ -680,6 +713,8 @@ def main() -> None:
             prefer_vid=choices["prefer_vid"],
             show=choices["show"],
             save=choices["save"],
+            seed=args.seed,
+            sequence=args.sequence,
         )
     else:
         run_competition(log)
@@ -696,7 +731,7 @@ def _fetch_competition_step(
         cooldown_left = resilience.open_cooldown_remaining()
         wait_s = min(max(0.2, Settings.RETRY_DELAY), max(0.2, cooldown_left))
         log.warn(f"Circuit breaker OPEN; waiting cooldown ({cooldown_left:.1f}s remaining, sleep={wait_s:.1f}s)")
-        return None, transient_failures, "continue"
+        return None, transient_failures, "continue", False
 
     fetch_result = network.get_frame()
     timeout_snapshot = network.consume_timeout_counters()
@@ -706,7 +741,7 @@ def _fetch_competition_step(
 
     if fetch_result.status == FrameFetchStatus.END_OF_STREAM:
         log.info("End of stream confirmed by server (204)")
-        return None, transient_failures, "break"
+        return None, transient_failures, "break", False
 
     if fetch_result.status == FrameFetchStatus.TRANSIENT_ERROR:
         transient_failures += 1
@@ -716,11 +751,11 @@ def _fetch_competition_step(
         if transient_failures >= transient_budget:
             log.warn("Transient failure budget reached; session stays alive under wall-clock circuit breaker policy")
         time.sleep(delay)
-        return None, transient_failures, "continue"
+        return None, transient_failures, "continue", False
 
     if fetch_result.status == FrameFetchStatus.FATAL_ERROR:
         log.error(f"Fatal frame fetch error: {fetch_result.error_type} (http={fetch_result.http_status})")
-        return None, transient_failures, "break"
+        return None, transient_failures, "break", False
 
     frame_data = fetch_result.frame_data or {}
     transient_failures = 0
@@ -764,14 +799,18 @@ def _fetch_competition_step(
             log.warn(f"Frame {frame_id}: image download failed, sending fallback result")
 
     if use_fallback:
-        # Görüntü yoksa son bilinen pozisyon kullan (şartname FR-011)
-        last_position = odometry.get_position()
+        gps_health = int(float(frame_data.get("gps_health", 0)))
+        if gps_health == 0:
+            last_position = odometry.get_last_of_position()
+        else:
+            last_position = odometry.get_position()
         pending_result = {
             "frame_id": frame_id, "frame_data": frame_data, "detected_objects": [],
             "frame": None, "position": last_position,
             "degraded": degrade_mode, "pending_ttl": 1 if degrade_mode else None,
             "detected_translation": {"translation_x": last_position["x"], "translation_y": last_position["y"], "translation_z": last_position["z"]},
             "frame_shape": None, "detected_undefined_objects": [],
+            "is_duplicate": fetch_result.is_duplicate,
         }
     else:
         frame_ctx = FrameContext(frame)
@@ -787,13 +826,15 @@ def _fetch_competition_step(
             "pending_ttl": 1 if degrade_mode else None,
             "detected_translation": {"translation_x": position["x"], "translation_y": position["y"], "translation_z": position["z"]},
             "frame_shape": frame.shape, "detected_undefined_objects": undefined_objects,
+            "is_duplicate": fetch_result.is_duplicate,
         }
 
-    return pending_result, transient_failures, "process"
+    return pending_result, transient_failures, "process", fetch_result.is_duplicate
 
 def _submit_competition_step(
     log: Logger, network: Any, resilience: Any, kpi_counters: dict, pending_result: dict,
-    ack_failures: int, ack_failure_budget: int
+    ack_failures: int, ack_failure_budget: int,
+    consecutive_permanent_rejects: int, permanent_reject_abort_threshold: int,
 ):
     import time
     frame_id = pending_result["frame_id"]
@@ -816,21 +857,24 @@ def _submit_competition_step(
     kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
     kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
 
-    # Snapshot before apply_send_result_status clears pending_result on success
     pending_result_snapshot = dict(pending_result)
 
     pending_result, should_abort_session, success_cycle = apply_send_result_status(
         send_status=send_status, pending_result=pending_result, kpi_counters=kpi_counters,
     )
 
-    if should_abort_session:
-        log.error(f"Frame {frame_id}: permanent rejected payload, aborting session")
-        return pending_result, ack_failures, "break"
+    if pending_result is None and not success_cycle:
+        consecutive_permanent_rejects += 1
+        log.warn(f"Frame {frame_id}: permanent rejected, frame dropped ({consecutive_permanent_rejects}/{permanent_reject_abort_threshold})")
+        if consecutive_permanent_rejects >= permanent_reject_abort_threshold:
+            log.error("Consecutive permanent reject threshold reached, aborting session")
+            return None, ack_failures, "break", consecutive_permanent_rejects
+        return None, ack_failures, "continue", consecutive_permanent_rejects
 
     if success_cycle:
         ack_failures = 0
+        consecutive_permanent_rejects = 0
         resilience.on_success_cycle()
-        # On success, we also want to return the display/log data before pending_result was cleared.
         success_info = {
             "frame_for_debug": pending_result_snapshot.get("frame"),
             "detected_objects": detected_objects,
@@ -838,7 +882,7 @@ def _submit_competition_step(
             "frame_id": frame_id,
             "frame_data": frame_data
         }
-        return pending_result, ack_failures, ("process", success_info)
+        return pending_result, ack_failures, ("process", success_info), consecutive_permanent_rejects
     else:
         ack_failures += 1
         resilience.on_ack_failure()
@@ -857,7 +901,7 @@ def _submit_competition_step(
                     pending_result = None
         
         time.sleep(delay)
-        return pending_result, ack_failures, "continue"
+        return pending_result, ack_failures, "continue", consecutive_permanent_rejects
 
 if __name__ == "__main__":
     main()

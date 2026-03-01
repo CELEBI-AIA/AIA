@@ -1,42 +1,19 @@
-"""
-TEKNOFEST Havacılıkta Yapay Zeka — Yerel Mock Sunucu
-=====================================================
-Yarışma formatını localde test etmek için basit HTTP sunucu.
-
-Kullanım:
-    # Terminal 1: Sunucuyu başlat
-    python tools/mock_server.py
-
-    # Terminal 2: Competition modunda test et
-    python main.py --mode competition
-
-Sunucu davranışı:
-    - GET  /           → 200 (bağlantı testi)
-    - GET  /next_frame → Video karelerini sırayla sunar (JSON)
-    - POST /submit_result → Sonuçları kabul eder ve doğrular
-    - 204 döndürür tüm kareler bittiğinde (end-of-stream)
-
-Dataset:
-    datasets/ klasöründeki görselleri otomatik keşfeder.
-    Bulunamazsa varsayılan test kareleri üretir.
-"""
+"""Yerel mock sunucu — yarışma formatında test."""
 
 import json
 import os
 import sys
+import threading
 import time
 from glob import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import List
 
-# Proje kökünü ayarla
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Görüntü dosyalarını keşfet
 def discover_frames() -> List[str]:
-    """datasets/ içindeki görüntüleri keşfeder."""
     datasets_dir = PROJECT_ROOT / "datasets"
     frames = []
 
@@ -45,47 +22,50 @@ def discover_frames() -> List[str]:
             found = sorted(glob(str(datasets_dir / "**" / ext), recursive=True))
             frames.extend(found)
 
-    # Fallback: bus.jpg
     if not frames:
         bus_path = PROJECT_ROOT / "bus.jpg"
         if bus_path.is_file():
             frames = [str(bus_path)] * 100  # 100 kare simüle et
 
-    return frames[:2250]  # Oturum limiti
+    return frames[:2250]
 
 
 class MockServerHandler(BaseHTTPRequestHandler):
-    """Yarışma sunucusunu simüle eden HTTP handler."""
-
     frames = discover_frames()
     current_index = 0
     results_received = 0
     session_start = time.time()
+    _lock = threading.Lock()
 
     def log_message(self, format: str, *args) -> None:
-        """Sunucu loglarını formatla."""
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] [MockServer] {format % args}")
 
     def do_GET(self) -> None:
-        """GET isteklerini işle."""
         if self.path == "/" or self.path == "":
-            # Bağlantı testi
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
+            task3_refs = []
+            ref_dir = PROJECT_ROOT / "datasets" / "task3_references"
+            if ref_dir.is_dir():
+                for ext in ["*.jpg", "*.jpeg", "*.png"]:
+                    for p in sorted(ref_dir.glob(ext))[:10]:
+                        task3_refs.append({"object_id": len(task3_refs) + 1, "path": str(p)})
+            payload = {
                 "status": "ok",
                 "server": "TEKNOFEST Mock Server",
                 "total_frames": len(self.frames),
-            }).encode())
+            }
+            if task3_refs:
+                payload["task3_references"] = task3_refs
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
             return
 
         if self.path.startswith("/next_frame"):
             self._handle_next_frame()
             return
 
-        # Görüntü sunumu
         if self.path.startswith("/images/"):
             self._serve_image()
             return
@@ -93,7 +73,6 @@ class MockServerHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:
-        """POST isteklerini işle."""
         if self.path.startswith("/submit_result"):
             self._handle_submit_result()
             return
@@ -101,20 +80,16 @@ class MockServerHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def _handle_next_frame(self) -> None:
-        """Sıradaki frame'i JSON olarak sun."""
         cls = MockServerHandler
+        with cls._lock:
+            if cls.current_index >= len(cls.frames):
+                self.send_response(204)
+                self.end_headers()
+                self.log_message("End of stream (204) — tüm kareler tamamlandı")
+                return
+            frame_path = cls.frames[cls.current_index]
+            frame_id = cls.current_index
 
-        if cls.current_index >= len(cls.frames):
-            # Tüm kareler bitti — end of stream
-            self.send_response(204)
-            self.end_headers()
-            self.log_message("End of stream (204) — tüm kareler tamamlandı")
-            return
-
-        frame_path = cls.frames[cls.current_index]
-        frame_id = cls.current_index
-
-        # GPS sağlığı simülasyonu (ilk 450 kare sağlıklı)
         if frame_id < 450:
             gps_health = 1
             tx = float(frame_id * 0.5)
@@ -132,7 +107,6 @@ class MockServerHandler(BaseHTTPRequestHandler):
                 ty = "NaN"
                 tz = "NaN"
 
-        # Relative path for image URL
         rel_path = os.path.relpath(frame_path, PROJECT_ROOT).replace("\\", "/")
 
         frame_data = {
@@ -150,7 +124,8 @@ class MockServerHandler(BaseHTTPRequestHandler):
             "gps_health": gps_health,
         }
 
-        cls.current_index += 1
+        with cls._lock:
+            cls.current_index += 1
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -158,15 +133,14 @@ class MockServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(frame_data).encode())
 
     def _handle_submit_result(self) -> None:
-        """Sonuç submission'ı kabul et."""
         cls = MockServerHandler
-
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
         try:
             result = json.loads(body)
-            cls.results_received += 1
+            with cls._lock:
+                cls.results_received += 1
 
             obj_count = len(result.get("detected_objects", []))
             undef_count = len(result.get("detected_undefined_objects", []))
@@ -186,8 +160,6 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Invalid JSON")
 
     def _serve_image(self) -> None:
-        """Görüntü dosyasını sun."""
-        # /images/ prefix'ini kaldır
         rel_path = self.path[len("/images/"):]
         
         try:

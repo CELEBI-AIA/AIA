@@ -1,4 +1,4 @@
-"""Runtime profile and determinism helpers."""
+"""Determinizm ve runtime profil yardımcıları."""
 
 import os
 import random
@@ -14,7 +14,6 @@ ProfileName = Literal["off", "balanced", "max"]
 
 
 def apply_runtime_profile(profile: ProfileName, requested_profile: Optional[str] = None) -> None:
-    """Apply deterministic/runtime behavior profile at startup."""
     log = Logger("Runtime")
     requested = (requested_profile or profile or "balanced").strip().lower()
     profile = (profile or "balanced").strip().lower()
@@ -55,8 +54,6 @@ def apply_runtime_profile(profile: ProfileName, requested_profile: Optional[str]
     except Exception:
         pass
 
-    # Profile-specific runtime toggles.
-    # Gerçek uygulamalarda Settings nesnesi başlatılırken okunmalıdır.
     log.info("Applying dynamic runtime overrides to Settings class...")
     if profile in {"balanced", "max"}:
         Settings.AUGMENTED_INFERENCE = False

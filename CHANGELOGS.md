@@ -1,5 +1,11 @@
 # CHANGELOGS
 
+## 0.0.33 - 2026-03-01
+- **refactor(data_loader)**: Recursive scan of datasets/; find images by extension (.jpg, .png, etc.); removed sequences/images folder structure requirement.
+- **refactor(config)**: Removed DATASET_NAME_PATTERN, added IMAGE_EXTENSIONS; supports any dataset structure.
+- **chore(comments)**: Cleaned up redundant comments, added concise explanatory comments at critical points.
+- **docs(data_loader)**: Replaced VisDrone references with generic wording.
+
 ## 0.0.32 - 2026-03-01
 - **fix(audit)**: Applied fixes per TEKNOFEST audit reports.
 - **fix(main)**: Use odometry.get_position() instead of (0,0,0) fallback on image download failure (B-04).
@@ -14,7 +20,6 @@
 ## 0.0.31 - 2026-03-01
 - **fix(typing)**: Added `TYPE_CHECKING` imports for `FrameContext` in `src/localization.py` and `src/movement.py` to fix Flake8 `F821` syntax errors during CI build without introducing circular dependencies.
 - **release**: Bumped project version from `0.0.30` to `0.0.31`.
-
 
 ## 0.0.30 - 2026-03-01
 - **fix(tests)**: Updated `MovementEstimator.annotate` mock and test calls to use `frame_ctx` instead of `frame`.
@@ -43,7 +48,7 @@
 - **fix(image_matcher)**: Added degenerate/collinear point guard before `cv2.findHomography` to prevent RANSAC crashes.
 - **chore(config)**: Marked `task3_params.yaml` as deprecated dead code; all values hardcoded in `settings.py`.
 - **test(tests)**: Consolidated 13 test files into single `tests/test_all.py` (47 tests, ~6s); added 10s global timeout via `conftest.py`.
-- **docs(readme)**: Added Audit & Sağlamlaştırma section, updated file structure, features table, Görev 3 deprecation notice.
+- **docs(readme)**: Added Audit & Hardening section, updated file structure, features table, Task 3 deprecation notice.
 
 ## 0.0.27 - 2026-02-26
 - **feat(task3)**: Added `src/image_matcher.py` (ORB/SIFT feature matching + homography) and integrated it into main competition/simulation loops.
@@ -112,7 +117,7 @@
 
 ## 0.0.18 - 2026-02-23
 - Updated outbound result payload in `src/network.py` from strict-minimal to a specification-aligned schema including top-level `id`, `user`, `frame`, `detected_objects`, `detected_translations`, and `detected_undefined_objects`.
-- Added per-object `motion_status` field (mapped from internal `movement_status` with safe fallback `-1`) to align Task-1 movement reporting with şartname terminology.
+- Added per-object `motion_status` field (mapped from internal `movement_status` with safe fallback `-1`) to align Task-1 movement reporting with specification terminology.
 - Passed live frame metadata from `main.py` to payload builder so `id/user/frame` can be populated from server-provided fields when available.
 - Updated `README.md` JSON example and notes to reflect the expanded payload schema.
 
@@ -121,7 +126,7 @@
 
 ## 0.0.16 - 2026-02-23
 - Added a formal specification compliance report at `AIA/sartname/UYUMLULUK_RAPORU_2026-02-23.md` by cross-checking `teknofest_context.md` and TEKNOFEST 2026 technical specification PDF (V1.0, 21.02.2026).
-- Documented itemized compliance status (`Uyumlu/Kısmi Uyum/Uyumsuz`), prioritized risks (P0/P1/P2), and concrete closure actions for Task-3, payload schema alignment, motion status naming, and offline policy guard.
+- Documented itemized compliance status (Compliant/Partial/Non-compliant), prioritized risks (P0/P1/P2), and concrete closure actions for Task-3, payload schema alignment, motion status naming, and offline policy guard.
 
 ## 0.0.15 - 2026-02-22
 - Refreshed `CODEBASE_STATE_REPORT.md` to reflect latest runtime architecture updates, including determinism profiles, fetch-state based networking, strict-minimal payload behavior, pinned dependencies, and revised technical maturity/risk assessment.
@@ -167,11 +172,11 @@
 - Documented the Task-3 parameter contract and field mapping in `README.md`.
 
 ## 0.0.06 - 2026-02-21
-- Added a dedicated "Görev 1 Temporal Karar Mantığı" section to `README.md` documenting window, decay, and threshold based decision flow.
+- Added a dedicated "Task 1 Temporal Decision Logic" section to `README.md` documenting window, decay, and threshold based decision flow.
 - Explicitly prohibited single-frame final decisions for `movement_status` and `landing_status` in documentation.
 
 ## 0.0.05 - 2026-02-21
-- Added a new "Deterministiklik Sözleşmesi" section to `README.md` with explicit rules for fixed seeds, model eval mode, version pinning, and stable JSON key ordering.
+- Added a new "Determinism Contract" section to `README.md` with explicit rules for fixed seeds, model eval mode, version pinning, and stable JSON key ordering.
 - Added the section link to README table of contents for easier navigation.
 
 ## 0.0.04 - 2026-02-21

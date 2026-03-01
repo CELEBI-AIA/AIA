@@ -1,6 +1,4 @@
-"""
-Session-level resilience helpers for competition networking loop.
-"""
+"""Circuit breaker: çok fazla hata → OPEN (bekle), sonra degrade. Wall-clock limiti oturumu sonlandırabilir."""
 
 import time
 from collections import deque
@@ -27,10 +25,7 @@ class ResilienceStats:
 
 
 class SessionResilienceController:
-    """
-    Wall-clock aware circuit breaker + degrade mode controller.
-    Only networking orchestration decisions use wall-clock.
-    """
+    """Circuit breaker ve degrade kontrolü (wall-clock tabanlı)."""
 
     def __init__(self, log) -> None:
         self.log = log
@@ -53,8 +48,6 @@ class SessionResilienceController:
             q.popleft()
 
     def _decay_window(self, q: Deque[float]) -> None:
-        # Recovery sonrası ani flap'i (circuit breaker flapping) azaltmak için
-        # Eski hataları temizle (flapping önleme)
         q.clear()
 
     def _current_transient_wall_time(self, now: Optional[float] = None) -> float:
@@ -129,7 +122,6 @@ class SessionResilienceController:
         self._degrade_frame_counter = 0
 
     def before_fetch(self) -> bool:
-        """True dönerse fetch yapılabilir, False ise cooldown beklenmeli."""
         now = self._now()
         if self.state != ResilienceState.OPEN:
             return True
@@ -147,14 +139,21 @@ class SessionResilienceController:
         return self._degrade_frame_counter
 
     def should_abort(self) -> Optional[str]:
-        # Oturum iptali yok; degrade modunda devam (ağ düzelirse toparlanır)
+        if self.state == ResilienceState.NORMAL:
+            return None
+        wall_time = self._current_transient_wall_time()
+        limit = float(Settings.CB_SESSION_MAX_TRANSIENT_SEC)
+        if wall_time >= limit:
+            return (
+                f"Transient wall time {wall_time:.0f}s >= limit {limit:.0f}s; "
+                "aborting session to avoid indefinite wait"
+            )
         return None
 
     def is_degraded(self) -> bool:
         return self.state in {ResilienceState.DEGRADED, ResilienceState.OPEN}
 
     def finalize(self) -> ResilienceStats:
-        # Oturum non-normal durumda kapanırsa, açık süreyi toplam duvar saatine ekle.
         if self._non_normal_since is not None:
             now = self._now()
             self.stats.transient_wall_time_sec += max(0.0, now - self._non_normal_since)

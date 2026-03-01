@@ -1,9 +1,4 @@
-"""
-AIA — Tüm Birim Testleri (Konsolide)
-=====================================
-Bu dosya tüm test modüllerini tek bir yerde toplar.
-Çalıştırma: python -m pytest tests/test_all.py -v
-"""
+"""Tüm birim testleri."""
 
 import copy
 import json
@@ -65,10 +60,6 @@ from src.runtime_profile import apply_runtime_profile
 from src.utils import Logger, log_json_to_disk, _sanitize_log_component, _prune_old_logs
 from main import run_simulation
 
-
-# =============================================================================
-#  §1  UTILS TESTS
-# =============================================================================
 
 class TestLogger:
     @patch('builtins.print')
@@ -134,10 +125,6 @@ class TestSanitizeAndLogs:
         assert mock_remove.call_count == 2
 
 
-# =============================================================================
-#  §2  RUNTIME PROFILE TESTS
-# =============================================================================
-
 class TestRuntimeProfile:
     def test_off(self):
         orig_tta = Settings.AUGMENTED_INFERENCE
@@ -192,7 +179,7 @@ class TestSendState:
     def test_permanent_rejected(self):
         c = self._counters()
         p, abort, ok = apply_send_result_status("permanent_rejected", {"x": 1}, c)
-        assert p == {"x": 1} and abort and not ok
+        assert p is None and not abort and not ok
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 1
 
     def test_other_error(self):
@@ -202,9 +189,18 @@ class TestSendState:
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 0
 
 
-# =============================================================================
-#  §4  MAIN ACK STATE MACHINE TESTS
-# =============================================================================
+@unittest.skipUnless(ObjectDetector is not None, "detection deps missing")
+class TestEdgeMarginRatio(unittest.TestCase):
+    def test_is_touching_edge_uses_ratio(self):
+        from src.detection import ObjectDetector
+        orig = Settings.EDGE_MARGIN_RATIO
+        Settings.EDGE_MARGIN_RATIO = 0.01
+        try:
+            self.assertTrue(ObjectDetector._is_touching_edge((5, 50, 100, 150), 1000, 500))
+            self.assertFalse(ObjectDetector._is_touching_edge((15, 50, 100, 150), 1000, 500))
+        finally:
+            Settings.EDGE_MARGIN_RATIO = orig
+
 
 class TestMainAckStateMachine:
     @staticmethod
@@ -223,17 +219,13 @@ class TestMainAckStateMachine:
         assert p is None and not abort and ok
         assert c["send_ok"] == 1 and c["send_fallback_ok"] == 1
 
-    def test_permanent_rejected_aborts(self):
+    def test_permanent_rejected_drops_frame(self):
         c = self._counters()
         pending = {"frame_id": "f-3"}
         p, abort, ok = apply_send_result_status("permanent_rejected", pending, c)
-        assert p is pending and abort and not ok
+        assert p is None and not abort and not ok
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 1
 
-
-# =============================================================================
-#  §5  SESSION RESILIENCE TESTS
-# =============================================================================
 
 class _StubLog:
     def __init__(self):
@@ -292,19 +284,19 @@ class TestSessionResilience:
         assert c.state == ResilienceState.DEGRADED
         time.sleep(0.45)
         reason = c.should_abort()
-        assert reason is None  # Oturum iptali yok; degrade modunda devam
+        assert reason is not None
+        assert "Transient wall time" in reason or "aborting" in reason.lower()
 
     def test_breaker_open_cycles_abort(self):
         self._setup_settings()
         c = self._ctrl()
-        c.stats.breaker_open_count = 3
+        assert c.should_abort() is None
+        c.on_ack_failure()
+        c._non_normal_since = time.monotonic() - 1.0
+        c.state = ResilienceState.DEGRADED
         reason = c.should_abort()
-        assert reason is None  # Oturum iptali devre dışı
+        assert reason is not None
 
-
-# =============================================================================
-#  §6  MAIN / SIMULATION TESTS
-# =============================================================================
 
 @patch('src.data_loader.DatasetLoader')
 @patch('main.ObjectDetector')
@@ -335,69 +327,8 @@ def test_run_simulation_stops_on_max_frames(
     assert MockDetector.return_value.detect.call_count == 1
 
 
-# =============================================================================
-#  §7  RIDER SUPPRESSION TESTS
-# =============================================================================
-
-@unittest.skipUnless(ObjectDetector is not None, "detection deps missing")
-class TestRiderSuppression(unittest.TestCase):
-    def setUp(self):
-        self._orig = {
-            "RIDER_SUPPRESS_ENABLED": Settings.RIDER_SUPPRESS_ENABLED,
-            "RIDER_OVERLAP_THRESHOLD": Settings.RIDER_OVERLAP_THRESHOLD,
-            "RIDER_IOU_THRESHOLD": Settings.RIDER_IOU_THRESHOLD,
-            "RIDER_SOURCE_CLASSES": Settings.RIDER_SOURCE_CLASSES,
-        }
-        Settings.RIDER_SUPPRESS_ENABLED = True
-        Settings.RIDER_OVERLAP_THRESHOLD = 0.35
-        Settings.RIDER_IOU_THRESHOLD = 0.15
-        Settings.RIDER_SOURCE_CLASSES = (1, 3, 10)
-
-    def tearDown(self):
-        for key, value in self._orig.items():
-            setattr(Settings, key, value)
-
-    @staticmethod
-    def _det(cls_int, source_cls_id, bbox):
-        x1, y1, x2, y2 = bbox
-        return {
-            "cls_int": cls_int, "cls": str(cls_int),
-            "source_cls_id": source_cls_id, "bbox": (x1, y1, x2, y2),
-            "top_left_x": x1, "top_left_y": y1,
-            "bottom_right_x": x2, "bottom_right_y": y2, "confidence": 0.9,
-        }
-
-    def test_person_over_bicycle_is_suppressed(self):
-        person = self._det(1, 0, (100, 100, 140, 160))
-        bicycle = self._det(0, 1, (95, 105, 145, 165))
-        out = ObjectDetector._suppress_rider_persons([person, bicycle])
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 0)
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 0), 1)
-
-    def test_person_far_from_vehicle_not_suppressed(self):
-        person = self._det(1, 0, (100, 100, 140, 160))
-        car = self._det(0, 2, (300, 300, 400, 400))
-        out = ObjectDetector._suppress_rider_persons([person, car])
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 1)
-
-    def test_low_overlap_not_suppressed(self):
-        person = self._det(1, 0, (100, 100, 140, 160))
-        bike = self._det(0, 1, (200, 200, 240, 260))
-        out = ObjectDetector._suppress_rider_persons([person, bike])
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 1)
-
-    def test_multi_person_only_overlapping_suppressed(self):
-        rider = self._det(1, 0, (100, 100, 140, 160))
-        walker = self._det(1, 0, (220, 120, 260, 180))
-        moto = self._det(0, 3, (95, 105, 145, 165))
-        out = ObjectDetector._suppress_rider_persons([rider, walker, moto])
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 1), 1)
-        self.assertEqual(sum(1 for d in out if d["cls_int"] == 0), 1)
 
 
-# =============================================================================
-#  §8  MOVEMENT COMPENSATION TESTS
-# =============================================================================
 
 @unittest.skipUnless(cv2 is not None and MovementEstimator is not None, "opencv/runtime deps missing")
 class TestMovementCompensation(unittest.TestCase):
@@ -461,10 +392,6 @@ class TestMovementCompensation(unittest.TestCase):
         self.assertEqual(out[0]["motion_status"], "0")
 
 
-# =============================================================================
-#  §9  FRAME DEDUP TESTS
-# =============================================================================
-
 @unittest.skipUnless(NetworkManager is not None and FrameFetchStatus is not None, "network deps missing")
 class TestFrameDedup(unittest.TestCase):
     def setUp(self):
@@ -495,10 +422,6 @@ class TestFrameDedup(unittest.TestCase):
         self.assertFalse(mgr._mark_seen_frame("C"))
         self.assertFalse(mgr._mark_seen_frame("A"))
 
-
-# =============================================================================
-#  §10  IDEMPOTENCY SUBMIT TESTS
-# =============================================================================
 
 @unittest.skipUnless(NetworkManager is not None and SendResultStatus is not None, "network deps missing")
 class TestIdempotencySubmit(unittest.TestCase):
@@ -538,14 +461,8 @@ class TestIdempotencySubmit(unittest.TestCase):
         self.assertEqual(first, SendResultStatus.ACKED)
         self.assertEqual(second, SendResultStatus.ACKED)
         
-        # Second submit should be permitted by client but dropped server-side using Idempotency-Key
-        # Due to how we mock `session.post`, it gets called twice here
         self.assertEqual(mgr.session.post.call_count, 2)
 
-
-# =============================================================================
-#  §11  NETWORK TIMEOUT TESTS
-# =============================================================================
 
 @unittest.skipUnless(requests is not None and NetworkManager is not None, "network deps missing")
 class TestNetworkTimeouts(unittest.TestCase):
@@ -612,10 +529,6 @@ class TestNetworkTimeouts(unittest.TestCase):
         self.assertEqual(counts["fetch"], 1)
         self.assertEqual(counts["image"], 0)
 
-
-# =============================================================================
-#  §12  NETWORK PAYLOAD GUARD TESTS
-# =============================================================================
 
 class _Response:
     def __init__(self, status_code):
@@ -710,10 +623,6 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         self.assertEqual(status, SendResultStatus.RETRYABLE_FAILURE)
 
 
-# =============================================================================
-#  §13  COMPETITION LOOP HARDENING TESTS
-# =============================================================================
-
 class _DummyDetector:
     detect_calls = 0
 
@@ -751,6 +660,9 @@ class _FakeNetwork:
 
     def start_session(self):
         return True
+
+    def get_task3_references(self):
+        return []
 
     def get_frame(self):
         return self.frame_results.pop(0)
@@ -797,7 +709,6 @@ class TestCompetitionLoopHardening(unittest.TestCase):
         Settings.LOOP_DELAY = 0.0
         Settings.FPS_REPORT_INTERVAL = 99999
         Settings.DEGRADE_FETCH_ONLY_ENABLED = False
-        # Resilience settings: yeterince büyük değerler ayarla
         Settings.CB_SESSION_MAX_TRANSIENT_SEC = 300.0
         Settings.CB_TRANSIENT_WINDOW_SEC = 60.0
         Settings.CB_TRANSIENT_MAX_EVENTS = 100
@@ -849,3 +760,34 @@ class TestCompetitionLoopHardening(unittest.TestCase):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(_FakeNetwork.send_calls, 1)
         self.assertEqual(self.summary_calls[-1]["kpi_counters"]["timeout_fetch"], 1)
+
+    def test_action_result_unexpected_type_handled_safely(self):
+        _FakeNetwork.frame_results = [
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.OK, frame_data={"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}, is_duplicate=False),
+            FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
+        ]
+        _FakeNetwork.timeout_snapshots = [{"fetch": 0, "image": 0, "submit": 0}] * 10
+        call_count = [0]
+
+        def mock_submit(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (None, False, 12345, 0)  # unexpected action_result
+            success_info = {
+                "frame_data": {"gps_health": 1},
+                "frame_id": "f2",
+                "detected_objects": [],
+                "frame_for_debug": None,
+                "position": (0.0, 0.0, 0.0),
+            }
+            return (None, False, (None, success_info), 0)
+
+        with patch("src.network.NetworkManager", _FakeNetwork), \
+             patch.object(main_module, "ObjectDetector", _DummyDetector), \
+             patch.object(main_module, "MovementEstimator", _DummyMovement), \
+             patch.object(main_module, "VisualOdometry", _DummyOdometry), \
+             patch.object(main_module, "_submit_competition_step", side_effect=mock_submit), \
+             patch.object(main_module, "_print_summary", side_effect=lambda *a, **kw: self.summary_calls.append(kw)):
+            main_module.run_competition(main_module.Logger("Test"))
+        self.assertEqual(call_count[0], 2)

@@ -1,9 +1,4 @@
-"""
-TEKNOFEST Havacılıkta Yapay Zeka - Ağ İletişim Katmanı (Network Layer)
-=======================================================================
-Sunucu ile tüm HTTP iletişimini yöneten sınıf.
-Retry mekanizması, hata yönetimi ve simülasyon modu desteği içerir.
-"""
+"""Sunucu HTTP iletişimi: frame al, sonuç gönder. Retry, circuit breaker, idempotency destekli."""
 
 import time
 import random
@@ -58,7 +53,7 @@ class NetworkManager:
         )
         self.log = Logger("Network")
         self.session = requests.Session()
-        self.session.verify = True  # Strict SSL verification
+        self.session.verify = True
         self._frame_counter: int = 0
         self._result_counter: int = 0
         self._sim_image_cache: Optional[np.ndarray] = None
@@ -75,10 +70,13 @@ class NetworkManager:
             "payload_clipped": 0,
         }
         self._clip_ratio_window: Deque[int] = deque(maxlen=100)
-        self._session_id: str = str(int(time.time()))  # Oturum benzersiz kimliği
+        self._session_id: str = str(int(time.time()))
+        self._task3_references: list = []
+
+    def get_task3_references(self) -> list:
+        return list(self._task3_references)
 
     def start_session(self) -> bool:
-        """Sunucu ile oturum başlatır."""
         if self.simulation_mode:
             self.log.success(f"[SIMULATION] Session started -> {self.base_url}")
             return True
@@ -104,7 +102,10 @@ class NetworkManager:
                                 self.log.info(f"Oturum: MAX_FRAMES güncellendi -> {Settings.MAX_FRAMES}")
                             refs = data.get("task3_references")
                             if refs and isinstance(refs, list):
+                                self._task3_references = refs
                                 self.log.info(f"Oturum: Sunucudan {len(refs)} Görev 3 referansı alındı.")
+                            else:
+                                self._task3_references = []
                     except ValueError:
                         pass
                         
@@ -127,7 +128,6 @@ class NetworkManager:
         return False
 
     def get_frame(self) -> FrameFetchResult:
-        """Sunucudan bir sonraki video karesinin meta verisini çeker."""
         if self.simulation_mode:
             return FrameFetchResult(
                 status=FrameFetchStatus.OK,
@@ -172,8 +172,9 @@ class NetworkManager:
                         is_duplicate=is_duplicate,
                     )
 
-                if response.status_code == 204:
-                    self.log.info("Video finished (204 No Content)")
+        if response.status_code == 204:
+            # Sunucu tüm kareleri bitirdi, oturum sonu
+            self.log.info("Video finished (204 No Content)")
                     return FrameFetchResult(
                         status=FrameFetchStatus.END_OF_STREAM,
                         http_status=204,
@@ -216,7 +217,6 @@ class NetworkManager:
         )
 
     def download_image(self, frame_data: Dict[str, Any]) -> Optional[np.ndarray]:
-        """Sunucudan veya yerel diskten görüntüyü indirir."""
         if self.simulation_mode:
             return self._load_simulation_image()
 
@@ -268,14 +268,11 @@ class NetworkManager:
         degrade: bool = False,
         detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> SendResultStatus:
-        """Tespit ve konum sonuçlarını TEKNOFEST taslak şemasına uyumlu JSON ile gönderir."""
         frame_key = self._normalize_frame_key(frame_id)
         if self._was_already_submitted(frame_key):
             self.log.warn(
                 f"Frame {frame_key}: duplicate submit prevented by idempotent client guard, sending gracefully."
             )
-            # Duplicate submit guard is safe to rely on idempotency. The server handles idempotency-key.
-
         raw_payload = self.build_competition_payload(
             frame_id=frame_id,
             detected_objects=detected_objects,
@@ -430,7 +427,6 @@ class NetworkManager:
         frame_shape: Optional[tuple] = None,
         detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> Dict[str, Any]:
-        """TEKNOFEST taslak şemasına uyumlu payload builder."""
         frame_data = frame_data or {}
         frame_h = frame_w = None
         if frame_shape and len(frame_shape) >= 2:
@@ -441,7 +437,7 @@ class NetworkManager:
         for obj in detected_objects:
             cls = str(obj.get("cls", ""))
             landing = str(obj.get("landing_status", "-1"))
-            motion = str(obj.get("motion_status", "-1"))
+            motion = str(obj.get(Settings.MOTION_FIELD_NAME, obj.get("motion_status", "-1")))
             if cls not in {"0", "1", "2", "3"}:
                 continue
             if landing not in {"-1", "0", "1"}:
@@ -459,11 +455,12 @@ class NetworkManager:
                     x1, y1, x2, y2, frame_w=frame_w, frame_h=frame_h
                 )
 
+            _cls_val = int(cls) if Settings.PAYLOAD_CLS_AS_INT else str(cls)
             clean_objects.append(
                 {
-                    "cls": int(cls),
+                    "cls": _cls_val,
                     "landing_status": int(landing),
-                    "motion_status": int(motion),
+                    Settings.MOTION_FIELD_NAME: int(motion),
                     "top_left_x": int(x1),
                     "top_left_y": int(y1),
                     "bottom_right_x": int(x2),
@@ -498,7 +495,6 @@ class NetworkManager:
     def _get_simulation_frame(self) -> Dict[str, Any]:
         frame_id = self._frame_counter
         self._frame_counter += 1
-        # Fallback to local dynamic image dataset or default black frame for pure network simulation
         return {
             "id": frame_id,
             "url": f"/simulation/frames/{frame_id}",
@@ -518,8 +514,6 @@ class NetworkManager:
         if self._sim_image_cache is not None:
             return self._sim_image_cache.copy()
 
-        # Generate a dummy 4K resolution image for simulation mode if no actual image path is provided
-        # This replaces the hardcoded `bus.jpg` single-image issue
         frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
         self.log.warn("Using generated blank image for network pure-simulation mode")
 
@@ -531,8 +525,6 @@ class NetworkManager:
             self.log.warn("Frame metadata is not dict")
             return False
 
-        # Şartname taslak alanları: id, url, image_url, ... + yarışma günü değişebilecek varyasyonlar.
-        # Uyum için frame_id'yi ortak dahili anahtar olarak normalize ediyoruz.
         frame_id = data.get("frame_id")
         if frame_id is None:
             frame_id = data.get("id")
@@ -546,7 +538,6 @@ class NetworkManager:
             return False
         data["frame_id"] = frame_id
 
-        # Görsel URL alanlarını normalize et
         if not data.get("frame_url") and data.get("image_url"):
             data["frame_url"] = data.get("image_url")
         if not data.get("image_url") and data.get("frame_url"):
@@ -654,7 +645,7 @@ class NetworkManager:
             if landing not in {"-1", "0", "1"}:
                 landing = "-1"
 
-            motion = str(obj.get("motion_status", "-1"))
+            motion = str(obj.get(Settings.MOTION_FIELD_NAME, obj.get("motion_status", "-1")))
             if motion not in {"-1", "0", "1"}:
                 motion = "-1"
 
@@ -667,11 +658,12 @@ class NetworkManager:
                     x1, y1, x2, y2, frame_w=frame_w, frame_h=frame_h
                 )
 
+            _cls_out = int(cls) if Settings.PAYLOAD_CLS_AS_INT else str(cls)
             normalized_objects.append(
                 {
-                    "cls": cls,
+                    "cls": _cls_out,
                     "landing_status": landing,
-                    "motion_status": motion,
+                    Settings.MOTION_FIELD_NAME: motion,
                     "top_left_x": x1,
                     "top_left_y": y1,
                     "bottom_right_x": x2,
@@ -690,7 +682,7 @@ class NetworkManager:
             {
                 "cls": obj["cls"],
                 "landing_status": obj["landing_status"],
-                "motion_status": obj["motion_status"],
+                Settings.MOTION_FIELD_NAME: obj.get(Settings.MOTION_FIELD_NAME, obj.get("motion_status", "-1")),
                 "top_left_x": obj["top_left_x"],
                 "top_left_y": obj["top_left_y"],
                 "bottom_right_x": obj["bottom_right_x"],
@@ -883,7 +875,6 @@ class NetworkManager:
 
     def _build_idempotency_key(self, frame_key: str) -> str:
         prefix = str(getattr(Settings, "IDEMPOTENCY_KEY_PREFIX", "aia")).strip() or "aia"
-        # Oturum + frame benzersiz idempotency anahtarı
         import uuid
         if not hasattr(self, "_run_uuid"):
             self._run_uuid = uuid.uuid4().hex[:8]

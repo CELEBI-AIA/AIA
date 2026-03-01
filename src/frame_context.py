@@ -4,10 +4,7 @@ from typing import Optional
 from config.settings import Settings
 
 class FrameContext:
-    """
-    Centralized object to compute common frame transformations (like grayscale)
-    and shared features (like optical flow) to eliminate redundant work across modules.
-    """
+    """Frame için ortak hesaplamalar (gray conversion). Detection, movement, localization tekrar hesaplamasın."""
     def __init__(self, frame: np.ndarray):
         self.frame = frame
         self._gray: Optional[np.ndarray] = None

@@ -1,25 +1,9 @@
-"""
-TEKNOFEST Havacılıkta Yapay Zeka — Veri Seti Yükleyici
-=======================================================
-VisDrone veri setlerini otomatik keşfeder ve iterator olarak sunar.
-
-Desteklenen veri setleri:
-    - VisDrone2019-DET-*  → Tekil fotoğraflar (Görev 1: Nesne Tespiti)
-    - VisDrone2019-VID-*  → Video sekansları (Görev 2: Pozisyon Kestirimi)
-
-Kullanım:
-    from src.data_loader import DatasetLoader
-
-    loader = DatasetLoader()
-    for frame_info in loader:
-        frame = frame_info["frame"]       # numpy BGR görüntüsü
-        idx   = frame_info["frame_idx"]   # kare numarası
-        # ...
-"""
+"""Veri seti yükleyici. datasets/ klasörünü recursive tarar, uzantıya göre görüntü bulur.
+VID: aynı klasördeki sıralı kareler. DET: tüm görüntülerden rastgele örnek."""
 
 import os
 import random
-from glob import glob
+from collections import defaultdict
 from typing import Dict, Iterator, List, Any, Optional
 
 import cv2
@@ -28,61 +12,61 @@ from config.settings import Settings
 from src.utils import Logger
 
 
+def _collect_images_recursive(root: str) -> List[str]:
+    """datasets/ altında recursive tara, sadece uzantıya göre eşleşen dosyaları topla."""
+    exts = tuple(e.lower() for e in Settings.IMAGE_EXTENSIONS)
+    paths: List[str] = []
+    for dirpath, _, filenames in os.walk(root):
+        for f in filenames:
+            if f.lower().endswith(exts):
+                paths.append(os.path.join(dirpath, f))
+    return sorted(paths)
+
+
+def _group_by_directory(paths: List[str]) -> Dict[str, List[str]]:
+    """Dosyaları üst klasörlerine göre grupla (VID sekans seçimi için)."""
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for p in paths:
+        parent = os.path.dirname(p)
+        groups[parent].append(p)
+    return dict(groups)
+
+
 class DatasetLoader:
-    """
-    VisDrone veri setlerini otomatik keşfeden ve sıralı kare sunan yükleyici.
+    """datasets/ recursive taranır, uzantıya göre (.jpg, .png vb.) tüm görüntüler bulunur."""
 
-    Başlatılırken datasets/ klasörünü tarar:
-        - VID veri seti bulunursa → rastgele bir sekans seçer (Görev 2: sıralı kareler)
-        - DET veri seti bulunursa → rastgele N fotoğraf seçer (Görev 1: tekil kareler)
-        - İkisi de varsa → VID tercih edilir (odometri testi daha değerli)
-
-    Iterator protocol destekler: `for frame_info in loader: ...`
-    """
-
-    def __init__(self, prefer_vid: bool = True) -> None:
-        """
-        DatasetLoader'ı başlatır — datasets/ klasörünü tarar.
-
-        Args:
-            prefer_vid: True ise VID veri seti öncelikli (Görev 2 testi).
-                        False ise DET veri seti öncelikli (Görev 1 testi).
-        """
+    def __init__(self, prefer_vid: bool = True, seed: Optional[int] = None, sequence: Optional[str] = None) -> None:
         self.log = Logger("DataLoader")
         self._frames: List[str] = []
         self._index: int = 0
-        self._mode: str = "unknown"  # "vid" veya "det"
+        self._mode: str = "unknown"
         self._sequence_name: str = ""
 
         datasets_dir = Settings.DATASETS_DIR
         if not os.path.isdir(datasets_dir):
             self.log.error(f"Veri seti dizini bulunamadı: {datasets_dir}")
-            self.log.error("  → 'datasets/' klasörünü oluşturup VisDrone verilerini koyun.")
+            self.log.error("  → 'datasets/' klasörünü oluşturup görüntü dosyalarını koyun.")
             return
 
-        self.log.info(f"Veri seti dizini taranıyor: {datasets_dir}")
+        self.log.info(f"Veri seti taranıyor (recursive): {datasets_dir}")
 
-        # ---- Veri Seti Keşfi ----
-        vid_dir = self._find_dataset(datasets_dir, "VID")
-        det_dir = self._find_dataset(datasets_dir, "DET")
+        all_images = _collect_images_recursive(datasets_dir)
 
-        if vid_dir:
-            self.log.success(f"VID veri seti bulundu: {os.path.basename(vid_dir)}")
-        if det_dir:
-            self.log.success(f"DET veri seti bulundu: {os.path.basename(det_dir)}")
-
-        if not vid_dir and not det_dir:
-            self.log.error("Hiçbir VisDrone veri seti bulunamadı!")
-            self.log.error("  → datasets/ klasörüne VisDrone2019-DET-* veya VID-* koyun.")
+        if not all_images:
+            self.log.error("Hiçbir görüntü bulunamadı!")
+            self.log.error(f"  → Desteklenen uzantılar: {Settings.IMAGE_EXTENSIONS}")
             return
 
-        # ---- Mod Seçimi ----
-        if prefer_vid and vid_dir:
-            self._load_video_sequence(vid_dir)
-        elif det_dir:
-            self._load_detection_images(det_dir)
-        elif vid_dir:
-            self._load_video_sequence(vid_dir)
+        self.log.success(f"Toplam {len(all_images)} görüntü bulundu")
+
+        if seed is not None:
+            random.seed(seed)
+            self.log.info(f"Deterministik mod: seed={seed}")
+
+        if prefer_vid:
+            self._load_video_sequence(all_images, sequence=sequence)
+        else:
+            self._load_detection_images(all_images)
 
         if self._frames:
             self.log.success(
@@ -91,144 +75,55 @@ class DatasetLoader:
                 f"{'Sekans: ' + self._sequence_name if self._sequence_name else ''}"
             )
 
-    # =========================================================================
-    #  VERİ SETİ KEŞFİ
-    # =========================================================================
+    def _load_video_sequence(self, all_images: List[str], sequence: Optional[str] = None) -> None:
+        """En çok görüntü içeren klasörü sekans olarak seç (veya sequence adıyla eşleşen)."""
+        groups = _group_by_directory(all_images)
+        # En az 2 görüntülü klasörleri al, içerik sayısına göre sırala
+        seq_candidates = [(k, sorted(v)) for k, v in groups.items() if len(v) >= 2]
+        seq_candidates.sort(key=lambda x: len(x[1]), reverse=True)
 
-    @staticmethod
-    def _find_dataset(datasets_dir: str, dataset_type: str) -> Optional[str]:
-        """
-        datasets/ içinde VisDrone veri setini arar.
-
-        Args:
-            datasets_dir: Ana veri seti dizini.
-            dataset_type: "VID" veya "DET".
-
-        Returns:
-            Bulunan veri seti dizini yolu, yoksa None.
-        """
-        pattern = os.path.join(datasets_dir, f"*VisDrone*{dataset_type}*")
-        matches = glob(pattern)
-        if matches:
-            return matches[0]
-        return None
-
-    # =========================================================================
-    #  VID YÜKLEME (Görev 2 — Sıralı Kareler)
-    # =========================================================================
-
-    def _load_video_sequence(self, vid_dir: str) -> None:
-        """
-        VID veri setinden rastgele bir sekans seçer ve sıralı kareleri listeler.
-
-        Args:
-            vid_dir: VisDrone VID veri seti kök dizini.
-        """
-        sequences_dir = os.path.join(vid_dir, "sequences")
-        if not os.path.isdir(sequences_dir):
-            self.log.error(f"'sequences' klasörü bulunamadı: {sequences_dir}")
+        if not seq_candidates:
+            self.log.warn("Sıralı sekans bulunamadı (en az 2 görüntülü klasör), DET moduna geçiliyor")
+            self._load_detection_images(all_images)
             return
 
-        # Mevcut sekansları listele
-        sequence_dirs = [
-            d for d in os.listdir(sequences_dir)
-            if os.path.isdir(os.path.join(sequences_dir, d))
-        ]
+        if sequence is not None:
+            chosen = None
+            for dirpath, paths in seq_candidates:
+                if os.path.basename(dirpath) == sequence:
+                    chosen = (dirpath, paths)
+                    break
+            if chosen is None:
+                self.log.warn(f"Sekans '{sequence}' bulunamadı, en büyük sekans seçiliyor")
+                chosen = seq_candidates[0]
+        else:
+            chosen = seq_candidates[0]
 
-        if not sequence_dirs:
-            self.log.error("Hiçbir video sekansı bulunamadı!")
-            return
-
-        # Rastgele bir sekans seç
-        chosen = random.choice(sequence_dirs)
-        self._sequence_name = chosen
-        seq_path = os.path.join(sequences_dir, chosen)
-
-        self.log.info(f"Sekans seçildi: {chosen} ({len(sequence_dirs)} seçenek arasından)")
-
-        # Kareleri sıralı listele
-        frames = sorted([
-            os.path.join(seq_path, f)
-            for f in os.listdir(seq_path)
-            if f.lower().endswith((".jpg", ".jpeg", ".png"))
-        ])
-
-        if not frames:
-            self.log.error(f"Sekansta görüntü bulunamadı: {seq_path}")
-            return
-
-        self._frames = frames
+        dirpath, paths = chosen
+        self._sequence_name = os.path.basename(dirpath)
+        self._frames = paths
         self._mode = "vid"
-        self.log.info(f"Sıralı kareler yüklendi: {len(frames)} adet")
+        self.log.info(f"Sekans: {self._sequence_name} ({len(paths)} kare)")
 
-    # =========================================================================
-    #  DET YÜKLEME (Görev 1 — Tekil Fotoğraflar)
-    # =========================================================================
-
-    def _load_detection_images(self, det_dir: str) -> None:
-        """
-        DET veri setinden rastgele N fotoğraf seçer.
-
-        Args:
-            det_dir: VisDrone DET veri seti kök dizini.
-        """
-        images_dir = os.path.join(det_dir, "images")
-        if not os.path.isdir(images_dir):
-            self.log.error(f"'images' klasörü bulunamadı: {images_dir}")
-            return
-
-        # Tüm görüntüleri listele
-        all_images = [
-            os.path.join(images_dir, f)
-            for f in os.listdir(images_dir)
-            if f.lower().endswith((".jpg", ".jpeg", ".png"))
-        ]
-
-        if not all_images:
-            self.log.error(f"Görüntü bulunamadı: {images_dir}")
-            return
-
-        # Rastgele örnekle
+    def _load_detection_images(self, all_images: List[str]) -> None:
+        """Tüm görüntülerden rastgele örnek al."""
         sample_size = min(Settings.SIMULATION_DET_SAMPLE_SIZE, len(all_images))
         selected = sorted(random.sample(all_images, sample_size))
 
         self._frames = selected
         self._mode = "det"
         self.log.info(
-            f"Rastgele {sample_size} fotoğraf seçildi "
-            f"(toplam {len(all_images)} içinden)"
+            f"Rastgele {sample_size} görüntü seçildi (toplam {len(all_images)} içinden)"
         )
 
-    # =========================================================================
-    #  ITERATOR PROTOCOL
-    # =========================================================================
-
     def __len__(self) -> int:
-        """Toplam kare sayısını döndürür."""
         return len(self._frames)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
-        """Iterator'ı sıfırlar ve döndürür."""
         self._index = 0
         return self
 
     def __next__(self) -> Dict[str, Any]:
-        """
-        Sıradaki kareyi yükler ve döndürür.
-
-        Returns:
-            Dict:
-                - "frame": numpy BGR görüntüsü
-                - "frame_idx": kare numarası (0-based)
-                - "filename": dosya adı
-                - "mode": "vid" veya "det"
-                - "gps_health": simüle GPS sağlığı (VID: alternating, DET: 1)
-
-        Raises:
-            StopIteration: Tüm kareler işlendiğinde.
-        """
-        # Bozuk görselleri atla — recursive __next__ yerine döngü
-        # (çok sayıda bozuk dosya olursa RecursionError'dan kaçınır)
         while self._index < len(self._frames):
             frame_path = self._frames[self._index]
             frame = cv2.imread(frame_path)
@@ -238,17 +133,11 @@ class DatasetLoader:
                 self._index += 1
                 continue
 
-            # GPS sağlığını simüle et — Şartname Bölüm 3.2.2:
-            # İlk 1 dakika (450 kare @ 7.5fps) GPS kesinlikle sağlıklı.
-            # Son 4 dakikada (1800 kare) sağlıksız duruma geçebilir.
-            # DET modunda: her zaman GPS sağlıklı (tekil kareler)
+            # GPS simülasyonu (şartname 3.2.2): ilk 1 dk sağlıklı, sonra %33 sağlıksız
             if self._mode == "vid":
                 if self._index < 450:
-                    # İlk 1 dakika — kesinlikle sağlıklı
                     gps_health = 1
                 else:
-                    # 450+ kare: GPS simülasyonu (rastgele sağlıksız)
-                    # %33 olasılıkla sağlıksız — şartname "geçebilir" der
                     gps_health = 0 if random.random() < 0.33 else 1
             else:
                 gps_health = 1
@@ -259,8 +148,6 @@ class DatasetLoader:
                 "filename": os.path.basename(frame_path),
                 "mode": self._mode,
                 "gps_health": gps_health,
-                # Sunucu formatını taklit et — localization.py beklediği key isimleri
-                # Şartname: GPS sağlıksız olduğunda translation = "NaN"
                 "server_data": {
                     "frame_id": self._index,
                     "gps_health": gps_health,
@@ -278,10 +165,8 @@ class DatasetLoader:
 
     @property
     def mode(self) -> str:
-        """Aktif veri seti modunu döndürür: 'vid' veya 'det'."""
         return self._mode
 
     @property
     def is_ready(self) -> bool:
-        """Veri seti başarıyla yüklenmiş mi?"""
         return len(self._frames) > 0

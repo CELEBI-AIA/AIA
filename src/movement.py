@@ -1,6 +1,5 @@
-"""
-Taşıt hareketlilik (movement_status) kestirimi için hafif takip modülü.
-"""
+"""Taşıt hareketlilik (motion_status): 1=hareketli, 0=sabit, -1=taşıt değil.
+Merkez takibi + kamera kayması kompanzasyonu ile yer değiştirme hesaplanır."""
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,14 +20,7 @@ class _Track:
 
 
 class MovementEstimator:
-    """
-    Basit merkez-nokta takibi ile taşıtların hareket durumunu belirler.
-
-    motion_status:
-        - "1": Hareketli
-        - "0": Hareketsiz
-        - "-1": Taşıt değil
-    """
+    """Merkez takibi ile taşıt hareket durumu (1=hareketli, 0=sabit, -1=taşıt değil)."""
 
     def __init__(self) -> None:
         self._tracks: Dict[int, _Track] = {}
@@ -58,17 +50,14 @@ class MovementEstimator:
         self._cam_total_x += cam_dx
         self._cam_total_y += cam_dy
 
-        # Kamera kayması birikimini sınırla (sayısal hassasiyet)
         _CAM_TOTAL_CAP = 1e6
         self._cam_total_x = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_x))
         self._cam_total_y = max(-_CAM_TOTAL_CAP, min(_CAM_TOTAL_CAP, self._cam_total_y))
 
-        # Donmuş kare: piksel farkı düşükse history güncellenmez
         self._is_frozen_frame = self._frame_diff < Settings.FROZEN_FRAME_DIFF_THRESHOLD
 
         vehicles: List[Tuple[int, Dict]] = []
         for idx, det in enumerate(detections):
-            # Taşıt seçimi: cls veya cls_int (str/int uyumlu)
             cls_val = det.get("cls_int", det.get("cls"))
             if cls_val == Settings.CLASS_TASIT or (isinstance(cls_val, str) and cls_val == "0"):
                 vehicles.append((idx, det))
@@ -91,8 +80,6 @@ class MovementEstimator:
             track = self._tracks[track_id]
             cx, cy = centers[idx]
 
-            # Frozen frame'lerde history'ye ekleme yapma —
-            # donmuş kareler gerçek motion verisini bozmasın
             if not self._is_frozen_frame:
                 track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
             track.missed = 0
@@ -103,22 +90,12 @@ class MovementEstimator:
         return detections
 
     def _status(self, history: Deque[Tuple[float, float, float, float]]) -> str:
-        """
-        Sliding window max displacement ile hareket durumu belirler.
-
-        MIN_HISTORY uzunluğundaki alt-pencereleri kaydırarak, herhangi bir
-        alt-pencerede kamera-kompanse edilmiş yer değiştirme eşiği aşıyorsa
-        "1" (hareketli) döner. İlk-son'dan farklı olarak, yeni başlayan
-        veya yeni duran hareketleri de yakalar.
-
-        Threshold, çözünürlüğe göre ölçeklenir (4K'da 2×, 1080p'de 1×).
-        """
+        """Sliding window: kamera-kompanze edilmiş yer değiştirme > threshold → hareketli"""
         n = len(history)
         scale = self._frame_width / Settings.MOVEMENT_THRESHOLD_REF_WIDTH
         threshold = Settings.MOVEMENT_THRESHOLD_PX * scale
         
         if n < Settings.MOVEMENT_MIN_HISTORY:
-            # Kısa history ile erken hareket tahmini (n>=2)
             if n >= 2:
                 x0, y0, cam0_x, cam0_y = history[0]
                 x1, y1, cam1_x, cam1_y = history[-1]
@@ -174,7 +151,6 @@ class MovementEstimator:
 
     def _age_tracks(self, matched_track_ids: set) -> None:
         to_delete: List[int] = []
-        # Döngü sırasında sözlük değişmesin
         for track_id in list(self._tracks.keys()):
             track = self._tracks[track_id]
             if track_id not in matched_track_ids:
@@ -182,7 +158,7 @@ class MovementEstimator:
                 if track.missed > Settings.MOVEMENT_MAX_MISSED_FRAMES:
                     to_delete.append(track_id)
         for track_id in to_delete:
-            self._tracks[track_id].history.clear()  # Belleği temizle
+            self._tracks[track_id].history.clear()
             del self._tracks[track_id]
 
     def _create_track(self, center: Tuple[float, float]) -> int:
@@ -202,14 +178,10 @@ class MovementEstimator:
         )
 
     def _estimate_camera_shift(self, frame_ctx: "FrameContext") -> Tuple[float, float]:
-        """
-        Frame-to-frame global kamera kaymasını medyan optik akış ile tahmin eder.
-        Ayrıca piksel-bazlı frame farkını hesaplar (frozen frame tespiti için).
-        """
         if isinstance(frame_ctx, np.ndarray):
-            gray = cv2.cvtColor(frame_ctx, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = frame_ctx.gray
+            from src.frame_context import FrameContext
+            frame_ctx = FrameContext(frame_ctx)
+        gray = frame_ctx.gray
         if self._prev_gray is None:
             self._prev_gray = gray
             self._prev_points = cv2.goodFeaturesToTrack(
@@ -221,7 +193,6 @@ class MovementEstimator:
             self._frame_diff = float("inf")
             return 0.0, 0.0
 
-        # Piksel-bazlı frame farkı — prev_gray güncellenmeden ÖNCE hesaplanmalı
         self._frame_diff = float(cv2.absdiff(self._prev_gray, gray).mean())
 
         if self._prev_points is None or len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES:
@@ -281,7 +252,6 @@ class MovementEstimator:
         dx = deltas[:, 0]
         dy = deltas[:, 1]
 
-        # Percentile kırpma ile outlier etkisini azalt.
         low, high = 10, 90
         dx_l, dx_h = np.percentile(dx, [low, high])
         dy_l, dy_h = np.percentile(dy, [low, high])
@@ -302,7 +272,6 @@ class MovementEstimator:
                 qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
                 minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
             )
-            # goodFeaturesToTrack None dönebilir — sonraki frame için güvenli
             if self._prev_points is None:
                 self._prev_points = None  # Açık atama, sonraki frame L210'da yakalar
 

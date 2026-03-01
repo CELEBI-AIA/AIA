@@ -1,21 +1,5 @@
-"""
-TEKNOFEST Havacılıkta Yapay Zeka - Nesne Tespit Modülü (Görev 1)
-=================================================================
-YOLOv8 tabanlı nesne tespiti ve İniş Uygunluğu (Landing Status) mantığı.
-
-İniş Uygunluğu Algoritması (teknofest_context.md Bölüm 4.6):
-    1. Taşıt (0) ve İnsan (1) → landing_status = "-1" (iniş alanı değil)
-    2. UAP (2) ve UAİ (3) için:
-       a. Bounding box kadrajın kenarına değiyorsa → "0" (alan tam görünmüyor)
-       b. Üzerinde herhangi bir nesne (Taşıt/İnsan/bilinmeyen) varsa → "0"
-       c. Perspektif proximity zone içinde yakın nesne varsa → "0"
-       d. Yukarıdaki koşulların hiçbiri yoksa → "1" (uygun)
-
-Kullanım:
-    from src.detection import ObjectDetector
-    detector = ObjectDetector()
-    detections = detector.detect(frame)
-"""
+"""YOLOv8 nesne tespiti + iniş uygunluğu (UAP/UAİ).
+Model COCO/VisDrone vb. eğitilmiş olabilir; sınıflar TEKNOFEST (0,1,2,3) formatına map edilir."""
 
 import os
 import unicodedata
@@ -32,33 +16,15 @@ from src.utils import Logger
 
 
 class ObjectDetector:
-    """
-    YOLOv8 tabanlı nesne tespit sınıfı.
-
-    CUDA üzerinde çalışır, model sınıflarını TEKNOFEST sınıflarına dönüştürür
-    ve UAP/UAİ alanları için İniş Uygunluğu hesabı yapar.
-
-    Attributes:
-        model: YOLOv8 model nesnesi.
-        device: Kullanılan cihaz ('cuda' veya 'cpu').
-        log: Logger nesnesi.
-    """
+    """YOLOv8 tespit, TEKNOFEST sınıf eşlemesi ve iniş uygunluğu."""
 
     def __init__(self) -> None:
-        """
-        YOLOv8 modelini yükler ve CUDA cihazına taşır.
-
-        Model dosyası Settings.MODEL_PATH'ten yerel diskten yüklenir.
-        CUDA kullanılamıyorsa CPU'ya düşer ve uyarı verir.
-        İlk kare gecikmesini önlemek için warmup inference yapılır.
-        """
         self.log = Logger("Detector")
         self._frame_count: int = 0
         self._use_half: bool = False
         self._class_map_mode: str = "unknown"
         self._model_class_map: Dict[int, int] = {}
 
-        # Cihaz Seçimi
         if Settings.DEVICE == "cuda" and torch.cuda.is_available():
             self.device = "cuda"
             gpu_name = torch.cuda.get_device_name(0)
@@ -68,7 +34,6 @@ class ObjectDetector:
             self.device = "cpu"
             self.log.warn("CUDA bulunamadı! CPU modunda çalışılıyor (yavaş olacak)")
 
-        # Model Yükleme (Yerel Diskten - OFFLINE MODE)
         self.log.info(f"YOLOv8 modeli yükleniyor: {Settings.MODEL_PATH}")
         try:
             if not os.path.exists(Settings.MODEL_PATH):
@@ -80,7 +45,6 @@ class ObjectDetector:
             self.model.to(self.device)
             self._configure_class_mapping()
 
-            # FP16 Yarı Hassasiyet — GPU'da ~%40 hız artışı
             if self.device == "cuda" and Settings.HALF_PRECISION:
                 self._use_half = True
                 self.log.info("FP16 (Half Precision) aktif — hız optimizasyonu ✓")
@@ -90,10 +54,8 @@ class ObjectDetector:
             self.log.error(f"Model yükleme hatası: {e}")
             raise RuntimeError(f"YOLOv8 modeli yüklenemedi: {e}")
 
-        # Warmup — ilk kare gecikmesini önle
         self._warmup()
 
-        # CLAHE nesnesi (ön-işleme için)
         if Settings.CLAHE_ENABLED:
             self._clahe = cv2.createCLAHE(
                 clipLimit=Settings.CLAHE_CLIP_LIMIT,
@@ -107,12 +69,6 @@ class ObjectDetector:
             self._clahe = None
 
     def _warmup(self) -> None:
-        """
-        Model ısınması — GPU belleğini hazırlar ve ilk kare gecikmesini önler.
-
-        Dummy (boş) bir tensor ile birkaç inference yaparak CUDA kernel'larını
-        ve cuDNN autotuner'ı önceden başlatır.
-        """
         self.log.info(f"Model ısınması başlıyor ({Settings.WARMUP_ITERATIONS} iterasyon)...")
         try:
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -156,6 +112,7 @@ class ObjectDetector:
         return -1
 
     def _configure_class_mapping(self) -> None:
+        """Model sınıf isimlerine göre COCO/VisDrone/resmi eşleme seçer."""
         names_raw = getattr(self.model, "names", {})
         items: List[Tuple[int, str]] = []
         if isinstance(names_raw, dict):
@@ -198,46 +155,19 @@ class ObjectDetector:
     def _map_model_class_to_teknofest(self, model_cls_id: int) -> int:
         return self._model_class_map.get(model_cls_id, -1)
 
-    # =========================================================================
-    #  ANA TESPİT FONKSİYONU
-    # =========================================================================
-
     def detect(self, frame: np.ndarray) -> List[Dict]:
-        """
-        Bir video karesinde nesne tespiti yapar ve sonuçları TEKNOFEST formatında döndürür.
-
-        SAHI aktifse:
-            1. Full-frame inference (büyük nesneler)
-            2. Sliced inference (küçük nesneler — tepeden görünüm)
-            3. NMS ile birleştirme
-
-        Args:
-            frame: BGR formatlı OpenCV görüntüsü (numpy array).
-
-        Returns:
-            Tespit edilen nesnelerin listesi (TEKNOFEST formatında dict'ler).
-        """
         try:
-            # ---- 0) Ön-İşleme (CLAHE + Sharpening) ----
             processed = self._preprocess(frame)
-
-            # ---- 1) Inference (SAHI veya Standard) ----
             if Settings.SAHI_ENABLED:
                 raw_detections = self._sahi_detect(processed)
             else:
                 raw_detections = self._standard_inference(processed)
-
-            # ---- 2) Post-Processing Filtreleri ----
             raw_detections = self._post_filter(raw_detections)
-            raw_detections = self._suppress_rider_persons(raw_detections)
-
-            # ---- 3) İniş Uygunluğu Hesaplaması ----
             frame_h, frame_w = frame.shape[:2]
             final_detections = self._determine_landing_status(
                 raw_detections, frame_w, frame_h
             )
 
-            # Yarışma formatı: cls_int=-1 (bilinmeyen) nesneler çıktıya dahil edilmez
             output: List[Dict] = []
             for det in final_detections:
                 if det["cls_int"] == -1:
@@ -278,12 +208,7 @@ class ObjectDetector:
             self.log.error(f"Tespit hatası: {e}")
             return []
 
-    # =========================================================================
-    #  STANDARD INFERENCE (Tek Geçiş)
-    # =========================================================================
-
     def _standard_inference(self, frame: np.ndarray) -> List[Dict]:
-        """Standart tam-kare inference — büyük nesneler için."""
         with torch.no_grad():
             results = self.model.predict(
                 source=frame,
@@ -300,46 +225,19 @@ class ObjectDetector:
             )
         return self._parse_results(results)
 
-    # =========================================================================
-    #  SAHI — Slicing Aided Hyper Inference
-    # =========================================================================
-
     def _sahi_detect(self, frame: np.ndarray) -> List[Dict]:
-        """
-        SAHI: Tam-kare + parçalı inference → NMS ile birleştirme.
-
-        Neden gerekli:
-            Drone 50m'den çekerken araçlar ~30px, insanlar ~15px.
-            1280px inference'ta bile çok küçükler.
-            640×640 parçalara bölünce, aynı araç ~120px olur → tespit edilir.
-
-        Strateji:
-            1) Full-frame @ INFERENCE_SIZE → büyük nesneleri yakalar
-            2) Sliced @ SAHI_SLICE_SIZE → küçük nesneleri yakalar
-            3) Tüm sonuçları NMS ile birleştir → duplikasyonu önle
-        """
+        # Full-frame + parçalı inference birleştir, NMS ile duplikasyonu temizle
         all_detections: List[Dict] = []
-
-        # ---- 1) Full-frame inference (büyük nesneler) ----
         full_dets = self._standard_inference(frame)
         all_detections.extend(full_dets)
-
-        # ---- 2) Sliced inference (küçük nesneler) ----
         slice_dets = self._sliced_inference(frame)
         all_detections.extend(slice_dets)
-
-        # ---- 3) NMS ile birleştirme (duplikasyonu önle) ----
         if len(all_detections) > 0:
             all_detections = self._merge_detections_nms(all_detections)
 
         return all_detections
 
     def _sliced_inference(self, frame: np.ndarray) -> List[Dict]:
-        """
-        Görüntüyü örtüşen parçalara böler ve her parçada inference yapar.
-
-        Koordinatlar orijinal görüntü koordinatlarına geri dönüştürülür.
-        """
         h, w = frame.shape[:2]
         slice_size = Settings.SAHI_SLICE_SIZE
         overlap = Settings.SAHI_OVERLAP_RATIO
@@ -350,19 +248,15 @@ class ObjectDetector:
         with torch.no_grad():
             for y_start in range(0, h, step):
                 for x_start in range(0, w, step):
-                    # Parça sınırlarını hesapla
                     x_end = min(x_start + slice_size, w)
                     y_end = min(y_start + slice_size, h)
 
-                    # Çok küçük kenar parçalarını atla
                     if (x_end - x_start) < slice_size // 2 or \
                        (y_end - y_start) < slice_size // 2:
                         continue
 
-                    # Parçayı kes
                     tile = frame[y_start:y_end, x_start:x_end]
 
-                    # Inference (parça boyutunda, tile'ın kendi boyutu)
                     results = self.model.predict(
                         source=tile,
                         imgsz=slice_size,
@@ -376,7 +270,6 @@ class ObjectDetector:
                         max_det=Settings.MAX_DETECTIONS,
                     )
 
-                    # Koordinatları orijinal frame'e dönüştür
                     tile_dets = self._parse_results(results)
                     for det in tile_dets:
                         det["top_left_x"] += x_start
@@ -393,17 +286,7 @@ class ObjectDetector:
 
         return all_slice_dets
 
-    # =========================================================================
-    #  YARDIMCI METODLAR
-    # =========================================================================
-
     def _parse_results(self, results) -> List[Dict]:
-        """
-        YOLO sonuçlarını etkin sınıf eşleme moduna göre parse eder.
-
-        Haritalanamayan sınıflar (tf_id == -1) UNKNOWN_OBJECTS_AS_OBSTACLES
-        aktifken dahili engel olarak tutulur; TEKNOFEST çıktısına dahil edilmez.
-        """
         detections: List[Dict] = []
         for result in results:
             if result.boxes is None:
@@ -418,9 +301,6 @@ class ObjectDetector:
                 )
 
                 tf_id = self._map_model_class_to_teknofest(model_cls_id)
-
-                if tf_id == -1 and not Settings.UNKNOWN_OBJECTS_AS_OBSTACLES:
-                    continue
 
                 detections.append({
                     "cls_int": tf_id,
@@ -437,21 +317,12 @@ class ObjectDetector:
 
     @staticmethod
     def _merge_detections_nms(detections: List[Dict]) -> List[Dict]:
-        """
-        Birden fazla kaynaktan gelen tespitleri NMS ile birleştirir.
-
-        Full-frame ve sliced sonuçlarda aynı nesne birden fazla kez
-        tespit edilebilir. Bu metod IoU tabanlı NMS ile duplikasyonları kaldırır.
-        En yüksek confidence'lı tespit korunur.
-        """
         if not detections:
             return detections
 
-        # NumPy array'lere dönüştür (NMS için)
         boxes = np.array([d["bbox"] for d in detections], dtype=np.float32)
         scores = np.array([d["confidence"] for d in detections], dtype=np.float32)
 
-        # Sınıf bazlı NMS (farklı sınıflar birbirini bastırmasın)
         class_ids = np.array([d["cls_int"] for d in detections], dtype=np.int32)
         unique_classes = np.unique(class_ids)
 
@@ -466,29 +337,18 @@ class ObjectDetector:
             cls_boxes = boxes[cls_indices]
             cls_scores = scores[cls_indices]
 
-            # Greedy NMS
             nms_keep = ObjectDetector._nms_greedy(
                 cls_boxes, cls_scores, Settings.SAHI_MERGE_IOU
             )
-            # NMS sonrası indeksleri güncelle
             nms_indices = cls_indices[nms_keep]
             keep_indices.extend(nms_indices.tolist())
 
         nms_results = [detections[i] for i in keep_indices]
 
-        # 2. Adım: Containment Suppression (İç içe geçen kutuları temizle)
-        # Örn: Bacak (küçük kutu) Vücut (büyük kutu) içindeyse, küçüğü sil
         return ObjectDetector._suppress_contained(nms_results)
 
     @staticmethod
     def _suppress_contained(detections: List[Dict], threshold: float = 0.85) -> List[Dict]:
-        """
-        Bir kutu diğerinin içindeyse (veya büyük oranda örtüşüyorsa) küçüğü siler.
-        Standart NMS'in aksine, IoU yerine 'Intersection over Small Area' kullanır.
-
-        UAP/UAİ sınıfları için LANDING_ZONE_CONTAINMENT_IOU eşiği kullanılır —
-        SAHI duplikasyonundan gelen iniş alanı çiftlerini daha agresif temizler.
-        """
         if not detections:
             return []
 
@@ -534,8 +394,6 @@ class ObjectDetector:
                 else threshold
             )
 
-            # UAP/UAİ üzerindeki engeller silinmez (landing_status için gerekli)
-            
             suppress_mask = np.zeros(len(valid_remaining), dtype=bool)
 
             for idx_b, b_idx in enumerate(valid_remaining):
@@ -543,7 +401,6 @@ class ObjectDetector:
                     cls_a = cls_ints[i]
                     cls_b = cls_ints[b_idx]
                     
-                    # A iniş alanıysa ve B iniş alanı değilse -> Silme (Engel olarak kalsın)
                     if cls_a in landing_zone_ids and cls_b not in landing_zone_ids:
                         continue
                     
@@ -557,7 +414,6 @@ class ObjectDetector:
     def _nms_greedy(
         boxes: np.ndarray, scores: np.ndarray, iou_threshold: float
     ) -> List[int]:
-        """Greedy NMS implementasyonu (sınıf-agnostik)."""
         x1 = boxes[:, 0]
         y1 = boxes[:, 1]
         x2 = boxes[:, 2]
@@ -574,7 +430,6 @@ class ObjectDetector:
             if order.size == 1:
                 break
 
-            # IoU hesapla
             xx1 = np.maximum(x1[i], x1[order[1:]])
             yy1 = np.maximum(y1[i], y1[order[1:]])
             xx2 = np.minimum(x2[i], x2[order[1:]])
@@ -587,73 +442,29 @@ class ObjectDetector:
             union = areas[i] + areas[order[1:]] - intersection
             iou = intersection / np.maximum(union, 1e-6)
 
-            # IoU düşük olanları koru
             remaining = np.where(iou <= iou_threshold)[0]
             order = order[remaining + 1]
 
         return keep
 
-    # =========================================================================
-    #  ÖN-İŞLEME (PREPROCESSING)
-    # =========================================================================
-
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Drone görüntülerini tespit öncesi iyileştirir.
-
-        İşlemler:
-            1. CLAHE: Adaptif kontrast iyileştirme (LAB renk uzayında L kanalına)
-               → karanlık/gölgeli bölgelerdeki insanları ortaya çıkarır
-            2. Sharpening: Hafif keskinleştirme (unsharp mask)
-               → uzaktaki küçük nesnelerin kenarlarını belirginleştirir
-
-        Args:
-            frame: BGR formatlı OpenCV görüntüsü.
-
-        Returns:
-            İyileştirilmiş BGR görüntüsü.
-        """
         result = frame
-
-        # ---- CLAHE Kontrast İyileştirme ----
         if self._clahe is not None:
-            # LAB renk uzayına çevir (L = parlaklık kanayı)
             lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
             l_channel, a_channel, b_channel = cv2.split(lab)
 
-            # Sadece L (parlaklık) kanalına CLAHE uygula
             l_enhanced = self._clahe.apply(l_channel)
 
-            # Kanalları birleştir ve BGR'ye dön
             lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
             result = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
 
-        # ---- Hafif Sharpening (Unsharp Mask) ----
-        # Gaussian bulanıklaştır → orijinalden çıkar → ekle
         blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=2.0)
         result = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
 
         return result
 
-    # =========================================================================
-    #  POST-PROCESSING FİLTRELERİ
-    # =========================================================================
-
     @staticmethod
     def _post_filter(detections: List[Dict]) -> List[Dict]:
-        """
-        False positive'leri azaltmak için tespit sonrası filtreler.
-
-        Filtreler:
-            1. Minimum bbox boyutu: Çok küçük tespitler (< MIN_BBOX_SIZE px) → kaldır
-            2. Aşırı aspect ratio: 6:1'den fazla uzun/geniş → kaldır (artefakt)
-
-        Args:
-            detections: Ham tespit listesi.
-
-        Returns:
-            Filtrelenmiş tespit listesi.
-        """
         filtered: List[Dict] = []
         min_size = Settings.MIN_BBOX_SIZE
 
@@ -662,17 +473,12 @@ class ObjectDetector:
             w = x2 - x1
             h = y2 - y1
 
-            # Minimum boyut kontrolü
             if w < min_size or h < min_size:
                 continue
 
-            # Maksimum boyut kontrolü (Binaları/çatıları elemek için)
-            # 50m irtifada 300px'den büyük bir şey araç olamaz (Otobüs bile ~200px)
             if w > Settings.MAX_BBOX_SIZE or h > Settings.MAX_BBOX_SIZE:
                 continue
 
-            # Aşırı aspect ratio kontrolü (Aşırı ince uzun/geniş objeleri (örn: direk) filtrele)
-            # Düşürüldü: 4.5. Bir araç veya insan üstten bakışta genelde 4.5'i geçmez. Direkler 10:1 vb olur.
             aspect = max(w, h) / max(min(w, h), 1)
             if aspect > 4.5:
                 continue
@@ -681,60 +487,7 @@ class ObjectDetector:
 
         return filtered
 
-    @staticmethod
-    def _suppress_rider_persons(detections: List[Dict]) -> List[Dict]:
-        """
-        Bisiklet/motosiklet üzerindeki sürücüyü insan sınıfından suppress eder.
 
-        Şartnameye göre: bisiklet/motosiklet sürücüsü "insan" olarak etiketlenmemelidir.
-        """
-        if not Settings.RIDER_SUPPRESS_ENABLED or not detections:
-            return detections
-
-        vehicles: List[Dict] = []
-        persons: List[Dict] = []
-        others: List[Dict] = []
-
-        # Since the custom fine-tuned model directly predicts "insan" and "tasit",
-        # the `source_cls_id` logic mapped to COCO is likely incorrect or unused. 
-        # So we evaluate all tasit boxes to suppress humans highly overlapping with them.
-        for det in detections:
-            cls_int = int(det.get("cls_int", -1))
-            if cls_int == Settings.CLASS_TASIT:
-                vehicles.append(det)
-            elif cls_int == Settings.CLASS_INSAN:
-                persons.append(det)
-            else:
-                others.append(det)
-
-        if not persons or not vehicles:
-            return detections
-
-        p_boxes = np.array([p["bbox"] for p in persons])
-        v_boxes = np.array([v["bbox"] for v in vehicles])
-
-        inter_x1 = np.maximum(p_boxes[:, None, 0], v_boxes[None, :, 0])
-        inter_y1 = np.maximum(p_boxes[:, None, 1], v_boxes[None, :, 1])
-        inter_x2 = np.minimum(p_boxes[:, None, 2], v_boxes[None, :, 2])
-        inter_y2 = np.minimum(p_boxes[:, None, 3], v_boxes[None, :, 3])
-
-        inter_w = np.maximum(0.0, inter_x2 - inter_x1)
-        inter_h = np.maximum(0.0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-
-        p_area = np.maximum((p_boxes[:, 2] - p_boxes[:, 0]) * (p_boxes[:, 3] - p_boxes[:, 1]), 1e-6)
-        v_area = np.maximum((v_boxes[:, 2] - v_boxes[:, 0]) * (v_boxes[:, 3] - v_boxes[:, 1]), 1e-6)
-
-        overlap = inter_area / p_area[:, None]
-        union = p_area[:, None] + v_area[None, :] - inter_area
-        iou = inter_area / np.maximum(union, 1e-6)
-
-        suppress_mask = (overlap >= Settings.RIDER_OVERLAP_THRESHOLD) | (iou >= Settings.RIDER_IOU_THRESHOLD)
-        suppress_persons = np.any(suppress_mask, axis=1)
-
-        kept_persons = [p for i, p in enumerate(persons) if not suppress_persons[i]]
-
-        return others + vehicles + kept_persons
 
     @staticmethod
     def _bbox_iou(
@@ -767,33 +520,10 @@ class ObjectDetector:
         frame_w: int,
         frame_h: int,
     ) -> List[Dict]:
-        """
-        Tespit edilen nesneler için iniş durumunu belirler.
-
-        Mantık (teknofest_context.md - Bölüm 4.6):
-            - Taşıt (0) ve İnsan (1): landing_status = "-1" (sabit)
-            - Bilinmeyen nesneler (cls_int == -1): landing_status = "-1" (dahili)
-            - UAP (2) ve UAİ (3):
-                a) bbox kadrajın kenarına değiyorsa → "0" (alan tam görünmüyor)
-                b) Üzerinde herhangi bir nesne varsa (Taşıt/İnsan/unknown) → "0"
-                c) Perspektif proximity zone içinde yakın nesne varsa → "0"
-                d) Yukarıdaki koşullar sağlanmıyorsa → "1" (uygun)
-
-        Engel kontrolünde IoU değil "intersection-over-area-of-landing-zone"
-        kullanılır. Şartname "alanın üzerinde nesne var mı" soruyor — küçük
-        bir insan büyük iniş alanının üzerinde olsa IoU düşük çıkar ama
-        yine de uygun değildir.
-
-        Args:
-            detections: Ham tespit listesi (bbox alanı dahil).
-            frame_w: Görüntü genişliği (piksel).
-            frame_h: Görüntü yüksekliği (piksel).
-
-        Returns:
-            landing_status alanı doldurulmuş tespit listesi.
-        """
-        # UAP/UAİ dışındaki TÜM nesneleri engel olarak topla
+        """Şartname 4.6: Taşıt/İnsan=-1, UAP/UAİ için kenar/engel/proximity kontrolü → 0 veya 1"""
+        # UAP/UAİ dışındaki tüm nesneler engel; IoU yerine intersection/landing_area kullanılır
         # Şartname: "tespit edilen veya tespit edilemeyen herhangi bir nesne"
+        # UNKNOWN_OBJECTS_AS_OBSTACLES şartname gereği her zaman True kabul edilir.
         landing_zone_ids = (Settings.CLASS_UAP, Settings.CLASS_UAI)
         obstacles: List[Tuple[float, float, float, float]] = []
         for det in detections:
@@ -809,17 +539,11 @@ class ObjectDetector:
             elif cls_id in landing_zone_ids:
                 bbox = det["bbox"]
 
-                # (a) Alan kadrajın kenarına değiyor mu? (clamp öncesi ham koordinatlar kullanılır)
-                if getattr(self, "_is_touching_edge_raw", None):
-                   if self._is_touching_edge_raw(bbox, frame_w, frame_h):
-                       det["landing_status"] = Settings.LANDING_NOT_SUITABLE
-                       self.log.debug("  UAP/UAİ kenar temas → uygun değil")
-                       continue
-                else: 
-                   if self._is_touching_edge(bbox, frame_w, frame_h):
-                       det["landing_status"] = Settings.LANDING_NOT_SUITABLE
-                       self.log.debug("  UAP/UAİ kenar temas → uygun değil")
-                       continue
+                # (a) Alan kadrajın kenarına değiyor mu? EDGE_MARGIN_RATIO ile çözünürlüğe orantılı.
+                if self._is_touching_edge(bbox, frame_w, frame_h):
+                    det["landing_status"] = Settings.LANDING_NOT_SUITABLE
+                    self.log.debug("  UAP/UAİ kenar temas → uygun değil")
+                    continue
 
                 # (b) Doğrudan engel örtüşme kontrolü
                 has_obstacle = self._check_obstacle_overlap(
@@ -955,46 +679,6 @@ class ObjectDetector:
             return 0.0
 
         return inter_area / landing_area
-
-    @staticmethod
-    def _is_touching_edge(
-        bbox: Tuple[float, float, float, float],
-        frame_w: int,
-        frame_h: int,
-    ) -> bool:
-        """
-        Gelen bbox'un kadrajın kenarına değip değmediğini kontrol eder
-        (sadece alt/sol/sağ - üst kenar nadiren problem).
-        """
-        x1, y1, x2, y2 = bbox
-        
-        margin_x = frame_w * Settings.EDGE_MARGIN_RATIO
-        margin_y = frame_h * Settings.EDGE_MARGIN_RATIO
-        
-        if x1 <= margin_x or y1 <= margin_y:
-            return True
-        if x2 >= frame_w - margin_x or y2 >= frame_h - margin_y:
-            return True
-            
-        return False
-
-    @staticmethod
-    def _is_touching_edge_raw(
-        bbox: Tuple[float, float, float, float],
-        frame_w: int,
-        frame_h: int,
-    ) -> bool:
-        """
-        Bbox'ın kadraj kenarına değip değmediğini ham koordinatlarla kontrol eder.
-        Clamp işlemi öncesi kullanılır.
-        """
-        x1, y1, x2, y2 = bbox
-        margin = 5
-        if x1 <= margin or y1 <= margin:
-            return True
-        if x2 >= frame_w - margin or y2 >= frame_h - margin:
-            return True
-        return False
 
     # =========================================================================
     #  KENAR TEMAS KONTROLÜ

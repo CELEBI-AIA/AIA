@@ -1,3 +1,4 @@
+"""Sonuç gönderme sonrası KPI güncelleme ve pending_result temizleme. main.py _submit_competition_step kullanır."""
 from typing import Dict, Optional, Tuple
 
 
@@ -17,7 +18,7 @@ def apply_send_result_status(
     if status_value == "permanent_rejected":
         kpi_counters["send_fail"] += 1
         kpi_counters["send_permanent_reject"] += 1
-        return pending_result, True, False
+        return None, False, False
 
     kpi_counters["send_fail"] += 1
     return pending_result, False, False
