@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+import math
 import cv2
 import numpy as np
 import requests
@@ -565,10 +566,13 @@ class NetworkManager:
                         "none",
                         "null",
                         "",
+                        "nan",
                     }:
                         data[key] = 0.0
                     else:
                         data[key] = float(val)
+                        if math.isnan(data[key]):
+                            data[key] = 0.0
                 except (ValueError, TypeError):
                     self.log.warn(f"Corrupt {key}: {val!r}, forcing 0.0")
                     data[key] = 0.0
