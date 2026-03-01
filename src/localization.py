@@ -2,6 +2,7 @@
 Piksel kayması focal_length ve irtifa ile metreye çevrilir."""
 
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
+import time
 
 if TYPE_CHECKING:
     from src.frame_context import FrameContext
@@ -13,11 +14,118 @@ from config.settings import Settings
 from src.utils import Logger
 
 
+class LatencyCompensator:
+    """GPS=0 senaryosu için hız kestirimi + ileri projeksiyon yardımcı sınıfı."""
+
+    def __init__(self, ema_alpha: float) -> None:
+        self._ema_alpha = self._clamp_alpha(ema_alpha)
+        self._velocity: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._last_position: Optional[Dict[str, float]] = None
+        self._last_sample_monotonic: Optional[float] = None
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _clamp_alpha(cls, alpha: float) -> float:
+        alpha_safe = cls._safe_float(alpha, default=0.0)
+        return max(0.0, min(1.0, alpha_safe))
+
+    def reset(self) -> None:
+        self._velocity = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._last_position = None
+        self._last_sample_monotonic = None
+
+    def update_velocity(
+        self,
+        position: Dict[str, float],
+        sample_monotonic: Optional[float] = None,
+    ) -> None:
+        sample_t = (
+            time.monotonic()
+            if sample_monotonic is None
+            else self._safe_float(sample_monotonic, default=0.0)
+        )
+        current_pos = {
+            "x": self._safe_float(position.get("x", 0.0)),
+            "y": self._safe_float(position.get("y", 0.0)),
+            "z": self._safe_float(position.get("z", 0.0)),
+        }
+
+        if self._last_position is not None and self._last_sample_monotonic is not None:
+            dt = sample_t - self._last_sample_monotonic
+            if dt > 1e-6:
+                alpha = self._ema_alpha
+                for axis in ("x", "y", "z"):
+                    raw_v = (current_pos[axis] - self._last_position[axis]) / dt
+                    self._velocity[axis] = alpha * raw_v + (1.0 - alpha) * self._velocity[axis]
+
+        self._last_position = current_pos
+        self._last_sample_monotonic = sample_t
+
+    def get_velocity(self) -> Dict[str, float]:
+        return {
+            "x": self._velocity["x"],
+            "y": self._velocity["y"],
+            "z": self._velocity["z"],
+        }
+
+    def project_position(
+        self,
+        position: Dict[str, float],
+        dt_sec: float,
+        max_dt_sec: float,
+        max_delta_m: float,
+    ) -> Tuple[Dict[str, float], float, float]:
+        base_pos = {
+            "x": self._safe_float(position.get("x", 0.0)),
+            "y": self._safe_float(position.get("y", 0.0)),
+            "z": self._safe_float(position.get("z", 0.0)),
+        }
+
+        dt = max(0.0, self._safe_float(dt_sec, default=0.0))
+        max_dt = max(0.0, self._safe_float(max_dt_sec, default=0.0))
+        if max_dt > 0.0:
+            dt = min(dt, max_dt)
+        else:
+            dt = 0.0
+
+        dx = self._velocity["x"] * dt
+        dy = self._velocity["y"] * dt
+        dz = self._velocity["z"] * dt
+
+        delta_norm = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+        max_delta = max(0.0, self._safe_float(max_delta_m, default=0.0))
+        if max_delta <= 0.0:
+            dx = 0.0
+            dy = 0.0
+            dz = 0.0
+            delta_norm = 0.0
+        elif delta_norm > max_delta and delta_norm > 1e-9:
+            scale = max_delta / delta_norm
+            dx *= scale
+            dy *= scale
+            dz *= scale
+            delta_norm = max_delta
+
+        projected = {
+            "x": base_pos["x"] + dx,
+            "y": base_pos["y"] + dy,
+            "z": base_pos["z"] + dz,
+        }
+        return projected, delta_norm, dt
+
+
 class VisualOdometry:
     """GPS + optik akış hibrit pozisyon kestirimi."""
 
     def __init__(self) -> None:
         self.log = Logger("Localization")
+        self._latency_comp = LatencyCompensator(Settings.LATENCY_COMP_EMA_ALPHA)
 
         self.position: Dict[str, float] = {
             "x": 0.0,
@@ -105,6 +213,7 @@ class VisualOdometry:
                 )
                 self._update_reference_frame(gray)
 
+        self._latency_comp.update_velocity(self.position)
         return self.get_position()
 
     def _update_from_gps(self, server_data: Dict) -> None:
@@ -265,6 +374,20 @@ class VisualOdometry:
             "z": round(self._last_of_position["z"], 4),
         }
 
+    def project_position_with_latency(
+        self,
+        position: Dict[str, float],
+        dt_sec: float,
+        max_dt_sec: float,
+        max_delta_m: float,
+    ) -> Tuple[Dict[str, float], float, float]:
+        return self._latency_comp.project_position(
+            position=position,
+            dt_sec=dt_sec,
+            max_dt_sec=max_dt_sec,
+            max_delta_m=max_delta_m,
+        )
+
     def reset(self) -> None:
         self.position = {"x": 0.0, "y": 0.0, "z": 0.0}
         self._last_of_position = {"x": 0.0, "y": 0.0, "z": 0.0}
@@ -272,4 +395,5 @@ class VisualOdometry:
         self._prev_points = None
         self._last_gps_position = None
         self._initial_point_count = 0
+        self._latency_comp.reset()
         self.log.info("Visual Odometry sıfırlandı → (0, 0, 0)")

@@ -274,6 +274,12 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 |-----------|-----------|----------|
 | `FOCAL_LENGTH_PX` | `800.0` | Kamera odak uzunluğu (px) — yarışma kamera parametreleriyle güncellenmeli |
 | `DEFAULT_ALTITUDE` | `50.0` | Optik akış fallback irtifası (m) |
+| `LATENCY_COMP_ENABLED` | `False` | GPS=0 için submit öncesi latency compensation/projeksiyon bayrağı |
+| `LATENCY_COMP_MAX_MS` | `120.0` | Ölçülen fetch→submit gecikmesi için üst sınır (ms) |
+| `LATENCY_COMP_MAX_DELTA_M` | `2.0` | Frame başına maksimum projeksiyon mesafesi clamp (m) |
+| `LATENCY_COMP_EMA_ALPHA` | `0.35` | Hız (v_t) EMA yumuşatma katsayısı |
+
+> Not: Compensation sadece `gps_health=0` olduğunda çalışır, fetch zamanı monotonic olarak ölçülür ve payload şeması değiştirilmez.
 
 ### Görev 3 (Referans Obje Tespiti)
 

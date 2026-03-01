@@ -215,3 +215,11 @@
 - Added `--base-url` and `--team-name` CLI flags.
 - Added `AIA_BASE_URL` and `AIA_TEAM_NAME` environment variable support (CLI takes precedence).
 - Runtime now logs active override source for traceability.
+
+## 0.0.21 - 2026-03-02
+- Added GPS=0 latency compensation flow with monotonic fetch timestamp capture and submit-time projection in `main.py`, without changing outbound payload schema.
+- Added EMA-based velocity/projection helper in `src/localization.py` and wired it to position updates for dynamic runtime compensation.
+- Added feature/config controls: `LATENCY_COMP_ENABLED`, `LATENCY_COMP_MAX_MS`, `LATENCY_COMP_MAX_DELTA_M`, `LATENCY_COMP_EMA_ALPHA`.
+- Added compensation KPIs (`compensation_apply_count`, `compensation_avg_delta_m`, `compensation_max_delta_m`) to competition summary logs.
+- Added unit tests in `tests/test_all.py` for GPS gating, runtime dt usage (non-hardcoded), clamp behavior, and feature-off backward compatibility.
+- Updated README configuration section with latency compensation usage notes.

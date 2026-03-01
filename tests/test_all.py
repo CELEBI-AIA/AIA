@@ -636,6 +636,10 @@ class _DummyOdometry:
     def update(self, frame, frame_data):
         return {"x": 0.0, "y": 0.0, "z": 0.0}
 
+    @staticmethod
+    def project_position_with_latency(position, dt_sec, max_dt_sec, max_delta_m):
+        return dict(position), 0.0, 0.0
+
 
 class _FakeNetwork:
     frame_results = []
@@ -796,3 +800,229 @@ class TestCompetitionLoopHardening(unittest.TestCase):
              patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(call_count[0], 2)
+
+
+class _LatencyNet:
+    def __init__(self):
+        self.last_translation = None
+
+    def send_result(self, frame_id, detected_objects, detected_translation, **kwargs):
+        self.last_translation = dict(detected_translation)
+        return "acked"
+
+    @staticmethod
+    def consume_timeout_counters():
+        return {"fetch": 0, "image": 0, "submit": 0}
+
+    @staticmethod
+    def consume_payload_guard_counters():
+        return {"preflight_reject": 0, "payload_clipped": 0}
+
+
+class _LatencyResilience:
+    @staticmethod
+    def on_success_cycle():
+        return None
+
+    @staticmethod
+    def on_ack_failure():
+        return None
+
+
+class _LatencyOdometry:
+    def __init__(self):
+        self.project_calls = []
+
+    def project_position_with_latency(self, position, dt_sec, max_dt_sec, max_delta_m):
+        self.project_calls.append(
+            {
+                "position": dict(position),
+                "dt_sec": dt_sec,
+                "max_dt_sec": max_dt_sec,
+                "max_delta_m": max_delta_m,
+            }
+        )
+        dt_used = min(max(0.0, dt_sec), max_dt_sec)
+        delta = min(max_delta_m, dt_used * 10.0)
+        projected = {
+            "x": position["x"] + delta,
+            "y": position["y"],
+            "z": position["z"],
+        }
+        return projected, delta, dt_used
+
+
+@unittest.skipUnless(main_module is not None, "main runtime missing")
+class TestGps0LatencyCompensation(unittest.TestCase):
+    def setUp(self):
+        self._orig = {
+            "LATENCY_COMP_ENABLED": Settings.LATENCY_COMP_ENABLED,
+            "LATENCY_COMP_MAX_MS": Settings.LATENCY_COMP_MAX_MS,
+            "LATENCY_COMP_MAX_DELTA_M": Settings.LATENCY_COMP_MAX_DELTA_M,
+            "LATENCY_COMP_EMA_ALPHA": Settings.LATENCY_COMP_EMA_ALPHA,
+        }
+        Settings.LATENCY_COMP_MAX_MS = 250.0
+        Settings.LATENCY_COMP_MAX_DELTA_M = 5.0
+        Settings.LATENCY_COMP_EMA_ALPHA = 0.5
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(Settings, key, value)
+
+    @staticmethod
+    def _kpi():
+        return {
+            "send_ok": 0,
+            "send_fail": 0,
+            "send_fallback_ok": 0,
+            "send_permanent_reject": 0,
+            "timeout_fetch": 0,
+            "timeout_image": 0,
+            "timeout_submit": 0,
+            "payload_preflight_reject_count": 0,
+            "payload_clipped_count": 0,
+            "compensation_apply_count": 0,
+            "compensation_sum_delta_m": 0.0,
+            "compensation_avg_delta_m": 0.0,
+            "compensation_max_delta_m": 0.0,
+        }
+
+    @staticmethod
+    def _pending(gps_health):
+        return {
+            "frame_id": "f-lat-1",
+            "frame_data": {"frame_id": "f-lat-1", "gps_health": gps_health},
+            "detected_objects": [],
+            "detected_translation": {"translation_x": 10.0, "translation_y": 0.0, "translation_z": 2.0},
+            "position": {"x": 10.0, "y": 0.0, "z": 2.0},
+            "base_position": {"x": 10.0, "y": 0.0, "z": 2.0},
+            "frame_fetch_monotonic": 10.0,
+            "frame_shape": None,
+            "degraded": False,
+            "detected_undefined_objects": [],
+        }
+
+    def test_feature_disabled_keeps_existing_behavior(self):
+        Settings.LATENCY_COMP_ENABLED = False
+        net = _LatencyNet()
+        odo = _LatencyOdometry()
+        pending = self._pending(gps_health=0)
+        kpi = self._kpi()
+
+        with patch("time.monotonic", return_value=10.12):
+            main_module._submit_competition_step(
+                Logger("Test"),
+                net,
+                _LatencyResilience(),
+                odo,
+                kpi,
+                pending,
+                0,
+                5,
+                0,
+                5,
+            )
+
+        self.assertEqual(net.last_translation["translation_x"], 10.0)
+        self.assertEqual(len(odo.project_calls), 0)
+        self.assertEqual(kpi["compensation_apply_count"], 0)
+
+    def test_gps_health_1_does_not_apply_compensation(self):
+        Settings.LATENCY_COMP_ENABLED = True
+        net = _LatencyNet()
+        odo = _LatencyOdometry()
+        pending = self._pending(gps_health=1)
+        kpi = self._kpi()
+
+        with patch("time.monotonic", return_value=10.12):
+            main_module._submit_competition_step(
+                Logger("Test"),
+                net,
+                _LatencyResilience(),
+                odo,
+                kpi,
+                pending,
+                0,
+                5,
+                0,
+                5,
+            )
+
+        self.assertEqual(net.last_translation["translation_x"], 10.0)
+        self.assertEqual(len(odo.project_calls), 0)
+        self.assertEqual(kpi["compensation_apply_count"], 0)
+
+    def test_gps_health_0_uses_runtime_dt_for_compensation(self):
+        Settings.LATENCY_COMP_ENABLED = True
+        net = _LatencyNet()
+        odo = _LatencyOdometry()
+        pending = self._pending(gps_health=0)
+        kpi = self._kpi()
+
+        with patch("time.monotonic", return_value=10.12):
+            main_module._submit_competition_step(
+                Logger("Test"),
+                net,
+                _LatencyResilience(),
+                odo,
+                kpi,
+                pending,
+                0,
+                5,
+                0,
+                5,
+            )
+
+        self.assertEqual(len(odo.project_calls), 1)
+        self.assertAlmostEqual(odo.project_calls[0]["dt_sec"], 0.12, places=5)
+        self.assertAlmostEqual(net.last_translation["translation_x"], 11.2, places=5)
+        self.assertEqual(kpi["compensation_apply_count"], 1)
+        self.assertAlmostEqual(kpi["compensation_avg_delta_m"], 1.2, places=5)
+        self.assertAlmostEqual(kpi["compensation_max_delta_m"], 1.2, places=5)
+
+    def test_compensation_respects_dt_and_delta_clamp_limits(self):
+        Settings.LATENCY_COMP_ENABLED = True
+        Settings.LATENCY_COMP_MAX_MS = 50.0
+        Settings.LATENCY_COMP_MAX_DELTA_M = 0.3
+        net = _LatencyNet()
+        odo = _LatencyOdometry()
+        pending = self._pending(gps_health=0)
+        pending["frame_fetch_monotonic"] = 20.0
+        kpi = self._kpi()
+
+        with patch("time.monotonic", return_value=20.2):
+            main_module._submit_competition_step(
+                Logger("Test"),
+                net,
+                _LatencyResilience(),
+                odo,
+                kpi,
+                pending,
+                0,
+                5,
+                0,
+                5,
+            )
+
+        self.assertAlmostEqual(odo.project_calls[0]["max_dt_sec"], 0.05, places=6)
+        self.assertAlmostEqual(net.last_translation["translation_x"], 10.3, places=6)
+        self.assertEqual(kpi["compensation_apply_count"], 1)
+        self.assertAlmostEqual(kpi["compensation_max_delta_m"], 0.3, places=6)
+
+
+class TestLatencyCompensatorHelper(unittest.TestCase):
+    def test_velocity_is_derived_from_position_diff_and_ema(self):
+        from src.localization import LatencyCompensator
+
+        comp = LatencyCompensator(ema_alpha=0.5)
+        comp.update_velocity({"x": 0.0, "y": 0.0, "z": 0.0}, sample_monotonic=1.0)
+        comp.update_velocity({"x": 2.0, "y": 0.0, "z": 0.0}, sample_monotonic=2.0)
+        projected, delta_m, _ = comp.project_position(
+            position={"x": 2.0, "y": 0.0, "z": 0.0},
+            dt_sec=0.2,
+            max_dt_sec=1.0,
+            max_delta_m=10.0,
+        )
+
+        self.assertAlmostEqual(projected["x"], 2.2, places=6)
+        self.assertAlmostEqual(delta_m, 0.2, places=6)
