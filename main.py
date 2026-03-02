@@ -2,12 +2,13 @@
 Simülasyon: datasets/ içinden kare yükler. Yarışma: sunucudan frame alır, sonuç gönderir."""
 
 import argparse
+import base64
 import os
 import signal
 import sys
 import time
 from collections import Counter
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -285,6 +286,158 @@ def _safe_gps_health(frame_data: Dict[str, Any]) -> int:
         return 0
 
 
+def _normalize_task3_object_id(raw_object_id: Any) -> Optional[int]:
+    if isinstance(raw_object_id, bool) or raw_object_id is None:
+        return None
+
+    if isinstance(raw_object_id, int):
+        object_id = raw_object_id
+    elif isinstance(raw_object_id, float):
+        if not raw_object_id.is_integer():
+            return None
+        object_id = int(raw_object_id)
+    elif isinstance(raw_object_id, str):
+        stripped = raw_object_id.strip()
+        if not stripped:
+            return None
+        try:
+            object_id = int(stripped)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if object_id < 0:
+        return None
+    return object_id
+
+
+def _build_task3_reference_source(
+    ref_data: Dict[str, Any],
+    object_id: int,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    label = str(ref_data.get("label", f"ref_{object_id}"))
+
+    if ref_data.get("path"):
+        path = str(ref_data["path"])
+        if not os.path.isabs(path):
+            path = os.path.join(PROJECT_ROOT, path)
+        return {"object_id": object_id, "path": path, "label": label}, "path"
+
+    image_base64 = ref_data.get("image_base64")
+    if image_base64:
+        try:
+            arr = np.frombuffer(base64.b64decode(image_base64), dtype=np.uint8)
+            image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if image is None:
+                return None, "base64_decode_failed"
+            return {"object_id": object_id, "image": image, "label": label}, "image_base64"
+        except (ValueError, TypeError):
+            return None, "base64_decode_failed"
+
+    image = ref_data.get("image")
+    if image is not None:
+        return {"object_id": object_id, "image": image, "label": label}, "image"
+
+    return None, "missing_image_source"
+
+
+def _validate_task3_references(
+    log: Logger,
+    server_refs: List[Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], str, str, bool]:
+    stats: Dict[str, int] = {
+        "total": len(server_refs),
+        "valid": 0,
+        "duplicate": 0,
+        "quarantined": 0,
+    }
+    canonical_refs: List[Dict[str, Any]] = []
+    seen_object_ids: Dict[int, Dict[str, Any]] = {}
+
+    for idx, raw_ref in enumerate(server_refs):
+        if not isinstance(raw_ref, dict):
+            stats["quarantined"] += 1
+            log.warn(
+                f"event=task3_ref_quarantined reason=invalid_record_type index={idx}"
+            )
+            continue
+
+        object_id = _normalize_task3_object_id(raw_ref.get("object_id"))
+        if object_id is None:
+            stats["quarantined"] += 1
+            log.warn(
+                f"event=task3_ref_quarantined reason=invalid_object_id index={idx} raw_object_id={raw_ref.get('object_id')}"
+            )
+            continue
+
+        source_ref, source_kind = _build_task3_reference_source(raw_ref, object_id)
+        if source_ref is None:
+            stats["quarantined"] += 1
+            log.warn(
+                f"event=task3_ref_quarantined reason={source_kind} object_id={object_id} index={idx}"
+            )
+            continue
+
+        if object_id in seen_object_ids:
+            stats["duplicate"] += 1
+            stats["quarantined"] += 1
+            first_source = seen_object_ids[object_id].get("_source_kind", "unknown")
+            log.warn(
+                f"event=task3_ref_duplicate_detected object_id={object_id} first_source={first_source} duplicate_source={source_kind} index={idx}"
+            )
+            log.warn(
+                f"event=task3_ref_quarantined reason=duplicate_object_id object_id={object_id} index={idx}"
+            )
+            continue
+
+        source_ref["_source_kind"] = source_kind
+        seen_object_ids[object_id] = source_ref
+        canonical_refs.append(source_ref)
+        stats["valid"] += 1
+
+    for ref in canonical_refs:
+        ref.pop("_source_kind", None)
+
+    duplicate_ratio = (
+        float(stats["duplicate"]) / float(stats["total"])
+        if stats["total"] > 0
+        else 0.0
+    )
+    duplicate_critical = (
+        stats["duplicate"] >= int(Settings.TASK3_DUPLICATE_DEGRADE_MIN_COUNT)
+        and duplicate_ratio >= float(Settings.TASK3_DUPLICATE_DEGRADE_RATIO)
+    )
+
+    if duplicate_critical:
+        id_integrity_mode = "degraded"
+        id_integrity_reason_code = "duplicate_ratio_critical"
+    elif stats["duplicate"] > 0:
+        id_integrity_mode = "degraded"
+        id_integrity_reason_code = "duplicate_detected_safe_degrade"
+    elif stats["quarantined"] > 0:
+        id_integrity_mode = "degraded"
+        id_integrity_reason_code = "reference_quarantined_non_duplicate"
+    else:
+        id_integrity_mode = "normal"
+        id_integrity_reason_code = "ok"
+
+    log.info(
+        f"event=task3_ref_validation_summary total={stats['total']} valid={stats['valid']} duplicate={stats['duplicate']} quarantined={stats['quarantined']}"
+    )
+    log.warn(
+        f"event=task3_id_integrity_mode mode={id_integrity_mode} reason_code={id_integrity_reason_code} duplicate_ratio={duplicate_ratio:.3f}"
+    )
+
+    return (
+        canonical_refs,
+        stats,
+        id_integrity_mode,
+        id_integrity_reason_code,
+        duplicate_critical,
+    )
+
+
 def _apply_latency_compensation_if_needed(
     log: Logger,
     odometry: VisualOdometry,
@@ -386,30 +539,41 @@ def run_competition(log: Logger) -> None:
             log.error(f"Payload schema self-check failed: {exc}")
             return
 
+    reference_validation_stats: Dict[str, int] = {
+        "total": 0,
+        "valid": 0,
+        "duplicate": 0,
+        "quarantined": 0,
+    }
+    id_integrity_mode = "normal"
+    id_integrity_reason_code = "no_server_references"
+
     server_refs = network.get_task3_references()
     if image_matcher is not None and server_refs:
-        ref_list = []
-        for r in server_refs:
-            if not isinstance(r, dict):
-                continue
-            obj_id = int(r.get("object_id", len(ref_list) + 1))
-            if "path" in r and r["path"]:
-                p = r["path"]
-                if not os.path.isabs(p):
-                    p = os.path.join(PROJECT_ROOT, p)
-                ref_list.append({"object_id": obj_id, "path": p, "label": f"ref_{obj_id}"})
-            elif "image_base64" in r and r["image_base64"]:
-                try:
-                    import base64
-                    arr = np.frombuffer(base64.b64decode(r["image_base64"]), dtype=np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        ref_list.append({"object_id": obj_id, "image": img, "label": f"ref_{obj_id}"})
-                except Exception:
-                    pass
-        if ref_list:
-            loaded = image_matcher.load_references(ref_list)
-            log.info(f"Görev 3: Sunucudan {loaded} referans obje yüklendi")
+        (
+            canonical_refs,
+            reference_validation_stats,
+            id_integrity_mode,
+            id_integrity_reason_code,
+            duplicate_critical,
+        ) = _validate_task3_references(log=log, server_refs=server_refs)
+        if duplicate_critical:
+            image_matcher = None
+            log.warn(
+                "Görev 3: ID integrity kritik eşiği aşıldı, kontrollü pasif moda geçildi "
+                "(task3_disable_reason=duplicate_ratio_critical)"
+            )
+        elif canonical_refs:
+            loaded = image_matcher.load_references(canonical_refs)
+            if loaded == 0:
+                log.warn("Görev 3: Doğrulanan referanslar yüklense de matcher aktifleşmedi")
+            else:
+                log.info(
+                    f"Görev 3: Sunucudan {loaded} canonical referans obje yüklendi"
+                )
+        else:
+            image_matcher = None
+            log.warn("Görev 3: Geçerli referans kalmadı, kontrollü pasif mod")
 
     running = True
     transient_failures = 0
@@ -426,7 +590,7 @@ def run_competition(log: Logger) -> None:
         degrade_budget=3,
     )
 
-    kpi_counters: Dict[str, int] = {
+    kpi_counters: Dict[str, Any] = {
         "send_ok": 0,
         "send_fail": 0,
         "send_fallback_ok": 0,
@@ -449,6 +613,9 @@ def run_competition(log: Logger) -> None:
         "error_decision_degrade": 0,
         "error_decision_stop": 0,
         "error_unknown_count": 0,
+        "reference_validation_stats": reference_validation_stats,
+        "id_integrity_mode": id_integrity_mode,
+        "id_integrity_reason_code": id_integrity_reason_code,
     }
     pending_result: Optional[Dict] = None
 
@@ -685,7 +852,7 @@ def _print_competition_result(
 def _print_summary(
     log: Logger,
     fps_counter: FPSCounter,
-    kpi_counters: Optional[Dict[str, int]] = None,
+    kpi_counters: Optional[Dict[str, Any]] = None,
     resilience_stats: Optional[Dict[str, float]] = None,
 ) -> None:
     log.info("-" * 50)
@@ -730,6 +897,18 @@ def _print_summary(
             f"Payload Size   : Max {val_str(kpi_counters.get('max_payload_bytes'))} bytes "
             f"(Avg: {val_str(kpi_counters.get('avg_payload_bytes'))} bytes)"
         )
+        ref_stats = kpi_counters.get("reference_validation_stats", {})
+        if isinstance(ref_stats, dict):
+            log.info(
+                "Task3 Ref Integrity: "
+                f"Mode={kpi_counters.get('id_integrity_mode', 'unknown')} | "
+                f"Reason={kpi_counters.get('id_integrity_reason_code', 'unknown')} | "
+                f"Stats(total/valid/duplicate/quarantined)="
+                f"{int(ref_stats.get('total', 0))}/"
+                f"{int(ref_stats.get('valid', 0))}/"
+                f"{int(ref_stats.get('duplicate', 0))}/"
+                f"{int(ref_stats.get('quarantined', 0))}"
+            )
 
     if resilience_stats is not None:
         log.info(

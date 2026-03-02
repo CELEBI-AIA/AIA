@@ -35,6 +35,14 @@ class ImageMatcher:
     def __init__(self) -> None:
         self.log = Logger("Task3")
         self.references: List[ReferenceObject] = []
+        self._references_by_id: Dict[int, ReferenceObject] = {}
+        self._reference_lifecycle: Dict[int, str] = {}
+        self._last_load_stats: Dict[str, int] = {
+            "total": 0,
+            "valid": 0,
+            "duplicate": 0,
+            "quarantined": 0,
+        }
         self._frame_counter: int = 0
 
         method = Settings.TASK3_FEATURE_METHOD.upper()
@@ -55,12 +63,71 @@ class ImageMatcher:
             f"fallback_threshold={Settings.TASK3_FALLBACK_THRESHOLD}"
         )
 
+    @staticmethod
+    def _normalize_object_id(raw_object_id: Any) -> Optional[int]:
+        if isinstance(raw_object_id, bool) or raw_object_id is None:
+            return None
+        if isinstance(raw_object_id, int):
+            object_id = raw_object_id
+        elif isinstance(raw_object_id, float):
+            if not raw_object_id.is_integer():
+                return None
+            object_id = int(raw_object_id)
+        elif isinstance(raw_object_id, str):
+            stripped = raw_object_id.strip()
+            if not stripped:
+                return None
+            try:
+                object_id = int(stripped)
+            except ValueError:
+                return None
+        else:
+            return None
+        if object_id < 0:
+            return None
+        return object_id
+
     def load_references(self, reference_images: List[Dict[str, Any]]) -> int:
         self.references.clear()
+        self._references_by_id.clear()
+        self._reference_lifecycle.clear()
+        self._last_load_stats = {
+            "total": len(reference_images),
+            "valid": 0,
+            "duplicate": 0,
+            "quarantined": 0,
+        }
         loaded = 0
 
-        for ref_data in reference_images:
-            object_id = ref_data.get("object_id", loaded + 1)
+        for idx, ref_data in enumerate(reference_images):
+            if not isinstance(ref_data, dict):
+                self._last_load_stats["quarantined"] += 1
+                self.log.warn(
+                    f"event=task3_ref_quarantined reason=invalid_record_type index={idx}"
+                )
+                continue
+
+            object_id = self._normalize_object_id(ref_data.get("object_id"))
+            if object_id is None:
+                self._last_load_stats["quarantined"] += 1
+                self.log.warn(
+                    f"event=task3_ref_quarantined reason=invalid_object_id index={idx} raw_object_id={ref_data.get('object_id')}"
+                )
+                continue
+
+            self._reference_lifecycle[object_id] = "received"
+
+            if object_id in self._references_by_id:
+                self._last_load_stats["duplicate"] += 1
+                self._last_load_stats["quarantined"] += 1
+                self.log.warn(
+                    f"event=task3_ref_duplicate_detected object_id={object_id} index={idx}"
+                )
+                self.log.warn(
+                    f"event=task3_ref_quarantined reason=duplicate_object_id object_id={object_id} index={idx}"
+                )
+                continue
+
             label = ref_data.get("label", f"ref_{object_id}")
 
             if "image" in ref_data and ref_data["image"] is not None:
@@ -68,9 +135,11 @@ class ImageMatcher:
             elif "path" in ref_data and os.path.isfile(ref_data["path"]):
                 image = cv2.imread(ref_data["path"])
                 if image is None:
+                    self._last_load_stats["quarantined"] += 1
                     self.log.warn(f"Referans obje okunamadı: {ref_data['path']}")
                     continue
             else:
+                self._last_load_stats["quarantined"] += 1
                 self.log.warn(f"Referans obje #{object_id} için geçerli görüntü bulunamadı")
                 continue
 
@@ -78,11 +147,13 @@ class ImageMatcher:
             keypoints, descriptors = self.detector.detectAndCompute(gray, None)
 
             if descriptors is None or len(keypoints) < 4:
+                self._last_load_stats["quarantined"] += 1
                 self.log.warn(
                     f"Referans obje #{object_id}: yetersiz feature ({len(keypoints) if keypoints else 0})"
                 )
                 continue
 
+            self._reference_lifecycle[object_id] = "validated"
             ref_obj = ReferenceObject(
                 object_id=object_id,
                 image=image,
@@ -91,13 +162,22 @@ class ImageMatcher:
                 label=label,
             )
             self.references.append(ref_obj)
+            self._references_by_id[object_id] = ref_obj
+            self._reference_lifecycle[object_id] = "loaded"
             loaded += 1
+            self._last_load_stats["valid"] += 1
 
             self.log.info(
                 f"Referans #{object_id} yüklendi: "
                 f"{ref_obj.w}x{ref_obj.h}px, {len(keypoints)} feature"
             )
 
+        self.references = list(self._references_by_id.values())
+        self.log.info(
+            f"event=task3_ref_validation_summary total={self._last_load_stats['total']} "
+            f"valid={self._last_load_stats['valid']} duplicate={self._last_load_stats['duplicate']} "
+            f"quarantined={self._last_load_stats['quarantined']}"
+        )
         self.log.success(f"Toplam {loaded}/{len(reference_images)} referans obje yüklendi")
         return loaded
 
@@ -148,6 +228,9 @@ class ImageMatcher:
         for ref in self.references:
             bbox = self._match_reference(ref, frame_kp, frame_desc, gray.shape)
             if bbox is not None:
+                if ref.object_id not in self._references_by_id:
+                    continue
+                self._reference_lifecycle[ref.object_id] = "matched"
                 results.append({
                     "object_id": ref.object_id,
                     "top_left_x": bbox[0],
@@ -256,5 +339,21 @@ class ImageMatcher:
 
     def reset(self) -> None:
         self.references.clear()
+        self._references_by_id.clear()
+        self._reference_lifecycle.clear()
+        self._last_load_stats = {
+            "total": 0,
+            "valid": 0,
+            "duplicate": 0,
+            "quarantined": 0,
+        }
         self._frame_counter = 0
         self.log.info("ImageMatcher reset")
+
+    @property
+    def id_lifecycle_states(self) -> Dict[int, str]:
+        return dict(self._reference_lifecycle)
+
+    @property
+    def last_load_stats(self) -> Dict[str, int]:
+        return dict(self._last_load_stats)

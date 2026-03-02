@@ -41,6 +41,11 @@ except Exception:  # pragma: no cover
     ObjectDetector = None
 
 try:
+    from src.image_matcher import ImageMatcher
+except Exception:  # pragma: no cover
+    ImageMatcher = None
+
+try:
     from src.movement import MovementEstimator
 except Exception:  # pragma: no cover
     MovementEstimator = None
@@ -229,6 +234,104 @@ class TestMainAckStateMachine:
         p, abort, ok = apply_send_result_status("permanent_rejected", pending, c)
         assert p is None and not abort and not ok
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 1
+
+
+@unittest.skipUnless(main_module is not None, "main runtime missing")
+class TestTask3ReferenceValidation(unittest.TestCase):
+    def test_unique_ids_all_validated(self):
+        refs = [
+            {"object_id": 1, "image": np.zeros((12, 12, 3), dtype=np.uint8)},
+            {"object_id": 2, "image": np.zeros((12, 12, 3), dtype=np.uint8)},
+        ]
+        canonical, stats, mode, reason, disabled = main_module._validate_task3_references(
+            main_module.Logger("Test"), refs
+        )
+        self.assertEqual(len(canonical), 2)
+        self.assertEqual(stats, {"total": 2, "valid": 2, "duplicate": 0, "quarantined": 0})
+        self.assertEqual(mode, "normal")
+        self.assertEqual(reason, "ok")
+        self.assertFalse(disabled)
+
+    def test_duplicate_id_second_is_quarantined(self):
+        refs = [
+            {"object_id": 7, "image": np.zeros((12, 12, 3), dtype=np.uint8)},
+            {"object_id": "7", "image": np.ones((12, 12, 3), dtype=np.uint8)},
+        ]
+        canonical, stats, mode, reason, disabled = main_module._validate_task3_references(
+            main_module.Logger("Test"), refs
+        )
+        self.assertEqual(len(canonical), 1)
+        self.assertEqual(canonical[0]["object_id"], 7)
+        self.assertEqual(stats["duplicate"], 1)
+        self.assertEqual(stats["quarantined"], 1)
+        self.assertEqual(mode, "degraded")
+        self.assertEqual(reason, "duplicate_detected_safe_degrade")
+        self.assertFalse(disabled)
+
+    def test_invalid_object_id_rejected(self):
+        refs = [
+            {"object_id": None, "image": np.zeros((12, 12, 3), dtype=np.uint8)},
+            {"object_id": "abc", "image": np.zeros((12, 12, 3), dtype=np.uint8)},
+        ]
+        canonical, stats, mode, reason, disabled = main_module._validate_task3_references(
+            main_module.Logger("Test"), refs
+        )
+        self.assertEqual(canonical, [])
+        self.assertEqual(stats["valid"], 0)
+        self.assertEqual(stats["quarantined"], 2)
+        self.assertEqual(mode, "degraded")
+        self.assertEqual(reason, "reference_quarantined_non_duplicate")
+        self.assertFalse(disabled)
+
+
+@unittest.skipUnless(ImageMatcher is not None, "image matcher deps missing")
+class TestImageMatcherIdIntegrity(unittest.TestCase):
+    def setUp(self):
+        self.matcher = ImageMatcher()
+        self.matcher.detector = Mock()
+        self.matcher.detector.detectAndCompute.return_value = (
+            [object(), object(), object(), object(), object()],
+            np.ones((5, 32), dtype=np.uint8),
+        )
+
+    def test_load_references_unique_ids(self):
+        refs = [
+            {"object_id": 1, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 2, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+        ]
+        loaded = self.matcher.load_references(refs)
+        self.assertEqual(loaded, 2)
+        self.assertEqual(self.matcher.reference_count, 2)
+        self.assertEqual(self.matcher.last_load_stats["valid"], 2)
+        self.assertEqual(self.matcher.id_lifecycle_states[1], "loaded")
+        self.assertEqual(self.matcher.id_lifecycle_states[2], "loaded")
+
+    def test_load_references_duplicate_id_quarantined(self):
+        refs = [
+            {"object_id": 3, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 3, "image": np.ones((16, 16, 3), dtype=np.uint8)},
+        ]
+        loaded = self.matcher.load_references(refs)
+        self.assertEqual(loaded, 1)
+        self.assertEqual(self.matcher.reference_count, 1)
+        self.assertEqual(self.matcher.last_load_stats["duplicate"], 1)
+        self.assertEqual(self.matcher.last_load_stats["quarantined"], 1)
+
+    def test_match_output_never_contains_duplicate_id(self):
+        refs = [
+            {"object_id": 5, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 5, "image": np.ones((16, 16, 3), dtype=np.uint8)},
+        ]
+        self.matcher.load_references(refs)
+        with patch.object(
+            self.matcher,
+            "_match_reference",
+            return_value=(1.0, 1.0, 6.0, 6.0),
+        ):
+            out = self.matcher.match(np.zeros((32, 32, 3), dtype=np.uint8))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["object_id"], 5)
+        self.assertEqual(self.matcher.id_lifecycle_states[5], "matched")
 
 
 class _StubLog:
@@ -753,6 +856,13 @@ class _FakeNetwork:
         return SendResultStatus.ACKED
 
 
+class _Task3RefNetwork(_FakeNetwork):
+    refs = []
+
+    def get_task3_references(self):
+        return list(self.refs)
+
+
 @unittest.skipUnless(
     np is not None and FrameFetchResult is not None
     and FrameFetchStatus is not None and SendResultStatus is not None
@@ -867,6 +977,38 @@ class TestCompetitionLoopHardening(unittest.TestCase):
              patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(call_count[0], 2)
+
+    def test_task3_server_duplicates_only_canonical_passes_matcher(self):
+        _Task3RefNetwork.reset()
+        _Task3RefNetwork.frame_results = [
+            FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
+        ]
+        _Task3RefNetwork.timeout_snapshots = [{"fetch": 0, "image": 0, "submit": 0}]
+        _Task3RefNetwork.refs = [
+            {"object_id": 11, "image": np.zeros((8, 8, 3), dtype=np.uint8)},
+            {"object_id": 11, "image": np.ones((8, 8, 3), dtype=np.uint8)},
+        ]
+
+        with patch("src.network.NetworkManager", _Task3RefNetwork), \
+             patch.object(main_module, "ObjectDetector", _DummyDetector), \
+             patch.object(main_module, "MovementEstimator", _DummyMovement), \
+             patch.object(main_module, "VisualOdometry", _DummyOdometry), \
+             patch("src.image_matcher.ImageMatcher") as mock_matcher_cls, \
+             patch.object(main_module, "_print_summary", side_effect=self._summary_cb):
+            matcher = mock_matcher_cls.return_value
+            matcher.load_references_from_directory.return_value = 0
+            matcher.load_references.side_effect = lambda refs: len(refs)
+            matcher.match.return_value = []
+
+            main_module.run_competition(main_module.Logger("Test"))
+
+        canonical_refs = matcher.load_references.call_args[0][0]
+        self.assertEqual(len(canonical_refs), 1)
+        self.assertEqual(canonical_refs[0]["object_id"], 11)
+        kpi = self.summary_calls[-1]["kpi_counters"]
+        self.assertEqual(kpi["reference_validation_stats"]["duplicate"], 1)
+        self.assertEqual(kpi["id_integrity_mode"], "degraded")
+        self.assertEqual(kpi["id_integrity_reason_code"], "duplicate_detected_safe_degrade")
 
 
 class _LatencyNet:

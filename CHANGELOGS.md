@@ -231,3 +231,10 @@
 - Updated competition fallback in `main.py` to use predict-only localization updates instead of replaying last pose when frame download fails under `gps_health=0`.
 - Closed K3 error-handling risk by adding typed competition error taxonomy + decision policy (`src/competition_contract.py`) and integrating decision-driven runtime handling (`RETRY/DEGRADE/STOP`) in the competition loop.
 - Added unit coverage in `tests/test_all.py` for payload schema canonicalization, error policy mapping, and predict-only odometry metadata.
+
+## 0.0.35 - 2026-03-02
+- Implemented Task3 `object_id` integrity gate in `main.py` with session-start reference validation, duplicate quarantine, deterministic first-valid canonicalization, and integrity mode/reason metadata.
+- Added mandatory Task3 telemetry events in competition flow: `task3_ref_validation_summary`, `task3_ref_duplicate_detected`, `task3_ref_quarantined`, `task3_id_integrity_mode`.
+- Added critical duplicate-threshold controls in `config/settings.py` (`TASK3_DUPLICATE_DEGRADE_RATIO`, `TASK3_DUPLICATE_DEGRADE_MIN_COUNT`) and controlled Task3 passive mode when threshold is exceeded.
+- Hardened `src/image_matcher.py` with defensive duplicate/invalid ID filtering, canonical `object_id -> reference` contract, ID lifecycle tracking (`received/validated/loaded/matched`), and validated-only match output.
+- Added Task3 ID-integrity unit/integration coverage in `tests/test_all.py` for unique IDs, duplicate quarantine, invalid ID rejection, canonical matcher ingestion, and duplicate-free match outputs.

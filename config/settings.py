@@ -54,6 +54,8 @@ class Settings:
     TASK3_GRID_STRIDE: int = 32
     TASK3_MAX_REFERENCES: int = 10
     TASK3_FEATURE_METHOD: str = "ORB"
+    TASK3_DUPLICATE_DEGRADE_RATIO: float = 0.50
+    TASK3_DUPLICATE_DEGRADE_MIN_COUNT: int = 3
 
     # Sınıflar (şartname)
     CLASS_TASIT: int = 0       # Taşıt
