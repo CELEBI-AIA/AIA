@@ -1,5 +1,25 @@
 # CHANGELOGS
 
+## 0.0.37 - 2026-03-03
+- **fix(network)**: Disabled class quotas (`RESULT_CLASS_QUOTA`) and global caps to prevent critical mAP loss during busy scenes.
+- **fix(network)**: Strengthened idempotency check to immediately return `ACKED` and prevent duplicate send penalizations.
+- **fix(network)**: Fortified fallback payload builder to retain valid detected objects (`safe_objects`) upon transmission rejection.
+- **fix(main)**: Removed strict Task 3 pasvization (`image_matcher = None`) to keep matcher active even when duplicate ratios are critical.
+- **fix(main)**: Changed session duplicate frame limit behavior from `break` to `continue` to prevent premature session aborts.
+- **fix(main)**: Hardened `gps_health` fallback to default to `1` (healthy) when telemetry is missing at session start.
+- **fix(detection)**: Tightened `landing_status` overlap threshold to `> 0.0` ensuring absolute edge-case compliance for UAP/UAI zones.
+- **fix(localization)**: Anchored z-axis altitude to `_last_gps_altitude` during Optical Flow to eliminate severe depth drift.
+- **release**: Bumped project version to `0.0.37`.
+
+## 0.0.36 - 2026-03-03
+- **feat(runtime)**: Simplified runtime contract to two clear modes: `competition` and `visual_validation`.
+- **feat(cli)**: Set `visual_validation` as the default startup mode while keeping `competition` explicitly selectable.
+- **chore(compat)**: Preserved backward-compatible CLI aliases `simulate_vid` and `simulate_det`.
+- **chore(config)**: Added centralized mode constants in `config/settings.py` (`DEFAULT_RUNTIME_MODE`, `COMPETITION_RUNTIME_MODE`, `VISUAL_VALIDATION_RUNTIME_MODE`).
+- **docs(readme)**: Updated usage/configuration docs to clearly state visual validation/test as the default mode.
+- **test(runtime)**: Added/updated tests to verify default mode is `visual_validation` and dispatch goes through the simulation path.
+- **chore(validation)**: Re-ran formatter/linter/test validation under existing Ubuntu 22.04-compatible runtime assumptions.
+
 ## 0.0.34 - 2026-03-01
 - **fix(network)**: Fixed E999 SyntaxError — `if response.status_code == 204` and 5xx branches moved inside `try` block with correct indentation.
 - **chore(lint)**: Resolved flake8 errors project-wide (W291/W293 trailing/blank whitespace, E261/E302/E303/E305, E501 line length, F401 unused imports, E731 lambda, W391).

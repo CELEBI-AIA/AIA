@@ -85,7 +85,7 @@ class Visualizer:
     def __init__(self) -> None:
         os.makedirs(Settings.DEBUG_OUTPUT_DIR, exist_ok=True)
         self.log = Logger("Visualizer")
-        self._save_counter: int = 0
+        self._save_count__version__ = "0.0.37"
 
     def draw_detections(
         self,

@@ -342,14 +342,11 @@ class VisualOdometry:
         smooth_dx = max(-cap, min(cap, self._ema_dx))
         smooth_dy = max(-cap, min(cap, self._ema_dy))
 
-        dz_meters = 0.0
-        if 0.5 < scale_ratio < 2.0 and scale_ratio != 1.0:
-            dz_meters = self.position["z"] * ((1.0 / scale_ratio) - 1.0)
-
-        smooth_dz = max(-cap, min(cap, dz_meters * alpha))
+        # Z-Ekseni Drift Koruması: Optik akış ile yükseklik hesabı sapmalara
+        # yol açabildiği için, z ekseni son bilinen güvenilir GPS yüksekliğine kilitlenir.
         self.position["x"] += smooth_dx
         self.position["y"] += smooth_dy
-        self.position["z"] += smooth_dz
+        self.position["z"] = float(self._last_gps_altitude)
 
         self._last_of_position = {k: v for k, v in self.position.items()}
 

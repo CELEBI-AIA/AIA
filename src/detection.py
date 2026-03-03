@@ -600,7 +600,7 @@ class ObjectDetector:
             overlap = ObjectDetector._intersection_over_area(
                 landing_bbox, obs_bbox
             )
-            if overlap > threshold:
+            if overlap > 0.0:  # Şartname 4.6 gereği en ufak bir kesişim "Uygun Değil" yapar
                 return True
         return False
 

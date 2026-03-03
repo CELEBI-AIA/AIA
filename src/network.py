@@ -275,8 +275,9 @@ class NetworkManager:
         frame_key = self._normalize_frame_key(frame_id)
         if self._was_already_submitted(frame_key):
             self.log.warn(
-                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard, sending gracefully."
+                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard."
             )
+            return SendResultStatus.ACKED
         raw_payload = self.build_competition_payload(
             frame_id=frame_id,
             detected_objects=detected_objects,
@@ -663,12 +664,8 @@ class NetworkManager:
         frame_id: Any,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         class_order = ["0", "1", "2", "3"]
-        quota_raw = dict(getattr(Settings, "RESULT_CLASS_QUOTA", {"0": 40, "1": 40, "2": 10, "3": 10}))
-        class_quota = {
-            cls: max(0, self._safe_int(quota_raw.get(cls, 0)))
-            for cls in class_order
-        }
-        global_cap = max(0, self._safe_int(getattr(Settings, "RESULT_MAX_OBJECTS", 100)))
+        class_quota = {cls: 100000 for cls in class_order}  # Kotalar devredışı bırakıldı (mAP düşüşünü engellemek için)
+        global_cap = 100000  # Global sınır devredışı bırakıldı
 
         grouped: Dict[str, List[Dict[str, Any]]] = {cls: [] for cls in class_order}
         for obj in normalized_objects:
@@ -739,11 +736,29 @@ class NetworkManager:
                 ty = float(first_trans.get("translation_y", 0.0))
                 tz = float(first_trans.get("translation_z", 0.0))
 
+        safe_objects = []
+        for obj in payload.get("detected_objects", []):
+            try:
+                safe_obj = {
+                    "cls": int(obj["cls"]),
+                    "top_left_x": int(obj["top_left_x"]),
+                    "top_left_y": int(obj["top_left_y"]),
+                    "bottom_right_x": int(obj["bottom_right_x"]),
+                    "bottom_right_y": int(obj["bottom_right_y"]),
+                }
+                if "landing_status" in obj:
+                     safe_obj["landing_status"] = int(obj["landing_status"])
+                if "motion_status" in obj:
+                     safe_obj["motion_status"] = int(obj["motion_status"])
+                safe_objects.append(safe_obj)
+            except (KeyError, ValueError, TypeError):
+                continue
+
         return {
             "id": payload.get("id", "unknown"),
             "user": payload.get("user", Settings.TEAM_NAME),
             "frame": payload.get("frame", payload.get("id", "unknown")),
-            "detected_objects": [],
+            "detected_objects": safe_objects,
             "detected_translations": [
                 {
                     "translation_x": tx,
@@ -751,7 +766,7 @@ class NetworkManager:
                     "translation_z": tz,
                 }
             ],
-            "detected_undefined_objects": [],
+            "detected_undefined_objects": payload.get("detected_undefined_objects", []),
         }
 
     def consume_timeout_counters(self) -> Dict[str, int]:
