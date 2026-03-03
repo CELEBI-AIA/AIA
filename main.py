@@ -3,12 +3,11 @@ Simülasyon: datasets/ içinden kare yükler. Yarışma: sunucudan frame alır, 
 """
 
 import argparse
-import base64
 import os
 import signal
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -34,8 +33,19 @@ from src.competition_contract import (  # noqa: E402
 from src.resilience import SessionResilienceController  # noqa: E402
 from src.runtime_profile import apply_runtime_profile  # noqa: E402
 from src.send_state import apply_send_result_status  # noqa: E402
-from src.utils import Logger, Visualizer  # noqa: E402
+from src.utils import Logger, Visualizer, log_json_to_disk  # noqa: E402
 from src.frame_context import FrameContext  # noqa: E402
+from src.gps_health import normalize_gps_health  # noqa: E402
+from src.flow_policy import (  # noqa: E402
+    DuplicateStormAction,
+    FetchStrategy,
+    FrameLifecycleState,
+    decide_degrade_fetch_strategy,
+    decide_duplicate_storm_action,
+)
+from src.task3_reference_policy import (  # noqa: E402
+    canonicalize_task3_references,
+)
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -207,22 +217,30 @@ def _process_simulation_step(
     _print_simulation_result(log, frame_idx, detected_objects, position, gps_health)
 
     if show or save:
-        annotated = visualizer.draw_detections(
-            frame,
-            detected_objects,
-            frame_id=str(frame_idx),
-            position=position,
-            save_to_disk=not save,
-        )
+        try:
+            annotated = visualizer.draw_detections(
+                frame,
+                detected_objects,
+                frame_id=str(frame_idx),
+                position=position,
+                save_to_disk=not save,
+            )
+        except Exception as exc:
+            log.warn(f"Frame {frame_idx}: debug visualizer failed (fail-open): {exc}")
+            annotated = frame.copy()
 
-        mode_text = "GPS" if gps_health == 1 else "Optical Flow"
+        mode_text = (
+            "GPS"
+            if gps_health == 1
+            else ("Optical Flow" if gps_health == 0 else "GPS Unknown")
+        )
         cv2.putText(
             annotated,
             f"Mode: {mode_text}",
             (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0) if gps_health else (0, 165, 255),
+            (0, 255, 0) if gps_health == 1 else (0, 165, 255),
             2,
         )
 
@@ -251,7 +269,7 @@ def _print_simulation_result(
     frame_idx: int,
     detected_objects: list,
     position: dict,
-    gps_health: int,
+    gps_health: Optional[int],
 ) -> None:
     cls_counts = Counter(obj["cls"] for obj in detected_objects)
     tasit = cls_counts.get("0", 0)
@@ -259,7 +277,7 @@ def _print_simulation_result(
     uap = cls_counts.get("2", 0)
     uai = cls_counts.get("3", 0)
 
-    loc_mode = "GPS" if gps_health == 1 else "OF"
+    loc_mode = "GPS" if gps_health == 1 else ("OF" if gps_health == 0 else "UNKNOWN")
     pos_str = (
         f"x={position['x']:+.1f}m "
         f"y={position['y']:+.1f}m "
@@ -283,169 +301,50 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _safe_gps_health(frame_data: Dict[str, Any]) -> int:
-    # Şartname 4.5: Yarışmanın başında GPS her zaman sağlıklıdır (1).
-    # Veri eksik veya bozuksa 1 kabul edilip OF sürüklenmesi önlenir.
-    raw_val = frame_data.get("gps_health")
-    if raw_val is None:
-        return 1
-    try:
-        val = int(float(raw_val))
-        return val if val in (0, 1) else 1
-    except (TypeError, ValueError):
-        return 1
+def _safe_gps_health(frame_data: Dict[str, Any]) -> Optional[int]:
+    value, _ = normalize_gps_health(
+        frame_data.get("gps_health"),
+        gps_health_status=frame_data.get("gps_health_status"),
+    )
+    return value
 
 
-def _normalize_task3_object_id(raw_object_id: Any) -> Optional[int]:
-    if isinstance(raw_object_id, bool) or raw_object_id is None:
-        return None
+def _assert_camera_calibration_ready(log: Logger) -> None:
+    if not bool(getattr(Settings, "CAMERA_CALIBRATION_GUARD_ENABLED", True)):
+        return
 
-    if isinstance(raw_object_id, int):
-        object_id = raw_object_id
-    elif isinstance(raw_object_id, float):
-        if not raw_object_id.is_integer():
-            return None
-        object_id = int(raw_object_id)
-    elif isinstance(raw_object_id, str):
-        stripped = raw_object_id.strip()
-        if not stripped:
-            return None
-        try:
-            object_id = int(stripped)
-        except ValueError:
-            return None
-    else:
-        return None
+    focal = _safe_float(getattr(Settings, "FOCAL_LENGTH_PX", 0.0))
+    cx = _safe_float(getattr(Settings, "CAMERA_CX", -1.0), default=-1.0)
+    cy = _safe_float(getattr(Settings, "CAMERA_CY", -1.0), default=-1.0)
 
-    if object_id < 0:
-        return None
-    return object_id
+    checks = {
+        "FOCAL_LENGTH_PX": focal > 0.0 and np.isfinite(focal),
+        "CAMERA_CX": cx >= 0.0 and np.isfinite(cx),
+        "CAMERA_CY": cy >= 0.0 and np.isfinite(cy),
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    if failed:
+        raise DataContractError(
+            "Camera calibration guard failed: "
+            f"invalid params={failed} values="
+            f"FOCAL_LENGTH_PX={focal}, CAMERA_CX={cx}, CAMERA_CY={cy}"
+        )
 
-
-def _build_task3_reference_source(
-    ref_data: Dict[str, Any],
-    object_id: int,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    label = str(ref_data.get("label", f"ref_{object_id}"))
-
-    if ref_data.get("path"):
-        path = str(ref_data["path"])
-        if not os.path.isabs(path):
-            path = os.path.join(PROJECT_ROOT, path)
-        return {"object_id": object_id, "path": path, "label": label}, "path"
-
-    image_base64 = ref_data.get("image_base64")
-    if image_base64:
-        try:
-            arr = np.frombuffer(base64.b64decode(image_base64), dtype=np.uint8)
-            image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if image is None:
-                return None, "base64_decode_failed"
-            return {
-                "object_id": object_id,
-                "image": image,
-                "label": label,
-            }, "image_base64"
-        except (ValueError, TypeError):
-            return None, "base64_decode_failed"
-
-    image = ref_data.get("image")
-    if image is not None:
-        return {"object_id": object_id, "image": image, "label": label}, "image"
-
-    return None, "missing_image_source"
+    if focal == 800.0 and cx == 960.0 and cy == 540.0:
+        log.warn(
+            "Camera calibration guard: default camera parameters are active "
+            "(FOCAL_LENGTH_PX=800.0, CAMERA_CX=960.0, CAMERA_CY=540.0)."
+        )
 
 
 def _validate_task3_references(
     log: Logger,
     server_refs: List[Any],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], str, str, bool]:
-    stats: Dict[str, int] = {
-        "total": len(server_refs),
-        "valid": 0,
-        "duplicate": 0,
-        "quarantined": 0,
-    }
-    canonical_refs: List[Dict[str, Any]] = []
-    seen_object_ids: Dict[int, Dict[str, Any]] = {}
-
-    for idx, raw_ref in enumerate(server_refs):
-        if not isinstance(raw_ref, dict):
-            stats["quarantined"] += 1
-            log.warn(
-                f"event=task3_ref_quarantined reason=invalid_record_type index={idx}"
-            )
-            continue
-
-        object_id = _normalize_task3_object_id(raw_ref.get("object_id"))
-        if object_id is None:
-            stats["quarantined"] += 1
-            log.warn(
-                f"event=task3_ref_quarantined reason=invalid_object_id index={idx} raw_object_id={raw_ref.get('object_id')}"
-            )
-            continue
-
-        source_ref, source_kind = _build_task3_reference_source(raw_ref, object_id)
-        if source_ref is None:
-            stats["quarantined"] += 1
-            log.warn(
-                f"event=task3_ref_quarantined reason={source_kind} object_id={object_id} index={idx}"
-            )
-            continue
-
-        if object_id in seen_object_ids:
-            stats["duplicate"] += 1
-            stats["quarantined"] += 1
-            first_source = seen_object_ids[object_id].get("_source_kind", "unknown")
-            log.warn(
-                f"event=task3_ref_duplicate_detected object_id={object_id} first_source={first_source} duplicate_source={source_kind} index={idx}"
-            )
-            log.warn(
-                f"event=task3_ref_quarantined reason=duplicate_object_id object_id={object_id} index={idx}"
-            )
-            continue
-
-        source_ref["_source_kind"] = source_kind
-        seen_object_ids[object_id] = source_ref
-        canonical_refs.append(source_ref)
-        stats["valid"] += 1
-
-    for ref in canonical_refs:
-        ref.pop("_source_kind", None)
-
-    duplicate_ratio = (
-        float(stats["duplicate"]) / float(stats["total"]) if stats["total"] > 0 else 0.0
-    )
-    duplicate_critical = stats["duplicate"] >= int(
-        Settings.TASK3_DUPLICATE_DEGRADE_MIN_COUNT
-    ) and duplicate_ratio >= float(Settings.TASK3_DUPLICATE_DEGRADE_RATIO)
-
-    if duplicate_critical:
-        id_integrity_mode = "degraded"
-        id_integrity_reason_code = "duplicate_ratio_critical"
-    elif stats["duplicate"] > 0:
-        id_integrity_mode = "degraded"
-        id_integrity_reason_code = "duplicate_detected_safe_degrade"
-    elif stats["quarantined"] > 0:
-        id_integrity_mode = "degraded"
-        id_integrity_reason_code = "reference_quarantined_non_duplicate"
-    else:
-        id_integrity_mode = "normal"
-        id_integrity_reason_code = "ok"
-
-    log.info(
-        f"event=task3_ref_validation_summary total={stats['total']} valid={stats['valid']} duplicate={stats['duplicate']} quarantined={stats['quarantined']}"
-    )
-    log.warn(
-        f"event=task3_id_integrity_mode mode={id_integrity_mode} reason_code={id_integrity_reason_code} duplicate_ratio={duplicate_ratio:.3f}"
-    )
-
-    return (
-        canonical_refs,
-        stats,
-        id_integrity_mode,
-        id_integrity_reason_code,
-        duplicate_critical,
+    return canonicalize_task3_references(
+        log=log,
+        references=server_refs,
+        project_root=PROJECT_ROOT,
     )
 
 
@@ -515,6 +414,160 @@ def _apply_latency_compensation_if_needed(
     return compensated_translation, projected_position
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rolling_fps_from_durations(frame_cycle_window: deque) -> float:
+    if not frame_cycle_window:
+        return 0.0
+    total = sum(frame_cycle_window)
+    if total <= 1e-9:
+        return 0.0
+    return float(len(frame_cycle_window)) / float(total)
+
+
+def _update_dynamic_json_log_interval(
+    log: Logger,
+    rolling_fps: float,
+    kpi_counters: Dict[str, Any],
+) -> None:
+    if not bool(getattr(Settings, "DYNAMIC_JSON_LOG_INTERVAL_ENABLED", True)):
+        return
+    prev = max(1, int(getattr(Settings, "JSON_LOG_EVERY_N_FRAMES", 1)))
+    slow = max(1, int(getattr(Settings, "DYNAMIC_JSON_LOG_SLOW_INTERVAL", 40)))
+    medium = max(1, int(getattr(Settings, "DYNAMIC_JSON_LOG_MEDIUM_INTERVAL", 20)))
+    fast = max(1, int(getattr(Settings, "DYNAMIC_JSON_LOG_FAST_INTERVAL", 10)))
+
+    if rolling_fps < 1.0:
+        target = slow
+    elif rolling_fps < 2.0:
+        target = medium
+    else:
+        target = fast
+
+    if target != prev:
+        Settings.JSON_LOG_EVERY_N_FRAMES = target
+        log.info(
+            f"event=json_log_interval_adjusted old={prev} new={target} rolling_fps={rolling_fps:.2f}"
+        )
+    kpi_counters["json_log_interval"] = int(Settings.JSON_LOG_EVERY_N_FRAMES)
+
+
+def _maybe_toggle_low_fps_guard(
+    log: Logger,
+    rolling_fps: float,
+    guard_state: Dict[str, Any],
+    kpi_counters: Dict[str, Any],
+) -> None:
+    if not bool(getattr(Settings, "LOW_FPS_GUARD_ENABLED", True)):
+        return
+
+    active = bool(guard_state.get("active", False))
+    low_threshold = float(getattr(Settings, "LOW_FPS_GUARD_THRESHOLD", 1.0))
+    recover_threshold = float(getattr(Settings, "LOW_FPS_GUARD_RECOVERY_THRESHOLD", 1.4))
+    recover_streak_needed = max(
+        1, int(getattr(Settings, "LOW_FPS_GUARD_RECOVERY_STREAK", 12))
+    )
+
+    if not active and rolling_fps > 0.0 and rolling_fps < low_threshold:
+        guard_state["active"] = True
+        guard_state["recovery_streak"] = 0
+
+        Settings.SAHI_ENABLED = not bool(getattr(Settings, "PROTECTIVE_DISABLE_SAHI", True))
+        Settings.INFERENCE_SIZE = min(
+            int(Settings.INFERENCE_SIZE),
+            max(256, int(getattr(Settings, "PROTECTIVE_INFERENCE_SIZE", 960))),
+        )
+        Settings.MAX_DETECTIONS = min(
+            int(Settings.MAX_DETECTIONS),
+            max(1, int(getattr(Settings, "PROTECTIVE_MAX_DETECTIONS", 180))),
+        )
+        Settings.CONFIDENCE_THRESHOLD = max(
+            float(Settings.CONFIDENCE_THRESHOLD),
+            float(getattr(Settings, "PROTECTIVE_CONFIDENCE_THRESHOLD", 0.50)),
+        )
+        Settings.AUGMENTED_INFERENCE = False
+        Settings.DEGRADE_SEND_INTERVAL_FRAMES = max(
+            int(Settings.DEGRADE_SEND_INTERVAL_FRAMES),
+            max(1, int(getattr(Settings, "PROTECTIVE_DEGRADE_SEND_INTERVAL_FRAMES", 8))),
+        )
+        Settings.JSON_LOG_EVERY_N_FRAMES = max(
+            int(Settings.JSON_LOG_EVERY_N_FRAMES),
+            max(1, int(getattr(Settings, "PROTECTIVE_LOG_INTERVAL", 25))),
+        )
+
+        kpi_counters["fps_guard_activations"] = (
+            int(kpi_counters.get("fps_guard_activations", 0)) + 1
+        )
+        log.warn(
+            f"event=fps_guard_activated rolling_fps={rolling_fps:.2f} "
+            f"sahi={'on' if Settings.SAHI_ENABLED else 'off'} "
+            f"imgsz={Settings.INFERENCE_SIZE} max_det={Settings.MAX_DETECTIONS}"
+        )
+        return
+
+    if not active:
+        return
+
+    if rolling_fps >= recover_threshold:
+        guard_state["recovery_streak"] = int(guard_state.get("recovery_streak", 0)) + 1
+    else:
+        guard_state["recovery_streak"] = 0
+
+    if int(guard_state["recovery_streak"]) < recover_streak_needed:
+        return
+
+    guard_state["active"] = False
+    guard_state["recovery_streak"] = 0
+    Settings.SAHI_ENABLED = bool(guard_state["orig_sahi"])
+    Settings.INFERENCE_SIZE = int(guard_state["orig_inference_size"])
+    Settings.MAX_DETECTIONS = int(guard_state["orig_max_det"])
+    Settings.CONFIDENCE_THRESHOLD = float(guard_state["orig_conf"])
+    Settings.AUGMENTED_INFERENCE = bool(
+        guard_state.get("orig_augmented", Settings.AUGMENTED_INFERENCE)
+    )
+    Settings.JSON_LOG_EVERY_N_FRAMES = int(guard_state["orig_json_interval"])
+    Settings.DEGRADE_SEND_INTERVAL_FRAMES = int(guard_state["orig_degrade_interval"])
+    kpi_counters["fps_guard_recoveries"] = (
+        int(kpi_counters.get("fps_guard_recoveries", 0)) + 1
+    )
+    log.info(f"event=fps_guard_recovered rolling_fps={rolling_fps:.2f}")
+
+
+def _run_periodic_gpu_maintenance(
+    log: Logger,
+    processed_frames: int,
+    kpi_counters: Dict[str, Any],
+) -> None:
+    interval = max(1, int(getattr(Settings, "GPU_CLEANUP_INTERVAL", 200)))
+    if processed_frames <= 0 or processed_frames % interval != 0:
+        return
+
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved(0) / (1024 ** 2)
+        kpi_counters["gpu_memory_allocated_mb"] = round(float(allocated), 2)
+        kpi_counters["gpu_memory_reserved_mb"] = round(float(reserved), 2)
+        log.info(
+            "event=gpu_maintenance "
+            f"processed_frames={processed_frames} allocated_mb={allocated:.1f} reserved_mb={reserved:.1f}"
+        )
+    else:
+        log.info(f"event=gpu_maintenance processed_frames={processed_frames} mode=cpu")
+
+    kpi_counters["gpu_maintenance_runs"] = int(
+        kpi_counters.get("gpu_maintenance_runs", 0)
+    ) + 1
+
+
 def run_competition(log: Logger) -> None:
     from src.network import NetworkManager
 
@@ -545,6 +598,12 @@ def run_competition(log: Logger) -> None:
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         log.error(f"Initialization error: {exc}")
         log.error("System startup failed, exiting.")
+        return
+
+    try:
+        _assert_camera_calibration_ready(log)
+    except DataContractError as exc:
+        log.error(f"Calibration guard failed: {exc}")
         return
 
     if not network.start_session():
@@ -602,12 +661,88 @@ def run_competition(log: Logger) -> None:
     consecutive_permanent_rejects = 0
     PERMANENT_REJECT_ABORT_THRESHOLD = 5
     consecutive_duplicate_frames = 0
-    CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD = 5
+    CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD = max(
+        1, int(getattr(Settings, "DUPLICATE_STORM_THRESHOLD", 5))
+    )
+    duplicate_storm_action_cfg = str(
+        getattr(Settings, "DUPLICATE_STORM_ACTION", "terminate_session")
+    )
     resilience = SessionResilienceController(log=log)
     error_policy = ErrorPolicy(
         retry_budget=max(5, Settings.MAX_RETRIES * 2),
         degrade_budget=3,
     )
+    frame_state = FrameLifecycleState.IDLE
+    current_frame_id = "none"
+    degrade_replay_state: Dict[str, Any] = {
+        "objects": [],
+        "age": 10**9,
+    }
+    degrade_fallback_window: deque = deque(
+        maxlen=max(5, int(getattr(Settings, "DEGRADE_FALLBACK_RATIO_WINDOW", 40)))
+    )
+    frame_cycle_window: deque = deque(
+        maxlen=max(5, int(getattr(Settings, "LOW_FPS_GUARD_WINDOW", 20)))
+    )
+    low_fps_guard_state: Dict[str, Any] = {
+        "active": False,
+        "recovery_streak": 0,
+        "orig_sahi": bool(Settings.SAHI_ENABLED),
+        "orig_inference_size": int(Settings.INFERENCE_SIZE),
+        "orig_max_det": int(Settings.MAX_DETECTIONS),
+        "orig_conf": float(Settings.CONFIDENCE_THRESHOLD),
+        "orig_augmented": bool(Settings.AUGMENTED_INFERENCE),
+        "orig_json_interval": int(Settings.JSON_LOG_EVERY_N_FRAMES),
+        "orig_degrade_interval": int(Settings.DEGRADE_SEND_INTERVAL_FRAMES),
+    }
+
+    valid_transitions = {
+        FrameLifecycleState.IDLE: {
+            FrameLifecycleState.FETCHED,
+            FrameLifecycleState.TERMINAL,
+        },
+        FrameLifecycleState.FETCHED: {
+            FrameLifecycleState.PROCESSED,
+            FrameLifecycleState.TERMINAL,
+        },
+        FrameLifecycleState.PROCESSED: {
+            FrameLifecycleState.SUBMITTING,
+            FrameLifecycleState.TERMINAL,
+        },
+        FrameLifecycleState.SUBMITTING: {
+            FrameLifecycleState.ACKED,
+            FrameLifecycleState.TERMINAL,
+        },
+        FrameLifecycleState.ACKED: {
+            FrameLifecycleState.IDLE,
+            FrameLifecycleState.TERMINAL,
+        },
+        FrameLifecycleState.TERMINAL: {FrameLifecycleState.TERMINAL},
+    }
+
+    def _transition_frame_state(
+        new_state: FrameLifecycleState,
+        reason_code: str,
+        frame_id: Optional[str] = None,
+    ) -> None:
+        nonlocal frame_state, current_frame_id
+        if new_state not in valid_transitions.get(frame_state, set()):
+            raise DataContractError(
+                f"Invalid frame state transition: {frame_state.value} -> {new_state.value}"
+            )
+
+        from_state = frame_state
+        frame_state = new_state
+        if frame_id is not None:
+            current_frame_id = str(frame_id)
+        kpi_counters["frame_state"] = frame_state.value
+        kpi_counters["frame_state_transitions"] = (
+            int(kpi_counters.get("frame_state_transitions", 0)) + 1
+        )
+        log.info(
+            f"event=frame_state_transition from={from_state.value} to={new_state.value} "
+            f"frame_id={current_frame_id} reason_code={reason_code}"
+        )
 
     kpi_counters: Dict[str, Any] = {
         "send_ok": 0,
@@ -618,12 +753,19 @@ def run_competition(log: Logger) -> None:
         "payload_clipped_count": 0,
         "mode_gps": 0,
         "mode_of": 0,
+        "mode_unknown": 0,
         "degrade_frames": 0,
+        "degrade_replayed_detection_frames": 0,
+        "degrade_empty_payload_count": 0,
         "frame_duplicate_drop": 0,
         "timeout_fetch": 0,
         "timeout_image": 0,
         "timeout_submit": 0,
         "consecutive_duplicate_abort": 0,
+        "duplicate_storm_events": 0,
+        "frame_state": frame_state.value,
+        "frame_state_transitions": 0,
+        "state_machine_errors": 0,
         "compensation_apply_count": 0,
         "compensation_sum_delta_m": 0.0,
         "compensation_avg_delta_m": 0.0,
@@ -632,6 +774,11 @@ def run_competition(log: Logger) -> None:
         "error_decision_degrade": 0,
         "error_decision_stop": 0,
         "error_unknown_count": 0,
+        "rolling_fps": 0.0,
+        "json_log_interval": int(Settings.JSON_LOG_EVERY_N_FRAMES),
+        "fps_guard_activations": 0,
+        "fps_guard_recoveries": 0,
+        "gpu_maintenance_runs": 0,
         "reference_validation_stats": reference_validation_stats,
         "id_integrity_mode": id_integrity_mode,
         "id_integrity_reason_code": id_integrity_reason_code,
@@ -655,7 +802,9 @@ def run_competition(log: Logger) -> None:
 
         while running:
             try:
-                abort_reason = resilience.should_abort()
+                abort_reason = resilience.should_abort(
+                    has_pending_result=(pending_result is not None or submit_future is not None)
+                )
                 if abort_reason:
                     log.error(f"Resilience abort: {abort_reason}")
                     break
@@ -668,6 +817,17 @@ def run_competition(log: Logger) -> None:
 
                 # Bekleyen sonuç varsa önce gönder (fetch ile çakışmayı önle)
                 if pending_result is not None and submit_future is None:
+                    if frame_state == FrameLifecycleState.PROCESSED:
+                        _transition_frame_state(
+                            FrameLifecycleState.SUBMITTING,
+                            reason_code="begin_submit",
+                            frame_id=pending_result.get("frame_id", "unknown"),
+                        )
+                    elif frame_state != FrameLifecycleState.SUBMITTING:
+                        raise DataContractError(
+                            f"Pending result exists but frame_state={frame_state.value}"
+                        )
+
                     submit_future = executor.submit(
                         _submit_competition_step,
                         log,
@@ -690,6 +850,10 @@ def run_competition(log: Logger) -> None:
                     consecutive_permanent_rejects = result[3]
                     submit_future = None
                     if action_result == "break":
+                        _transition_frame_state(
+                            FrameLifecycleState.TERMINAL,
+                            reason_code="submit_terminal_break",
+                        )
                         break
                     elif action_result == "continue":
                         continue
@@ -697,32 +861,89 @@ def run_competition(log: Logger) -> None:
                     if not (
                         isinstance(action_result, tuple) and len(action_result) == 2
                     ):
+                        kpi_counters["state_machine_errors"] += 1
                         log.error(
                             f"Unexpected action_result type: {type(action_result)}, skipping frame"
                         )
+                        if pending_result is None and frame_state == FrameLifecycleState.SUBMITTING:
+                            _transition_frame_state(
+                                FrameLifecycleState.ACKED,
+                                reason_code="unexpected_action_pending_cleared",
+                            )
+                            _transition_frame_state(
+                                FrameLifecycleState.IDLE,
+                                reason_code="reset_to_idle_after_unexpected_action",
+                            )
                         continue
                     _, success_info = action_result
+                    _transition_frame_state(
+                        FrameLifecycleState.ACKED,
+                        reason_code="ack_received",
+                        frame_id=success_info.get("frame_id", "unknown"),
+                    )
 
                     gps_health = _safe_gps_health(success_info["frame_data"])
 
                     if gps_health == 1:
                         kpi_counters["mode_gps"] += 1
-                    else:
+                    elif gps_health == 0:
                         kpi_counters["mode_of"] += 1
+                    else:
+                        kpi_counters["mode_unknown"] += 1
 
                     if (
                         Settings.DEBUG
                         and visualizer is not None
                         and success_info["frame_for_debug"] is not None
                     ):
-                        visualizer.draw_detections(
-                            success_info["frame_for_debug"],
-                            success_info["detected_objects"],
-                            frame_id=str(success_info["frame_id"]),
-                            position=success_info["position"],
+                        try:
+                            debug_interval = max(
+                                1, int(getattr(Settings, "COMPETITION_DEBUG_DRAW_INTERVAL", 1))
+                            )
+                            if (fps_counter.frame_count + 1) % debug_interval == 0:
+                                visualizer.draw_detections(
+                                    success_info["frame_for_debug"],
+                                    success_info["detected_objects"],
+                                    frame_id=str(success_info["frame_id"]),
+                                    position=success_info["position"],
+                                )
+                        except Exception as exc:
+                            log.warn(
+                                f"Frame {success_info['frame_id']}: debug draw failed (fail-open): {exc}"
+                            )
+
+                    frame_fetch_monotonic = success_info.get("frame_fetch_monotonic")
+                    if frame_fetch_monotonic is not None:
+                        cycle_sec = max(
+                            1e-3,
+                            time.monotonic() - _safe_float(frame_fetch_monotonic, default=0.0),
+                        )
+                        frame_cycle_window.append(cycle_sec)
+                        rolling_fps = _rolling_fps_from_durations(frame_cycle_window)
+                        kpi_counters["rolling_fps"] = round(rolling_fps, 4)
+                        _update_dynamic_json_log_interval(
+                            log=log,
+                            rolling_fps=rolling_fps,
+                            kpi_counters=kpi_counters,
+                        )
+                        _maybe_toggle_low_fps_guard(
+                            log=log,
+                            rolling_fps=rolling_fps,
+                            guard_state=low_fps_guard_state,
+                            kpi_counters=kpi_counters,
                         )
 
                     fps_counter.tick()
+                    _run_periodic_gpu_maintenance(
+                        log=log,
+                        processed_frames=fps_counter.frame_count,
+                        kpi_counters=kpi_counters,
+                    )
+                    _transition_frame_state(
+                        FrameLifecycleState.IDLE,
+                        reason_code="ready_for_next_fetch",
+                        frame_id=success_info.get("frame_id", "unknown"),
+                    )
 
                     interval = max(1, int(Settings.COMPETITION_RESULT_LOG_INTERVAL))
                     if fps_counter.frame_count % interval == 0:
@@ -743,6 +964,10 @@ def run_competition(log: Logger) -> None:
                     continue
 
                 elif pending_result is None:
+                    if frame_state != FrameLifecycleState.IDLE:
+                        raise DataContractError(
+                            f"Fetch requested while frame_state={frame_state.value}"
+                        )
                     # Yeni frame al
                     if fetch_future is None:
                         fetch_future = executor.submit(
@@ -757,6 +982,8 @@ def run_competition(log: Logger) -> None:
                             kpi_counters,
                             transient_failures,
                             transient_budget,
+                            degrade_replay_state,
+                            degrade_fallback_window,
                         )
 
                     if fetch_future.done():
@@ -771,25 +998,54 @@ def run_competition(log: Logger) -> None:
                             )
                             time.sleep(delay_val)
                             continue
-                        elif action == "break":
+                        if action == "break":
+                            _transition_frame_state(
+                                FrameLifecycleState.TERMINAL,
+                                reason_code="fetch_terminal_break",
+                            )
                             break
+
                         if is_dup:
                             consecutive_duplicate_frames += 1
-                            if (
-                                consecutive_duplicate_frames
-                                >= CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD
-                            ):
+                            log.warn(
+                                f"event=duplicate_frame_detected streak={consecutive_duplicate_frames} "
+                                f"threshold={CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD} action_cfg={duplicate_storm_action_cfg}"
+                            )
+                            duplicate_action = decide_duplicate_storm_action(
+                                consecutive_duplicates=consecutive_duplicate_frames,
+                                threshold=CONSECUTIVE_DUPLICATE_ABORT_THRESHOLD,
+                                configured_action=duplicate_storm_action_cfg,
+                            )
+                            if duplicate_action == DuplicateStormAction.TERMINATE_SESSION:
+                                kpi_counters["duplicate_storm_events"] += 1
                                 kpi_counters["consecutive_duplicate_abort"] = (
                                     consecutive_duplicate_frames
                                 )
-                                log.warn(
-                                    f"Ardışık {consecutive_duplicate_frames} duplicate frame tespit edildi. "
-                                    "Oturum sonlandırılmıyor, yeni kare bekleniyor."
+                                log.error(
+                                    "event=duplicate_storm_terminal_action "
+                                    f"streak={consecutive_duplicate_frames} action=terminate_session"
                                 )
-                                continue
+                                _transition_frame_state(
+                                    FrameLifecycleState.TERMINAL,
+                                    reason_code="duplicate_storm_terminal",
+                                )
+                                break
                         else:
                             consecutive_duplicate_frames = 0
+
                         pending_result = fetch_res
+                        if pending_result is not None:
+                            fetched_frame_id = str(pending_result.get("frame_id", "unknown"))
+                            _transition_frame_state(
+                                FrameLifecycleState.FETCHED,
+                                reason_code="frame_metadata_fetched",
+                                frame_id=fetched_frame_id,
+                            )
+                            _transition_frame_state(
+                                FrameLifecycleState.PROCESSED,
+                                reason_code="frame_processed",
+                                frame_id=fetched_frame_id,
+                            )
                     else:
                         time.sleep(0.01)
                         continue
@@ -812,7 +1068,9 @@ def run_competition(log: Logger) -> None:
                     continue
                 kpi_counters["error_decision_stop"] += 1
                 break
-            except (ValueError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError, DataContractError) as exc:
+                if isinstance(exc, DataContractError):
+                    kpi_counters["state_machine_errors"] += 1
                 decision = error_policy.decide_on_error(DataContractError(str(exc)))
                 log.error(
                     f"event=error_decision decision={decision.value} type={type(exc).__name__}"
@@ -864,6 +1122,15 @@ def run_competition(log: Logger) -> None:
                 "transient_wall_time_sec": resilience_stats.transient_wall_time_sec,
             },
         )
+        Settings.SAHI_ENABLED = bool(low_fps_guard_state["orig_sahi"])
+        Settings.INFERENCE_SIZE = int(low_fps_guard_state["orig_inference_size"])
+        Settings.MAX_DETECTIONS = int(low_fps_guard_state["orig_max_det"])
+        Settings.CONFIDENCE_THRESHOLD = float(low_fps_guard_state["orig_conf"])
+        Settings.AUGMENTED_INFERENCE = bool(low_fps_guard_state["orig_augmented"])
+        Settings.JSON_LOG_EVERY_N_FRAMES = int(low_fps_guard_state["orig_json_interval"])
+        Settings.DEGRADE_SEND_INTERVAL_FRAMES = int(
+            low_fps_guard_state["orig_degrade_interval"]
+        )
 
 
 def _print_competition_result(
@@ -872,9 +1139,9 @@ def _print_competition_result(
     detected_objects: list,
     send_status: str,
     position: dict,
-    gps_health: int,
+    gps_health: Optional[int],
 ) -> None:
-    mode = "GPS" if gps_health == 1 else "OF"
+    mode = "GPS" if gps_health == 1 else ("OF" if gps_health == 0 else "UNKNOWN")
 
     def _safe_float(val) -> float:
         try:
@@ -905,6 +1172,7 @@ def _print_summary(
     log.info("-" * 50)
     log.info(f"Total processed frames: {fps_counter.frame_count}")
     elapsed = time.time() - fps_counter.start_time
+    avg_fps = 0.0
     if elapsed > 0:
         avg_fps = fps_counter.frame_count / elapsed
         log.info(f"Average FPS: {avg_fps:.2f}")
@@ -927,12 +1195,40 @@ def _print_summary(
             f"Preflight Reject={kpi_counters.get('payload_preflight_reject_count', 0)} | "
             f"Payload Clipped={kpi_counters.get('payload_clipped_count', 0)} | "
             f"Mode OF={kpi_counters.get('mode_of', 0)} | "
+            f"Mode Unknown={kpi_counters.get('mode_unknown', 0)} | "
             f"Degrade Frames={kpi_counters.get('degrade_frames', 0)} | "
+            f"Degrade Replay={kpi_counters.get('degrade_replayed_detection_frames', 0)} | "
+            f"Degrade Empty={kpi_counters.get('degrade_empty_payload_count', 0)} | "
             f"DupDrop={kpi_counters.get('frame_duplicate_drop', 0)} | "
+            f"DupStorm={kpi_counters.get('duplicate_storm_events', 0)} | "
+            f"State={kpi_counters.get('frame_state', 'IDLE')} | "
+            f"StateErr={kpi_counters.get('state_machine_errors', 0)} | "
+            f"RollingFPS={_safe_float(kpi_counters.get('rolling_fps', 0.0)):.2f} | "
+            f"JSONInt={kpi_counters.get('json_log_interval', Settings.JSON_LOG_EVERY_N_FRAMES)} | "
+            f"FPSGuard(A/R)="
+            f"{kpi_counters.get('fps_guard_activations', 0)}/"
+            f"{kpi_counters.get('fps_guard_recoveries', 0)} | "
+            f"GPUMaint={kpi_counters.get('gpu_maintenance_runs', 0)} | "
             f"Timeouts(fetch/image/submit)="
             f"{kpi_counters.get('timeout_fetch', 0)}/"
             f"{kpi_counters.get('timeout_image', 0)}/"
             f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+        send_ok = int(kpi_counters.get("send_ok", 0))
+        send_fail = int(kpi_counters.get("send_fail", 0))
+        processed = max(1, int(fps_counter.frame_count))
+        frame_loss_ratio = max(0.0, 1.0 - (float(send_ok) / float(processed)))
+        fallback_ratio = float(kpi_counters.get("send_fallback_ok", 0)) / float(
+            max(1, send_ok)
+        )
+        reject_ratio = float(kpi_counters.get("send_permanent_reject", 0)) / float(
+            max(1, send_ok + send_fail)
+        )
+        log.info(
+            "Derived Metrics: "
+            f"FrameLossRatio={frame_loss_ratio:.4f} | "
+            f"FallbackRatio={fallback_ratio:.4f} | "
+            f"SubmitRejectRatio={reject_ratio:.4f}"
         )
         log.info(
             "KPI Compensation: "
@@ -965,6 +1261,41 @@ def _print_summary(
             f"Recovery Count={int(resilience_stats.get('recovered_count', 0))} | "
             f"Transient Wall Time={float(resilience_stats.get('transient_wall_time_sec', 0.0)):.1f}s"
         )
+
+    report_payload: Dict[str, Any] = {
+        "processed_frames": int(fps_counter.frame_count),
+        "elapsed_sec": float(round(elapsed, 4)),
+        "average_fps": float(round(avg_fps, 4)) if elapsed > 0 else 0.0,
+        "kpi_counters": dict(kpi_counters or {}),
+        "resilience_stats": dict(resilience_stats or {}),
+        "baseline_metrics": {
+            "frame_loss_ratio": max(
+                0.0,
+                1.0
+                - (
+                    float((kpi_counters or {}).get("send_ok", 0))
+                    / float(max(1, int(fps_counter.frame_count)))
+                ),
+            ),
+            "submit_reject_ratio": float(
+                (kpi_counters or {}).get("send_permanent_reject", 0)
+            )
+            / float(
+                max(
+                    1,
+                    int((kpi_counters or {}).get("send_ok", 0))
+                    + int((kpi_counters or {}).get("send_fail", 0)),
+                )
+            ),
+            "fallback_ratio": float((kpi_counters or {}).get("send_fallback_ok", 0))
+            / float(max(1, int((kpi_counters or {}).get("send_ok", 0)))),
+            "average_fps": float(round(avg_fps, 4)) if elapsed > 0 else 0.0,
+        },
+    }
+    try:
+        log_json_to_disk(report_payload, direction="metrics", tag="run_summary")
+    except Exception as exc:
+        log.warn(f"Metrics summary write skipped: {exc}")
 
     log.success("System shutdown complete")
 
@@ -1183,6 +1514,8 @@ def _fetch_competition_step(
     kpi_counters: dict,
     transient_failures: int,
     transient_budget: int,
+    degrade_replay_state: Dict[str, Any],
+    degrade_fallback_window: deque,
 ):
     from src.network import FrameFetchStatus
     import time
@@ -1231,6 +1564,9 @@ def _fetch_competition_step(
     frame_id = frame_data.get("frame_id", "unknown")
     frame_fetch_monotonic = time.monotonic()
 
+    if degrade_replay_state.get("objects"):
+        degrade_replay_state["age"] = int(degrade_replay_state.get("age", 0)) + 1
+
     if fetch_result.is_duplicate:
         kpi_counters["frame_duplicate_drop"] += 1
         log.warn(
@@ -1239,13 +1575,72 @@ def _fetch_competition_step(
 
     frame = None
     use_fallback = False
+    fallback_reason_code = "frame_download_failed"
 
+    degrade_seq = 0
+    heavy_every = max(1, int(Settings.DEGRADE_SEND_INTERVAL_FRAMES))
     if degrade_mode:
         kpi_counters["degrade_frames"] += 1
         degrade_seq = resilience.record_degraded_frame()
-        heavy_every = max(1, int(Settings.DEGRADE_SEND_INTERVAL_FRAMES))
-        should_try_heavy = (degrade_seq % heavy_every) == 0
-        if should_try_heavy:
+
+    fallback_ratio = 0.0
+    if len(degrade_fallback_window) > 0:
+        fallback_ratio = float(sum(degrade_fallback_window)) / float(
+            len(degrade_fallback_window)
+        )
+    force_recovery_heavy = (
+        degrade_mode
+        and len(degrade_fallback_window) >= max(5, degrade_fallback_window.maxlen // 2)
+        and fallback_ratio >= float(getattr(Settings, "DEGRADE_FALLBACK_RATIO_HIGH", 0.75))
+    )
+    if force_recovery_heavy:
+        log.warn(
+            f"event=degrade_recovery_force_heavy frame_id={frame_id} "
+            f"fallback_ratio={fallback_ratio:.2f}"
+        )
+
+    fetch_decision = decide_degrade_fetch_strategy(
+        is_degraded=degrade_mode,
+        degrade_seq=degrade_seq,
+        heavy_every=heavy_every,
+        force_full_frame=force_recovery_heavy,
+    )
+    if degrade_mode:
+        log.info(
+            "event=degrade_fetch_decision "
+            f"frame_id={frame_id} strategy={fetch_decision.strategy.value} "
+            f"reason_code={fetch_decision.reason_code} slot={fetch_decision.degrade_seq}/{heavy_every}"
+        )
+
+    if fetch_decision.strategy == FetchStrategy.FULL_FRAME:
+        frame = network.download_image(frame_data)
+        timeout_snapshot = network.consume_timeout_counters()
+        kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
+        kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
+        kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
+        if frame is None:
+            use_fallback = True
+            fallback_reason_code = "frame_download_failed"
+            if degrade_mode:
+                log.warn(
+                    f"Frame {frame_id}: degrade heavy pass image download failed, sending fallback result"
+                )
+            else:
+                log.warn(
+                    f"Frame {frame_id}: image download failed, sending fallback result"
+                )
+        elif degrade_mode:
+            log.info(
+                f"Frame {frame_id}: degrade heavy pass (every {heavy_every} frames)"
+            )
+    else:
+        if degrade_mode:
+            use_fallback = True
+            fallback_reason_code = fetch_decision.reason_code
+            log.info(
+                f"Frame {frame_id}: degraded fetch-only fallback (slot {degrade_seq}/{heavy_every})"
+            )
+        else:
             frame = network.download_image(frame_data)
             timeout_snapshot = network.consume_timeout_counters()
             kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
@@ -1254,35 +1649,15 @@ def _fetch_competition_step(
             if frame is None:
                 use_fallback = True
                 log.warn(
-                    f"Frame {frame_id}: degrade heavy pass image download failed, sending fallback result"
+                    f"Frame {frame_id}: image download failed, sending fallback result"
                 )
-            else:
-                log.info(
-                    f"Frame {frame_id}: degrade heavy pass (every {heavy_every} frames)"
-                )
-        else:
-            use_fallback = True
-            log.info(
-                f"Frame {frame_id}: degraded fetch-only fallback (slot {degrade_seq}/{heavy_every})"
-            )
-    else:
-        frame = network.download_image(frame_data)
-        timeout_snapshot = network.consume_timeout_counters()
-        kpi_counters["timeout_fetch"] += timeout_snapshot.get("fetch", 0)
-        kpi_counters["timeout_image"] += timeout_snapshot.get("image", 0)
-        kpi_counters["timeout_submit"] += timeout_snapshot.get("submit", 0)
-        if frame is None:
-            use_fallback = True
-            log.warn(
-                f"Frame {frame_id}: image download failed, sending fallback result"
-            )
 
     if use_fallback:
-        gps_health = int(float(frame_data.get("gps_health", 0)))
+        gps_health = _safe_gps_health(frame_data)
         if gps_health == 0:
             if hasattr(odometry, "predict_without_measurement"):
                 last_position = odometry.predict_without_measurement(
-                    reason_code="frame_download_failed",
+                    reason_code=fallback_reason_code,
                     gps_health=0,
                 )
             else:
@@ -1295,18 +1670,43 @@ def _fetch_competition_step(
             else {
                 "update_mode": "fallback",
                 "state_source": "last_known",
-                "quality_flag": "degraded" if gps_health == 0 else "nominal",
-                "reason_code": "frame_download_failed",
+                "quality_flag": "degraded" if gps_health != 1 else "nominal",
+                "reason_code": fallback_reason_code,
             }
         )
+        replay_objects: List[Dict[str, Any]] = []
+        replay_used = False
+        if bool(getattr(Settings, "DEGRADE_REPLAY_ENABLED", True)):
+            max_age = max(0, int(getattr(Settings, "DEGRADE_REPLAY_MAX_AGE_FRAMES", 6)))
+            max_objects = max(0, int(getattr(Settings, "DEGRADE_REPLAY_MAX_OBJECTS", 40)))
+            cached_objects = degrade_replay_state.get("objects") or []
+            cache_age = int(degrade_replay_state.get("age", 10**9))
+            if cached_objects and cache_age <= max_age:
+                replay_objects = [dict(obj) for obj in cached_objects[:max_objects]]
+                replay_used = True
+                kpi_counters["degrade_replayed_detection_frames"] = int(
+                    kpi_counters.get("degrade_replayed_detection_frames", 0)
+                ) + 1
+                log.info(
+                    f"event=degrade_detection_replay frame_id={frame_id} "
+                    f"object_count={len(replay_objects)} cache_age={cache_age}"
+                )
+            else:
+                kpi_counters["degrade_empty_payload_count"] = int(
+                    kpi_counters.get("degrade_empty_payload_count", 0)
+                ) + 1
+        else:
+            kpi_counters["degrade_empty_payload_count"] = int(
+                kpi_counters.get("degrade_empty_payload_count", 0)
+            ) + 1
+
         pending_result = {
             "frame_id": frame_id,
             "frame_data": frame_data,
-            "detected_objects": [],
+            "detected_objects": replay_objects,
             "frame": None,
             "position": last_position,
             "degraded": degrade_mode,
-            "pending_ttl": 1 if degrade_mode else None,
             "detected_translation": {
                 "translation_x": last_position["x"],
                 "translation_y": last_position["y"],
@@ -1318,11 +1718,22 @@ def _fetch_competition_step(
             "frame_shape": None,
             "detected_undefined_objects": [],
             "is_duplicate": fetch_result.is_duplicate,
+            "used_detection_replay": replay_used,
         }
     else:
         frame_ctx = FrameContext(frame)
-        detected_objects = detector.detect(frame)
+        detect_profile = "light" if degrade_mode else "default"
+        try:
+            detected_objects = detector.detect(frame, runtime_profile=detect_profile)
+        except TypeError:
+            detected_objects = detector.detect(frame)
         detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
+        if detected_objects:
+            max_objects = max(1, int(getattr(Settings, "DEGRADE_REPLAY_MAX_OBJECTS", 40)))
+            degrade_replay_state["objects"] = [
+                dict(obj) for obj in detected_objects[:max_objects]
+            ]
+            degrade_replay_state["age"] = 0
         undefined_objects = []
         if image_matcher is not None:
             undefined_objects = image_matcher.match(frame)
@@ -1344,7 +1755,6 @@ def _fetch_competition_step(
             "frame": frame,
             "position": position,
             "degraded": degrade_mode,
-            "pending_ttl": 1 if degrade_mode else None,
             "detected_translation": {
                 "translation_x": position["x"],
                 "translation_y": position["y"],
@@ -1357,6 +1767,15 @@ def _fetch_competition_step(
             "detected_undefined_objects": undefined_objects,
             "is_duplicate": fetch_result.is_duplicate,
         }
+
+    if degrade_mode:
+        degrade_fallback_window.append(1 if use_fallback else 0)
+        if len(degrade_fallback_window) > 0:
+            kpi_counters["degrade_fallback_ratio"] = round(
+                float(sum(degrade_fallback_window))
+                / float(len(degrade_fallback_window)),
+                4,
+            )
 
     return pending_result, transient_failures, "process", fetch_result.is_duplicate
 
@@ -1426,17 +1845,58 @@ def _submit_competition_step(
     )
 
     if pending_result is None and not success_cycle:
-        consecutive_permanent_rejects += 1
-        log.warn(
-            f"Frame {frame_id}: permanent rejected, frame dropped "
-            f"({consecutive_permanent_rejects}/{permanent_reject_abort_threshold})"
-        )
-        if consecutive_permanent_rejects >= permanent_reject_abort_threshold:
-            log.error(
-                "Consecutive permanent reject threshold reached, aborting session"
+        status_value = str(getattr(send_status, "value", send_status))
+        if status_value == "permanent_rejected":
+            retry_limit = max(0, int(getattr(Settings, "PERMANENT_REJECT_RETRY_LIMIT", 1)))
+            retry_count = int(pending_result_snapshot.get("permanent_reject_retry_count", 0))
+            if retry_count < retry_limit:
+                pending_result_snapshot["permanent_reject_retry_count"] = retry_count + 1
+                pending_result_snapshot["degraded"] = True
+                log.warn(
+                    f"Frame {frame_id}: permanent rejected; controlled retry "
+                    f"({retry_count + 1}/{retry_limit}) with safe payload path"
+                )
+                time.sleep(min(2.0, Settings.RETRY_DELAY))
+                return (
+                    pending_result_snapshot,
+                    ack_failures,
+                    "continue",
+                    consecutive_permanent_rejects,
+                )
+
+            consecutive_permanent_rejects += 1
+            pending_result_snapshot["degraded"] = True
+            pending_result_snapshot["permanent_reject_exhausted_count"] = (
+                int(pending_result_snapshot.get("permanent_reject_exhausted_count", 0))
+                + 1
             )
-            return None, ack_failures, "break", consecutive_permanent_rejects
-        return None, ack_failures, "continue", consecutive_permanent_rejects
+            log.error(
+                "event=permanent_reject_terminal_decision "
+                f"frame_id={frame_id} streak={consecutive_permanent_rejects} "
+                f"threshold={permanent_reject_abort_threshold}"
+            )
+            if consecutive_permanent_rejects >= permanent_reject_abort_threshold:
+                log.error(
+                    "Consecutive permanent reject threshold reached, aborting session"
+                )
+                return None, ack_failures, "break", consecutive_permanent_rejects
+
+            ack_failures += 1
+            resilience.on_ack_failure()
+            delay = min(5.0, Settings.RETRY_DELAY * (2 ** min(ack_failures, 4)))
+            time.sleep(delay)
+            return (
+                pending_result_snapshot,
+                ack_failures,
+                "continue",
+                consecutive_permanent_rejects,
+            )
+
+        # Failsafe: ACK alınamayan döngüde frame'i düşürme; aynı frame ile devam et.
+        ack_failures += 1
+        resilience.on_ack_failure()
+        time.sleep(min(2.0, Settings.RETRY_DELAY))
+        return pending_result_snapshot, ack_failures, "continue", consecutive_permanent_rejects
 
     if success_cycle:
         ack_failures = 0
@@ -1449,6 +1909,8 @@ def _submit_competition_step(
             "position": pending_result_snapshot.get("position"),
             "frame_id": frame_id,
             "frame_data": frame_data,
+            "frame_fetch_monotonic": pending_result_snapshot.get("frame_fetch_monotonic"),
+            "degraded": bool(pending_result_snapshot.get("degraded", False)),
         }
         return (
             pending_result,
@@ -1469,17 +1931,6 @@ def _submit_competition_step(
                 "ACK failure budget reached; session stays alive "
                 "under wall-clock circuit breaker policy"
             )
-
-        if pending_result is not None:
-            pending_ttl = pending_result.get("pending_ttl")
-            if pending_ttl is not None:
-                pending_ttl = int(pending_ttl) - 1
-                pending_result["pending_ttl"] = pending_ttl
-                if pending_ttl <= 0:
-                    log.warn(
-                        f"Frame {frame_id}: stale degraded pending result dropped after TTL"
-                    )
-                    pending_result = None
 
         time.sleep(delay)
         return pending_result, ack_failures, "continue", consecutive_permanent_rejects

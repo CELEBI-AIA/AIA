@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from config.settings import Settings
+from src.gps_health import normalize_gps_health
 from src.utils import Logger
 
 
@@ -142,6 +143,12 @@ class VisualOdometry:
         self._ema_dy: float = 0.0
 
         self._max_displacement_per_frame: float = 5.0
+        self._gps_reanchor_alpha: float = max(
+            0.0, min(1.0, float(Settings.GPS_REANCHOR_ALPHA))
+        )
+        self._gps_reanchor_max_delta_m: float = max(
+            0.0, float(Settings.GPS_REANCHOR_MAX_DELTA_M)
+        )
 
         self._was_gps_healthy: bool = False
         self._mode: str = "GPS_FUSED"
@@ -187,7 +194,10 @@ class VisualOdometry:
         frame_ctx: "FrameContext",
         server_data: Dict,
     ) -> Dict[str, float]:
-        gps_health = server_data.get("gps_health", 0)
+        gps_health, _ = normalize_gps_health(
+            server_data.get("gps_health"),
+            gps_health_status=server_data.get("gps_health_status"),
+        )
         now_mono = time.monotonic()
         if self._last_update_monotonic is None:
             self._last_update_monotonic = now_mono
@@ -199,7 +209,10 @@ class VisualOdometry:
 
         if gps_health == 1:
             # GPS sağlıklı: sunucu verisini kullan, gri kareyi referans için sakla
-            self._update_from_gps(server_data)
+            self._update_from_gps(
+                server_data,
+                soft_reanchor=not self._was_gps_healthy,
+            )
             self._prev_gray = gray
             self._was_gps_healthy = True
             self._mode = "GPS_FUSED"
@@ -235,7 +248,7 @@ class VisualOdometry:
                 else:
                     self.predict_without_measurement(
                         reason_code="optical_flow_unavailable",
-                        gps_health=0,
+                        gps_health=0 if gps_health == 0 else -1,
                     )
             else:
                 self.log.warn(
@@ -245,21 +258,41 @@ class VisualOdometry:
                 self._update_reference_frame(gray)
                 self.predict_without_measurement(
                     reason_code="missing_reference_frame",
-                    gps_health=0,
+                    gps_health=0 if gps_health == 0 else -1,
                 )
 
         self._latency_comp.update_velocity(self.position)
         self._last_update_monotonic = now_mono
         return self.get_position()
 
-    def _update_from_gps(self, server_data: Dict) -> None:
+    def _update_from_gps(self, server_data: Dict, soft_reanchor: bool = False) -> None:
         new_x = float(server_data.get("translation_x", self.position["x"]))
         new_y = float(server_data.get("translation_y", self.position["y"]))
         new_z = float(server_data.get("translation_z", self.position["z"]))
 
-        self.position["x"] = new_x
-        self.position["y"] = new_y
-        self.position["z"] = new_z
+        if soft_reanchor:
+            dx = new_x - self.position["x"]
+            dy = new_y - self.position["y"]
+            dz = new_z - self.position["z"]
+            delta_norm = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+            if (
+                self._gps_reanchor_max_delta_m > 0.0
+                and delta_norm > self._gps_reanchor_max_delta_m
+                and delta_norm > 1e-9
+            ):
+                scale = self._gps_reanchor_max_delta_m / delta_norm
+                dx *= scale
+                dy *= scale
+                dz *= scale
+
+            alpha = self._gps_reanchor_alpha
+            self.position["x"] += dx * alpha
+            self.position["y"] += dy * alpha
+            self.position["z"] += dz * alpha
+        else:
+            self.position["x"] = new_x
+            self.position["y"] = new_y
+            self.position["z"] = new_z
 
         if new_z > 0:
             self._last_gps_altitude = new_z
@@ -342,14 +375,12 @@ class VisualOdometry:
         smooth_dx = max(-cap, min(cap, self._ema_dx))
         smooth_dy = max(-cap, min(cap, self._ema_dy))
 
-        # Z-Ekseni Drift Koruması: Optik akış ile yükseklik hesabı sapmalara
-        # yol açabildiği için, z ekseni son bilinen güvenilir GPS yüksekliğine kilitlenir.
         self.position["x"] += smooth_dx
         self.position["y"] += smooth_dy
-        self.position["z"] = float(self._last_gps_altitude)
+        dz_meters = max(-cap, min(cap, (1.0 - scale_ratio) * max(altitude, 1.0)))
+        self.position["z"] = max(0.0, float(self.position["z"]) + dz_meters)
 
         self._last_of_position = {k: v for k, v in self.position.items()}
-        dz_meters = 0.0  # Z ekseni sabitlendiği için dZ = 0 sayıyoruz
 
         self.log.debug(
             f"Optik Akış → dX:{dx_meters:.3f}m dY:{dy_meters:.3f}m dZ:{dz_meters:.3f}m | "

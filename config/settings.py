@@ -30,6 +30,8 @@ class Settings:
         0.40  # 0.0-1.0, düşük = daha fazla tespit (noise riski)
     )
     NMS_IOU_THRESHOLD: float = 0.15  # Çakışan kutuları bastırma eşiği
+    NMS_MODE: str = "class_aware"  # class_aware|agnostic|hybrid
+    HYBRID_NMS_IOU_THRESHOLD: float = 0.65
     DEVICE: str = "cuda"
     HALF_PRECISION: bool = True
     INFERENCE_SIZE: int = 1280
@@ -43,6 +45,12 @@ class Settings:
     CLAHE_TILE_SIZE: int = 8
     MIN_BBOX_SIZE: int = 20
     MAX_BBOX_SIZE: int = 9999
+    CLASS_ADAPTIVE_FILTERS: dict = {
+        "0": {"min_size": 20, "max_aspect": 6.0},  # Tasit
+        "1": {"min_size": 12, "max_aspect": 5.5},  # Insan
+        "2": {"min_size": 24, "max_aspect": 2.5},  # UAP
+        "3": {"min_size": 24, "max_aspect": 2.5},  # UAI
+    }
 
     # SAHI: Görüntüyü parçalara böl, küçük nesneleri (drone tepeden bakış) yakala
     SAHI_ENABLED: bool = True
@@ -60,9 +68,17 @@ class Settings:
     TASK3_FALLBACK_INTERVAL: int = 5
     TASK3_GRID_STRIDE: int = 32
     TASK3_MAX_REFERENCES: int = 10
+    TASK3_REFERENCE_BATCH_SIZE: int = 5
     TASK3_FEATURE_METHOD: str = "ORB"
     TASK3_DUPLICATE_DEGRADE_RATIO: float = 0.50
     TASK3_DUPLICATE_DEGRADE_MIN_COUNT: int = 3
+    TASK3_INCLUDE_QUALITY_FIELDS: bool = False
+    TASK3_QUALITY_HIGH_THRESHOLD: float = 0.85
+    TASK3_QUALITY_MEDIUM_THRESHOLD: float = 0.72
+    TASK3_DOMAIN_FALLBACK_ENABLED: bool = True
+    TASK3_DOMAIN_FALLBACK_METHOD: str = "AKAZE"
+    TASK3_DOMAIN_FALLBACK_THRESHOLD: float = 0.58
+    TASK3_DOMAIN_FALLBACK_INTERVAL: int = 3
 
     # Sınıflar (şartname)
     CLASS_TASIT: int = 0  # Taşıt
@@ -116,6 +132,7 @@ class Settings:
     CAMERA_CX: float = 960.0
     CAMERA_CY: float = 540.0
     DEFAULT_ALTITUDE: float = 50.0
+    CAMERA_CALIBRATION_GUARD_ENABLED: bool = True
 
     # Ağ
     REQUEST_TIMEOUT: int = 5
@@ -137,8 +154,17 @@ class Settings:
     CB_OPEN_COOLDOWN_SEC: float = 8.0
     CB_MAX_OPEN_CYCLES: int = 6
     CB_SESSION_MAX_TRANSIENT_SEC: float = 120.0
+    CB_SESSION_SOFT_TRANSIENT_SEC: float = 90.0
     DEGRADE_FETCH_ONLY_ENABLED: bool = True
     DEGRADE_SEND_INTERVAL_FRAMES: int = 5
+    DEGRADE_REPLAY_ENABLED: bool = True
+    DEGRADE_REPLAY_MAX_AGE_FRAMES: int = 6
+    DEGRADE_REPLAY_MAX_OBJECTS: int = 40
+    DEGRADE_FALLBACK_RATIO_WINDOW: int = 40
+    DEGRADE_FALLBACK_RATIO_HIGH: float = 0.75
+    PERMANENT_REJECT_RETRY_LIMIT: int = 1
+    DUPLICATE_STORM_THRESHOLD: int = 5
+    DUPLICATE_STORM_ACTION: str = "terminate_session"  # terminate_session|continue
 
     # Dosya yolları
     LOG_DIR: str = os.path.join(str(PROJECT_ROOT), "logs")
@@ -152,21 +178,46 @@ class Settings:
     # Performans
     FPS_REPORT_INTERVAL: int = 10
     COMPETITION_RESULT_LOG_INTERVAL: int = 10
+    COMPETITION_DEBUG_DRAW_INTERVAL: int = 10
     LOOP_DELAY: float = 0.0
     GPU_CLEANUP_INTERVAL: int = 200
     DEBUG_SAVE_INTERVAL: int = 50
     ENABLE_JSON_LOGGING: bool = True
     JSON_LOG_EVERY_N_FRAMES: int = 10
+    DYNAMIC_JSON_LOG_INTERVAL_ENABLED: bool = True
+    DYNAMIC_JSON_LOG_SLOW_INTERVAL: int = 40
+    DYNAMIC_JSON_LOG_MEDIUM_INTERVAL: int = 20
+    DYNAMIC_JSON_LOG_FAST_INTERVAL: int = 10
     LOG_MAX_FILES: int = 2000
+    LOW_FPS_GUARD_ENABLED: bool = True
+    LOW_FPS_GUARD_THRESHOLD: float = 1.0
+    LOW_FPS_GUARD_RECOVERY_THRESHOLD: float = 1.4
+    LOW_FPS_GUARD_WINDOW: int = 20
+    LOW_FPS_GUARD_RECOVERY_STREAK: int = 12
+    PROTECTIVE_INFERENCE_SIZE: int = 960
+    PROTECTIVE_MAX_DETECTIONS: int = 180
+    PROTECTIVE_CONFIDENCE_THRESHOLD: float = 0.50
+    PROTECTIVE_LOG_INTERVAL: int = 25
+    PROTECTIVE_DEGRADE_SEND_INTERVAL_FRAMES: int = 8
+    PROTECTIVE_DISABLE_SAHI: bool = True
+    LIGHT_PROFILE_INFERENCE_SIZE: int = 960
+    LIGHT_PROFILE_MAX_DETECTIONS: int = 180
+    LIGHT_PROFILE_CONFIDENCE_THRESHOLD: float = 0.50
+    LIGHT_PROFILE_AUGMENTED_INFERENCE: bool = False
+    LIGHT_PROFILE_SAHI_ENABLED: bool = False
     DETERMINISM_SEED: int = 42
     DETERMINISM_CPU_THREADS: int = 1
     MOTION_FIELD_NAME: str = "motion_status"
     PAYLOAD_CLS_AS_INT: bool = False
+    PAYLOAD_STATUS_TYPE_PROFILE: str = "int"  # int|string
+    PAYLOAD_ADAPTER_VERSION: str = "v1"  # v1|v1_legacy|v2_int
 
     # Hareket (movement_status)
     MOVEMENT_WINDOW_FRAMES: int = 24
     MOVEMENT_MIN_HISTORY: int = 6
     MOVEMENT_THRESHOLD_PX: float = 12.0
+    MOVEMENT_EARLY_SIGNAL_RATIO: float = 0.75
+    MOVEMENT_HYSTERESIS_RATIO: float = 0.65
     MOVEMENT_MATCH_DISTANCE_PX: float = 80.0
     MOVEMENT_MAX_MISSED_FRAMES: int = 8
     MOVEMENT_THRESHOLD_REF_WIDTH: int = 1920
@@ -183,6 +234,8 @@ class Settings:
     LATENCY_COMP_MAX_MS: float = 120.0
     LATENCY_COMP_MAX_DELTA_M: float = 0.3
     LATENCY_COMP_EMA_ALPHA: float = 0.35
+    GPS_REANCHOR_ALPHA: float = 0.35
+    GPS_REANCHOR_MAX_DELTA_M: float = 8.0
 
     # Yarışma limitleri
     MAX_FRAMES: int = 2250
@@ -193,6 +246,7 @@ class Settings:
         "2": 10,
         "3": 10,
     }
+    BASE_URL_ALLOWLIST: tuple = ("127.0.0.1", "localhost", "test")
 
 
 # task3_params.yaml → Görev 3 parametre override

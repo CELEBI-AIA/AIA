@@ -1,5 +1,20 @@
 # CHANGELOGS
 
+## 0.0.38 - 2026-03-03
+- **feat(config)**: Added NMS_MODE (class_aware|agnostic|hybrid), HYBRID_NMS_IOU_THRESHOLD, CLASS_ADAPTIVE_FILTERS per class.
+- **feat(config)**: Added TASK3_REFERENCE_BATCH_SIZE, TASK3_INCLUDE_QUALITY_FIELDS, TASK3_DOMAIN_FALLBACK_* (AKAZE), GPS_REANCHOR_*.
+- **feat(config)**: Added LOW_FPS_GUARD_*, PROTECTIVE_*, LIGHT_PROFILE_*, DEGRADE_REPLAY_*, DEGRADE_FALLBACK_RATIO_*, DUPLICATE_STORM_*.
+- **feat(main)**: Integrated flow_policy (FetchStrategy, FrameLifecycleState, decide_degrade_fetch_strategy, decide_duplicate_storm_action).
+- **feat(main)**: Added camera calibration guard (CAMERA_CALIBRATION_GUARD_ENABLED) with FOCAL_LENGTH_PX/CAMERA_CX/CAMERA_CY validation.
+- **feat(main)**: Added low FPS guard with automatic protective mode (reduce SAHI, inference size, degrade interval) and recovery.
+- **feat(main)**: Added dynamic JSON log interval based on rolling FPS; periodic GPU maintenance (gc + empty_cache).
+- **feat(main)**: Frame lifecycle state machine (IDLE→FETCHED→PROCESSED→SUBMITTING→ACKED) with valid transition checks.
+- **refactor(main)**: Task3 reference validation moved to `task3_reference_policy.canonicalize_task3_references`.
+- **refactor(main)**: `gps_health` normalization delegated to `gps_health.normalize_gps_health`; tri-state (0/1/unknown) support.
+- **feat(src)**: Added `flow_policy.py`, `gps_health.py`, `task3_reference_policy.py`, `payload_adapter.py`.
+- **docs(readme)**: Updated localization, network, reliability tables; added Ağ/Resilience/Payload Guard config; audit #9–15; test count 66.
+- **release**: Bumped project version to `0.0.38`.
+
 ## 0.0.37 - 2026-03-03
 - **fix(network)**: Disabled class quotas (`RESULT_CLASS_QUOTA`) and global caps to prevent critical mAP loss during busy scenes.
 - **fix(network)**: Strengthened idempotency check to immediately return `ACKED` and prevent duplicate send penalizations.

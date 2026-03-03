@@ -38,6 +38,8 @@ class SessionResilienceController:
         self._non_normal_since: Optional[float] = None
         self._open_until_monotonic: float = 0.0
         self._degrade_frame_counter: int = 0
+        self._soft_limit_warned: bool = False
+        self._hard_limit_deferred_logged: bool = False
 
     def _now(self) -> float:
         return time.monotonic()
@@ -65,10 +67,14 @@ class SessionResilienceController:
 
         if old_state == ResilienceState.NORMAL and new_state != ResilienceState.NORMAL:
             self._non_normal_since = curr
+            self._soft_limit_warned = False
+            self._hard_limit_deferred_logged = False
         elif old_state != ResilienceState.NORMAL and new_state == ResilienceState.NORMAL:
             if self._non_normal_since is not None:
                 self.stats.transient_wall_time_sec += max(0.0, curr - self._non_normal_since)
             self._non_normal_since = None
+            self._soft_limit_warned = False
+            self._hard_limit_deferred_logged = False
 
         if old_state == ResilienceState.NORMAL and new_state == ResilienceState.DEGRADED:
             self.stats.degrade_entries += 1
@@ -138,16 +144,41 @@ class SessionResilienceController:
         self.stats.degrade_frames += 1
         return self._degrade_frame_counter
 
-    def should_abort(self) -> Optional[str]:
+    def should_abort(self, has_pending_result: bool = False) -> Optional[str]:
         if self.state == ResilienceState.NORMAL:
             return None
+
         wall_time = self._current_transient_wall_time()
-        limit = float(Settings.CB_SESSION_MAX_TRANSIENT_SEC)
-        if wall_time >= limit:
+        hard_limit = float(Settings.CB_SESSION_MAX_TRANSIENT_SEC)
+        soft_limit = float(
+            getattr(
+                Settings,
+                "CB_SESSION_SOFT_TRANSIENT_SEC",
+                max(1.0, hard_limit * 0.75),
+            )
+        )
+
+        if wall_time >= hard_limit:
+            if has_pending_result:
+                if not self._hard_limit_deferred_logged:
+                    self.log.warn(
+                        "Resilience hard limit reached but pending_result is active; "
+                        "deferring abort until submit closes."
+                    )
+                    self._hard_limit_deferred_logged = True
+                return None
             return (
-                f"Transient wall time {wall_time:.0f}s >= limit {limit:.0f}s; "
+                f"Transient wall time {wall_time:.0f}s >= hard limit {hard_limit:.0f}s; "
                 "aborting session to avoid indefinite wait"
             )
+
+        if wall_time >= soft_limit and not self._soft_limit_warned:
+            self.log.warn(
+                f"Resilience soft limit reached (wall_time={wall_time:.0f}s "
+                f">= {soft_limit:.0f}s); session continues in degraded mode."
+            )
+            self._soft_limit_warned = True
+
         return None
 
     def is_degraded(self) -> bool:

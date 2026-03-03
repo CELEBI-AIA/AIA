@@ -18,6 +18,7 @@ class CompetitionPayloadSchema:
                 "Invalid MOTION_FIELD_NAME config: "
                 f"expected '{cls.CANONICAL_MOTION_FIELD}', got '{configured or '<empty>'}'"
             )
+        cls._read_status_type_profile()
 
     @classmethod
     def normalize_motion_value(
@@ -67,10 +68,12 @@ class CompetitionPayloadSchema:
             )
 
         out_class = int(class_id) if Settings.PAYLOAD_CLS_AS_INT else str(class_id)
+        landing_value = cls.cast_status_value(int(landing))
+        motion_value = cls.cast_status_value(int(motion))
         normalized = {
             "cls": out_class,
-            "landing_status": int(landing),
-            cls.CANONICAL_MOTION_FIELD: int(motion),
+            "landing_status": landing_value,
+            cls.CANONICAL_MOTION_FIELD: motion_value,
             "top_left_x": int(x1),
             "top_left_y": int(y1),
             "bottom_right_x": int(x2),
@@ -85,6 +88,27 @@ class CompetitionPayloadSchema:
         if v not in {"-1", "0", "1"}:
             return "-1"
         return v
+
+    @classmethod
+    def cast_status_value(cls, value: int) -> Any:
+        profile = cls._read_status_type_profile()
+        if profile == "string":
+            return str(int(value))
+        return int(value)
+
+    @staticmethod
+    def _read_status_type_profile() -> str:
+        profile_raw = str(
+            getattr(Settings, "PAYLOAD_STATUS_TYPE_PROFILE", "int")
+        ).strip().lower()
+        if profile_raw in {"int", "integer"}:
+            return "int"
+        if profile_raw in {"string", "str"}:
+            return "string"
+        raise DataContractError(
+            "Invalid PAYLOAD_STATUS_TYPE_PROFILE config: "
+            f"expected 'int' or 'string', got '{profile_raw or '<empty>'}'"
+        )
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -148,4 +172,3 @@ class CompetitionPayloadSchema:
             if used_alias:
                 alias_count += 1
         return normalized, alias_count
-

@@ -84,13 +84,13 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 | **Hız** | FP16 half-precision + model warmup → **~33 FPS** (RTX 3060) |
 | **İniş Tespiti** | Intersection-over-area + kenar temas kontrolü + perspektif marjı |
 | **Hareket Tespiti** | Temporal pencere tabanlı karar + kamera hareket kompanzasyonu |
-| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + Z ekseni scale tahmini + EMA yumuşatma |
+| **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + `gps_health` tri-state + dinamik Z + yumuşak re-anchor |
 | **Referans Obje** | ORB/SIFT feature matching + homography + degenerate guard (Görev 3) |
-| **Ağ** | Otomatik retry, timeout yönetimi, circuit breaker, idempotency guard |
+| **Ağ** | Otomatik retry, timeout yönetimi, idempotency guard, allowlist + startup guard |
 | **Debug** | Renkli konsol çıktısı, tespit görselleştirme, periyodik kayıt |
-| **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, OOM koruması |
+| **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, soft/hard abort politikası |
 | **Offline** | İnternet bağlantısı gerektirmez — yarışma kurallarına uygun (şartname 6.2) |
-| **Test** | 45 birim testi, pytest-timeout (10s), tek dosyada (`tests/test_all.py`) |
+| **Test** | 66 birim testi, pytest-timeout (10s), tek dosyada (`tests/test_all.py`) |
 
 ---
 
@@ -223,6 +223,7 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
 | `BASE_URL` | `http://127.0.0.1:5000` | Sunucu adresi (yarışma günü güncellenir) |
+| `BASE_URL_ALLOWLIST` | `("127.0.0.1", "localhost", "test")` | Competition modunda izinli host listesi (startup guard) |
 | `TEAM_NAME` | `"Takim_ID"` | Takım kimliği (yarışma günü güncellenir) |
 | `SIMULATION_MODE` | `True` | Legacy simülasyon bayrağı (runtime CLI-first çalışır) |
 | `DEFAULT_RUNTIME_MODE` | `"visual_validation"` | Varsayılan çalışma modu (insan-doğrulamalı test akışı) |
@@ -280,12 +281,14 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 |-----------|-----------|----------|
 | `FOCAL_LENGTH_PX` | `800.0` | Kamera odak uzunluğu (px) — yarışma kamera parametreleriyle güncellenmeli |
 | `DEFAULT_ALTITUDE` | `50.0` | Optik akış fallback irtifası (m) |
-| `LATENCY_COMP_ENABLED` | `False` | GPS=0 için submit öncesi latency compensation/projeksiyon bayrağı |
+| `LATENCY_COMP_ENABLED` | `True` | GPS=0 için submit öncesi latency compensation/projeksiyon bayrağı |
 | `LATENCY_COMP_MAX_MS` | `120.0` | Ölçülen fetch→submit gecikmesi için üst sınır (ms) |
-| `LATENCY_COMP_MAX_DELTA_M` | `2.0` | Frame başına maksimum projeksiyon mesafesi clamp (m) |
+| `LATENCY_COMP_MAX_DELTA_M` | `0.3` | Frame başına maksimum projeksiyon mesafesi clamp (m) |
 | `LATENCY_COMP_EMA_ALPHA` | `0.35` | Hız (v_t) EMA yumuşatma katsayısı |
+| `GPS_REANCHOR_ALPHA` | `0.35` | GPS geri geldiğinde yumuşak re-anchor katsayısı |
+| `GPS_REANCHOR_MAX_DELTA_M` | `8.0` | Re-anchor için frame başına maksimum düzeltme (m) |
 
-> Not: Compensation sadece `gps_health=0` olduğunda çalışır, fetch zamanı monotonic olarak ölçülür ve payload şeması değiştirilmez.
+> Not: `gps_health` semantiği tri-state (`0/1/unknown`) olarak normalize edilir. `unknown` değeri zorla `0` veya `1` yapılmaz.
 
 ### Görev 3 (Referans Obje Tespiti)
 
@@ -318,6 +321,18 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `MOTION_COMP_QUALITY_LEVEL` | `0.01` | Köşe kalite eşiği |
 | `MOTION_COMP_MIN_DISTANCE` | `20` | Köşeler arası minimum mesafe |
 | `MOTION_COMP_WIN_SIZE` | `21` | LK optik akış pencere boyutu |
+
+### Ağ / Resilience / Payload Guard
+
+| Parametre | Varsayılan | Açıklama |
+|-----------|-----------|----------|
+| `CB_SESSION_MAX_TRANSIENT_SEC` | `120.0` | Hard abort limiti (pending yoksa) |
+| `CB_SESSION_SOFT_TRANSIENT_SEC` | `90.0` | Soft limit; sadece uyarı + degrade devam |
+| `PERMANENT_REJECT_RETRY_LIMIT` | `1` | `permanent_rejected` sonrası kontrollü yeniden deneme sayısı |
+| `RESULT_MAX_OBJECTS` | `100` | Payload global obje üst limiti |
+| `RESULT_CLASS_QUOTA` | `{"0":40,"1":40,"2":10,"3":10}` | Sınıf bazlı payload kotası |
+| `PAYLOAD_STATUS_TYPE_PROFILE` | `"int"` | `landing_status`/`motion_status` tip profili (`int` veya `string`) |
+| `PAYLOAD_CLS_AS_INT` | `False` | `cls` alanını `int`/`string` gönderim profili |
 
 ### Tutarlılık ve Tekrarlanabilirlik (Best-Effort)
 
@@ -394,6 +409,7 @@ HavaciliktaYZ/
 │   ├── movement.py         # Görev 1: Temporal hareket kararı + kamera kompanzasyonu
 │   ├── localization.py     # Görev 2: GPS + optik akış + EMA pozisyon kestirimi
 │   ├── image_matcher.py    # Görev 3: ORB/SIFT referans obje eşleştirme
+│   ├── gps_health.py       # gps_health tri-state normalize yardımcıları
 │   ├── network.py          # Sunucu iletişimi + retry + idempotency + payload guard
 │   ├── resilience.py       # Circuit breaker + degrade mode kontrolü
 │   ├── data_loader.py      # Simülasyon veri yükleme (VID/DET)
@@ -406,7 +422,7 @@ HavaciliktaYZ/
 │
 ├── tests/
 │   ├── conftest.py         # ML mock'ları + 10s global timeout
-│   └── test_all.py         # 47 konsolide birim testi
+│   └── test_all.py         # 66 konsolide birim testi
 │
 ├── model/
 │   └── best_*.pt           # Eğitilmiş YOLOv8 modeli (Git'e dahil değil)
@@ -438,13 +454,19 @@ Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirme
 | 6 | **Homography koruması** | `image_matcher.py` | Dejenere/koliner nokta kontrolü + fallback bounding rect |
 | 7 | **task3_params.yaml** | `config/settings.py` | YAML opsiyonel yükleme; mevcutsa Görev 3 parametrelerini override eder |
 | 8 | **Fallback pozisyon** | `main.py` | Görüntü indirilemezse son bilinen pozisyon (0,0,0 yerine) |
-| 9 | **Circuit breaker** | `resilience.py` | Oturum iptali yok; degrade modunda devam, ağ düzelince toparlanma |
+| 9 | **Resilience soft/hard abort** | `resilience.py` | Soft/hard limit ayrımı + pending varken hard-abort erteleme |
+| 10 | **ACK güvenliği** | `main.py` | `pending_ttl` drop yolu kaldırıldı; ACK gelmeden frame kapanışı yok |
+| 11 | **Controlled permanent reject retry** | `main.py` | `permanent_rejected` sonrası kontrollü yeniden deneme |
+| 12 | **Payload type profile** | `payload_schema.py` | `landing_status`/`motion_status` için `int|string` profil desteği |
+| 13 | **Object cap hardening** | `network.py` | `RESULT_CLASS_QUOTA` + `RESULT_MAX_OBJECTS` gerçek limitleri |
+| 14 | **BASE_URL startup guard** | `network.py` | Allowlist dışı host ile competition başlangıcını engelleme |
+| 15 | **gps_health tri-state** | `gps_health.py`, `main.py`, `network.py` | `0/1/unknown` tek kaynak normalize semantiği |
 
 ### Testler
 
 ```bash
-# Tüm testleri çalıştır (pytest-timeout 10s)
-python -m pytest tests/test_all.py -v
+# Tüm testleri çalıştır
+python -m pytest -q
 ```
 
 Gereksinimler: `pytest`, `pytest-timeout`, `PyYAML` (`requirements.txt` içinde)

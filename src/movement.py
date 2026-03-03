@@ -17,6 +17,7 @@ from config.settings import Settings
 class _Track:
     history: Deque[Tuple[float, float, float, float]] = field(default_factory=deque)
     missed: int = 0
+    last_status: str = "0"
 
 
 class MovementEstimator:
@@ -84,16 +85,25 @@ class MovementEstimator:
                 track.history.append((cx, cy, self._cam_total_x, self._cam_total_y))
             track.missed = 0
 
-            status = self._status(track.history)
+            status = self._status(track.history, track.last_status)
+            track.last_status = status
             det["motion_status"] = status
 
         return detections
 
-    def _status(self, history: Deque[Tuple[float, float, float, float]]) -> str:
+    def _status(
+        self,
+        history: Deque[Tuple[float, float, float, float]],
+        previous_status: str,
+    ) -> str:
         """Sliding window: kamera-kompanze edilmiş yer değiştirme > threshold → hareketli"""
         n = len(history)
         scale = self._frame_width / Settings.MOVEMENT_THRESHOLD_REF_WIDTH
         threshold = Settings.MOVEMENT_THRESHOLD_PX * scale
+        early_ratio = max(0.1, float(getattr(Settings, "MOVEMENT_EARLY_SIGNAL_RATIO", 0.75)))
+        hysteresis_ratio = max(0.1, float(getattr(Settings, "MOVEMENT_HYSTERESIS_RATIO", 0.65)))
+        move_on_threshold = threshold
+        move_off_threshold = threshold * hysteresis_ratio
 
         if n < Settings.MOVEMENT_MIN_HISTORY:
             if n >= 2:
@@ -102,11 +112,14 @@ class MovementEstimator:
                 rel_dx = (x1 - x0) - (cam1_x - cam0_x)
                 rel_dy = (y1 - y0) - (cam1_y - cam0_y)
                 dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
-                if dist >= threshold * 0.9:
+                if dist >= threshold * early_ratio:
+                    return "1"
+                if previous_status == "1" and dist >= move_off_threshold:
                     return "1"
             return "0"
 
         step = max(1, Settings.MOVEMENT_MIN_HISTORY - 1)
+        max_dist = 0.0
 
         for i in range(n - step):
             j = i + step
@@ -116,11 +129,12 @@ class MovementEstimator:
             rel_dx = (x1 - x0) - (cam1_x - cam0_x)
             rel_dy = (y1 - y0) - (cam1_y - cam0_y)
             dist = (rel_dx * rel_dx + rel_dy * rel_dy) ** 0.5
+            if dist > max_dist:
+                max_dist = dist
 
-            if dist >= threshold:
-                return "1"
-
-        return "0"
+        if previous_status == "1":
+            return "1" if max_dist >= move_off_threshold else "0"
+        return "1" if max_dist >= move_on_threshold else "0"
 
     def _match(self, centers: Dict[int, Tuple[float, float]]) -> Dict[int, int]:
         assignments: Dict[int, int] = {}

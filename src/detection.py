@@ -4,7 +4,7 @@ Model COCO/VisDrone vb. eğitilmiş olabilir; sınıflar TEKNOFEST (0,1,2,3) for
 import os
 import unicodedata
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -155,13 +155,84 @@ class ObjectDetector:
     def _map_model_class_to_teknofest(self, model_cls_id: int) -> int:
         return self._model_class_map.get(model_cls_id, -1)
 
-    def detect(self, frame: np.ndarray) -> List[Dict]:
+    @staticmethod
+    def _resolve_nms_mode() -> str:
+        mode = str(getattr(Settings, "NMS_MODE", "")).strip().lower()
+        if mode in {"class_aware", "agnostic", "hybrid"}:
+            return mode
+        return "agnostic" if bool(getattr(Settings, "AGNOSTIC_NMS", False)) else "class_aware"
+
+    def _build_inference_config(self, runtime_profile: str) -> Dict[str, Any]:
+        profile = str(runtime_profile or "default").strip().lower()
+        if profile == "light":
+            return {
+                "imgsz": max(
+                    256,
+                    int(
+                        getattr(
+                            Settings,
+                            "LIGHT_PROFILE_INFERENCE_SIZE",
+                            Settings.INFERENCE_SIZE,
+                        )
+                    ),
+                ),
+                "conf": float(
+                    max(
+                        Settings.CONFIDENCE_THRESHOLD,
+                        getattr(
+                            Settings,
+                            "LIGHT_PROFILE_CONFIDENCE_THRESHOLD",
+                            Settings.CONFIDENCE_THRESHOLD,
+                        ),
+                    )
+                ),
+                "iou": float(Settings.NMS_IOU_THRESHOLD),
+                "max_det": max(
+                    1,
+                    int(
+                        getattr(
+                            Settings,
+                            "LIGHT_PROFILE_MAX_DETECTIONS",
+                            Settings.MAX_DETECTIONS,
+                        )
+                    ),
+                ),
+                "augment": bool(
+                    getattr(Settings, "LIGHT_PROFILE_AUGMENTED_INFERENCE", False)
+                ),
+                "sahi_enabled": bool(
+                    getattr(Settings, "LIGHT_PROFILE_SAHI_ENABLED", False)
+                ),
+                "merge_iou": float(Settings.SAHI_MERGE_IOU),
+                "hybrid_iou": float(
+                    getattr(Settings, "HYBRID_NMS_IOU_THRESHOLD", 0.65)
+                ),
+            }
+
+        return {
+            "imgsz": int(Settings.INFERENCE_SIZE),
+            "conf": float(Settings.CONFIDENCE_THRESHOLD),
+            "iou": float(Settings.NMS_IOU_THRESHOLD),
+            "max_det": int(Settings.MAX_DETECTIONS),
+            "augment": bool(Settings.AUGMENTED_INFERENCE),
+            "sahi_enabled": bool(Settings.SAHI_ENABLED),
+            "merge_iou": float(Settings.SAHI_MERGE_IOU),
+            "hybrid_iou": float(getattr(Settings, "HYBRID_NMS_IOU_THRESHOLD", 0.65)),
+        }
+
+    def detect(self, frame: np.ndarray, runtime_profile: str = "default") -> List[Dict]:
         try:
+            inference_cfg = self._build_inference_config(runtime_profile)
             processed = self._preprocess(frame)
-            if Settings.SAHI_ENABLED:
-                raw_detections = self._sahi_detect(processed)
+            if inference_cfg["sahi_enabled"]:
+                raw_detections = self._sahi_detect(processed, inference_cfg=inference_cfg)
             else:
-                raw_detections = self._standard_inference(processed)
+                raw_detections = self._standard_inference(
+                    processed, inference_cfg=inference_cfg
+                )
+            raw_detections = self._apply_runtime_nms(
+                raw_detections, inference_cfg=inference_cfg
+            )
             raw_detections = self._post_filter(raw_detections)
             frame_h, frame_w = frame.shape[:2]
             final_detections = self._determine_landing_status(
@@ -192,6 +263,13 @@ class ObjectDetector:
                     f"UAİ: {cls_counts.get('3', 0)})"
                 )
 
+            if Settings.DEBUG:
+                self.log.debug(
+                    f"Inference profile={runtime_profile} "
+                    f"sahi={'on' if inference_cfg['sahi_enabled'] else 'off'} "
+                    f"imgsz={inference_cfg['imgsz']} conf={inference_cfg['conf']:.2f}"
+                )
+
             self._frame_count += 1
 
             return output
@@ -208,36 +286,45 @@ class ObjectDetector:
             self.log.error(f"Tespit hatası: {e}")
             return []
 
-    def _standard_inference(self, frame: np.ndarray) -> List[Dict]:
+    def _standard_inference(
+        self,
+        frame: np.ndarray,
+        inference_cfg: Dict[str, Any],
+    ) -> List[Dict]:
         with torch.no_grad():
             results = self.model.predict(
                 source=frame,
-                imgsz=Settings.INFERENCE_SIZE,
-                conf=Settings.CONFIDENCE_THRESHOLD,
-                iou=Settings.NMS_IOU_THRESHOLD,
+                imgsz=int(inference_cfg["imgsz"]),
+                conf=float(inference_cfg["conf"]),
+                iou=float(inference_cfg["iou"]),
                 device=self.device,
                 verbose=False,
                 save=False,
                 half=self._use_half,
-                agnostic_nms=Settings.AGNOSTIC_NMS,
-                max_det=Settings.MAX_DETECTIONS,
-                augment=Settings.AUGMENTED_INFERENCE,
+                agnostic_nms=self._resolve_nms_mode() == "agnostic",
+                max_det=int(inference_cfg["max_det"]),
+                augment=bool(inference_cfg["augment"]),
             )
         return self._parse_results(results)
 
-    def _sahi_detect(self, frame: np.ndarray) -> List[Dict]:
+    def _sahi_detect(
+        self,
+        frame: np.ndarray,
+        inference_cfg: Dict[str, Any],
+    ) -> List[Dict]:
         # Full-frame + parçalı inference birleştir, NMS ile duplikasyonu temizle
         all_detections: List[Dict] = []
-        full_dets = self._standard_inference(frame)
+        full_dets = self._standard_inference(frame, inference_cfg=inference_cfg)
         all_detections.extend(full_dets)
-        slice_dets = self._sliced_inference(frame)
+        slice_dets = self._sliced_inference(frame, inference_cfg=inference_cfg)
         all_detections.extend(slice_dets)
-        if len(all_detections) > 0:
-            all_detections = self._merge_detections_nms(all_detections)
-
         return all_detections
 
-    def _sliced_inference(self, frame: np.ndarray) -> List[Dict]:
+    def _sliced_inference(
+        self,
+        frame: np.ndarray,
+        inference_cfg: Dict[str, Any],
+    ) -> List[Dict]:
         h, w = frame.shape[:2]
         slice_size = Settings.SAHI_SLICE_SIZE
         overlap = Settings.SAHI_OVERLAP_RATIO
@@ -260,14 +347,15 @@ class ObjectDetector:
                     results = self.model.predict(
                         source=tile,
                         imgsz=slice_size,
-                        conf=Settings.CONFIDENCE_THRESHOLD,
-                        iou=Settings.NMS_IOU_THRESHOLD,
+                        conf=float(inference_cfg["conf"]),
+                        iou=float(inference_cfg["iou"]),
                         device=self.device,
                         verbose=False,
                         save=False,
                         half=self._use_half,
-                        agnostic_nms=Settings.AGNOSTIC_NMS,
-                        max_det=Settings.MAX_DETECTIONS,
+                        agnostic_nms=self._resolve_nms_mode() == "agnostic",
+                        max_det=int(inference_cfg["max_det"]),
+                        augment=bool(inference_cfg["augment"]),
                     )
 
                     tile_dets = self._parse_results(results)
@@ -315,6 +403,27 @@ class ObjectDetector:
                 })
         return detections
 
+    def _apply_runtime_nms(
+        self,
+        detections: List[Dict],
+        inference_cfg: Dict[str, Any],
+    ) -> List[Dict]:
+        if not detections:
+            return []
+
+        mode = self._resolve_nms_mode()
+        if mode == "agnostic":
+            return self._merge_detections_nms_agnostic(
+                detections, iou_threshold=float(inference_cfg["merge_iou"])
+            )
+        if mode == "hybrid":
+            class_aware = self._merge_detections_nms(detections)
+            return self._merge_detections_nms_agnostic(
+                class_aware,
+                iou_threshold=float(inference_cfg["hybrid_iou"]),
+            )
+        return self._merge_detections_nms(detections)
+
     @staticmethod
     def _merge_detections_nms(detections: List[Dict]) -> List[Dict]:
         if not detections:
@@ -346,6 +455,18 @@ class ObjectDetector:
         nms_results = [detections[i] for i in keep_indices]
 
         return ObjectDetector._suppress_contained(nms_results)
+
+    @staticmethod
+    def _merge_detections_nms_agnostic(
+        detections: List[Dict],
+        iou_threshold: float,
+    ) -> List[Dict]:
+        if not detections:
+            return []
+        boxes = np.array([d["bbox"] for d in detections], dtype=np.float32)
+        scores = np.array([d["confidence"] for d in detections], dtype=np.float32)
+        keep = ObjectDetector._nms_greedy(boxes, scores, float(iou_threshold))
+        return ObjectDetector._suppress_contained([detections[i] for i in keep])
 
     @staticmethod
     def _suppress_contained(detections: List[Dict], threshold: float = 0.85) -> List[Dict]:
@@ -466,21 +587,30 @@ class ObjectDetector:
     @staticmethod
     def _post_filter(detections: List[Dict]) -> List[Dict]:
         filtered: List[Dict] = []
-        min_size = Settings.MIN_BBOX_SIZE
+        class_filters = getattr(Settings, "CLASS_ADAPTIVE_FILTERS", {}) or {}
+        default_min_size = max(1, int(Settings.MIN_BBOX_SIZE))
+        default_max_size = max(default_min_size, int(Settings.MAX_BBOX_SIZE))
+        default_max_aspect = 4.5
 
         for det in detections:
             x1, y1, x2, y2 = det["bbox"]
             w = x2 - x1
             h = y2 - y1
 
+            cls_key = str(det.get("cls_int", det.get("cls", "")))
+            cfg = class_filters.get(cls_key, {})
+            min_size = max(1, int(cfg.get("min_size", default_min_size)))
+            max_size = max(min_size, int(cfg.get("max_size", default_max_size)))
+            max_aspect = float(cfg.get("max_aspect", default_max_aspect))
+
             if w < min_size or h < min_size:
                 continue
 
-            if w > Settings.MAX_BBOX_SIZE or h > Settings.MAX_BBOX_SIZE:
+            if w > max_size or h > max_size:
                 continue
 
             aspect = max(w, h) / max(min(w, h), 1)
-            if aspect > 4.5:
+            if aspect > max_aspect:
                 continue
 
             filtered.append(det)

@@ -66,6 +66,7 @@ from src.competition_contract import (
     RecoverableIOError,
 )
 from src.payload_schema import CompetitionPayloadSchema
+from src.payload_adapter import PayloadAdapter
 from src.utils import Logger, log_json_to_disk, _sanitize_log_component, _prune_old_logs
 from main import run_simulation
 
@@ -713,7 +714,7 @@ class TestIdempotencySubmit(unittest.TestCase):
         self.assertEqual(first, SendResultStatus.ACKED)
         self.assertEqual(second, SendResultStatus.ACKED)
 
-        self.assertEqual(mgr.session.post.call_count, 2)
+        self.assertEqual(mgr.session.post.call_count, 1)
 
 
 @unittest.skipUnless(
@@ -821,10 +822,12 @@ class TestNetworkPayloadGuard(unittest.TestCase):
             "RESULT_MAX_OBJECTS": Settings.RESULT_MAX_OBJECTS,
             "RESULT_CLASS_QUOTA": dict(Settings.RESULT_CLASS_QUOTA),
             "MAX_RETRIES": Settings.MAX_RETRIES,
+            "PAYLOAD_ADAPTER_VERSION": Settings.PAYLOAD_ADAPTER_VERSION,
         }
         Settings.RESULT_MAX_OBJECTS = 100
         Settings.RESULT_CLASS_QUOTA = {"0": 40, "1": 40, "2": 10, "3": 10}
         Settings.MAX_RETRIES = 3
+        Settings.PAYLOAD_ADAPTER_VERSION = "v1"
         self.net = NetworkManager(base_url="http://localhost", simulation_mode=False)
         self.net._sleep_with_backoff = lambda attempt: None
 
@@ -933,6 +936,37 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         )
         self.assertEqual(status, SendResultStatus.RETRYABLE_FAILURE)
 
+    def test_payload_adapter_legacy_is_applied_before_submit(self):
+        Settings.PAYLOAD_ADAPTER_VERSION = "v1_legacy"
+        self.net.session = Mock()
+        self.net.session.post = Mock(return_value=_Response(200))
+        status = self.net.send_result(
+            frame_id="f-legacy",
+            detected_objects=[
+                {
+                    "cls": "0",
+                    "landing_status": "-1",
+                    "motion_status": "0",
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 20,
+                    "bottom_right_y": 30,
+                }
+            ],
+            detected_translation={
+                "translation_x": 0.0,
+                "translation_y": 0.0,
+                "translation_z": 0.0,
+            },
+            frame_data={"id": "f-legacy", "user": "u", "url": "frame-url"},
+            frame_shape=(1080, 1920, 3),
+        )
+        self.assertEqual(status, SendResultStatus.ACKED)
+        sent_payload = self.net.session.post.call_args.kwargs["json"]
+        sent_obj = sent_payload["detected_objects"][0]
+        self.assertIn("movement_status", sent_obj)
+        self.assertNotIn("motion_status", sent_obj)
+
 
 class TestCompetitionPayloadSchema(unittest.TestCase):
     def test_legacy_motion_alias_is_normalized_to_canonical(self):
@@ -962,6 +996,63 @@ class TestCompetitionPayloadSchema(unittest.TestCase):
                 CompetitionPayloadSchema.self_check()
         finally:
             Settings.MOTION_FIELD_NAME = old
+
+
+class TestPayloadAdapter(unittest.TestCase):
+    def setUp(self):
+        self._orig = {
+            "PAYLOAD_ADAPTER_VERSION": Settings.PAYLOAD_ADAPTER_VERSION,
+            "PAYLOAD_CLS_AS_INT": Settings.PAYLOAD_CLS_AS_INT,
+            "PAYLOAD_STATUS_TYPE_PROFILE": Settings.PAYLOAD_STATUS_TYPE_PROFILE,
+        }
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(Settings, key, value)
+
+    @staticmethod
+    def _payload():
+        return {
+            "id": 1,
+            "user": "u",
+            "frame": "f",
+            "detected_objects": [
+                {
+                    "cls": "0",
+                    "landing_status": "1",
+                    "motion_status": "0",
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 5,
+                    "bottom_right_y": 6,
+                }
+            ],
+            "detected_translations": [
+                {"translation_x": 0.0, "translation_y": 0.0, "translation_z": 0.0}
+            ],
+            "detected_undefined_objects": [],
+        }
+
+    def test_v1_legacy_maps_motion_field(self):
+        Settings.PAYLOAD_ADAPTER_VERSION = "v1_legacy"
+        out = PayloadAdapter.adapt_payload(self._payload())
+        obj = out["detected_objects"][0]
+        self.assertIn("movement_status", obj)
+        self.assertNotIn("motion_status", obj)
+        self.assertEqual(obj["movement_status"], "0")
+
+    def test_v2_int_casts_types(self):
+        Settings.PAYLOAD_ADAPTER_VERSION = "v2_int"
+        out = PayloadAdapter.adapt_payload(self._payload())
+        obj = out["detected_objects"][0]
+        self.assertIsInstance(obj["cls"], int)
+        self.assertIsInstance(obj["landing_status"], int)
+        self.assertIsInstance(obj["motion_status"], int)
+
+    def test_self_check_rejects_unknown_version(self):
+        Settings.PAYLOAD_ADAPTER_VERSION = "unknown_version"
+        with self.assertRaises(DataContractError):
+            PayloadAdapter.self_check()
 
 
 class TestErrorPolicy(unittest.TestCase):
@@ -998,7 +1089,7 @@ class TestErrorPolicy(unittest.TestCase):
 class _DummyDetector:
     detect_calls = 0
 
-    def detect(self, frame):
+    def detect(self, frame, runtime_profile="default"):
         _DummyDetector.detect_calls += 1
         return []
 
@@ -1168,11 +1259,91 @@ class TestCompetitionLoopHardening(unittest.TestCase):
         ), patch.object(main_module, "MovementEstimator", _DummyMovement), patch.object(
             main_module, "VisualOdometry", _DummyOdometry
         ), patch.object(
+            main_module.time, "sleep", return_value=None
+        ), patch.object(
             main_module, "_print_summary", side_effect=self._summary_cb
         ):
             main_module.run_competition(main_module.Logger("Test"))
         self.assertEqual(_FakeNetwork.send_calls, 1)
         self.assertEqual(self.summary_calls[-1]["kpi_counters"]["timeout_fetch"], 1)
+
+    def test_transient_burst_recovers_without_early_abort(self):
+        fd1 = {"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}
+        fd2 = {"frame_id": "f2", "frame_url": "/f2.jpg", "gps_health": 1}
+        _FakeNetwork.frame_results = [
+            FrameFetchResult(
+                status=FrameFetchStatus.TRANSIENT_ERROR, error_type="retries_exhausted"
+            ),
+            FrameFetchResult(
+                status=FrameFetchStatus.TRANSIENT_ERROR, error_type="retries_exhausted"
+            ),
+            FrameFetchResult(
+                status=FrameFetchStatus.TRANSIENT_ERROR, error_type="retries_exhausted"
+            ),
+            FrameFetchResult(
+                status=FrameFetchStatus.OK, frame_data=fd1, is_duplicate=False
+            ),
+            FrameFetchResult(
+                status=FrameFetchStatus.OK, frame_data=fd2, is_duplicate=False
+            ),
+            FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM),
+        ]
+        _FakeNetwork.timeout_snapshots = [
+            {"fetch": 1, "image": 0, "submit": 0},
+            {"fetch": 1, "image": 0, "submit": 0},
+            {"fetch": 1, "image": 0, "submit": 0},
+            {"fetch": 0, "image": 0, "submit": 0},
+            {"fetch": 0, "image": 0, "submit": 0},
+            {"fetch": 0, "image": 0, "submit": 0},
+            {"fetch": 0, "image": 0, "submit": 0},
+            {"fetch": 0, "image": 0, "submit": 0},
+        ]
+        with patch("src.network.NetworkManager", _FakeNetwork), patch.object(
+            main_module, "ObjectDetector", _DummyDetector
+        ), patch.object(main_module, "MovementEstimator", _DummyMovement), patch.object(
+            main_module, "VisualOdometry", _DummyOdometry
+        ), patch.object(
+            main_module.time, "sleep", return_value=None
+        ), patch.object(
+            main_module, "_print_summary", side_effect=self._summary_cb
+        ):
+            main_module.run_competition(main_module.Logger("Test"))
+        self.assertEqual(_FakeNetwork.send_calls, 2)
+        self.assertGreaterEqual(self.summary_calls[-1]["kpi_counters"]["timeout_fetch"], 3)
+
+    def test_debug_fail_open_long_run_does_not_stop_loop(self):
+        Settings.DEBUG = True
+        frames = []
+        for i in range(1, 7):
+            frames.append(
+                FrameFetchResult(
+                    status=FrameFetchStatus.OK,
+                    frame_data={"frame_id": f"f{i}", "frame_url": f"/f{i}.jpg", "gps_health": 1},
+                    is_duplicate=False,
+                )
+            )
+        frames.append(FrameFetchResult(status=FrameFetchStatus.END_OF_STREAM))
+        _FakeNetwork.frame_results = frames
+        _FakeNetwork.timeout_snapshots = [{"fetch": 0, "image": 0, "submit": 0}] * 20
+
+        failing_visualizer = Mock()
+        failing_visualizer.draw_detections.side_effect = RuntimeError("draw boom")
+
+        with patch("src.network.NetworkManager", _FakeNetwork), patch.object(
+            main_module, "ObjectDetector", _DummyDetector
+        ), patch.object(main_module, "MovementEstimator", _DummyMovement), patch.object(
+            main_module, "VisualOdometry", _DummyOdometry
+        ), patch.object(
+            main_module, "Visualizer", return_value=failing_visualizer
+        ), patch.object(
+            main_module.cv2, "destroyAllWindows", return_value=None
+        ), patch.object(
+            main_module.cv2, "waitKey", return_value=1
+        ), patch.object(
+            main_module, "_print_summary", side_effect=self._summary_cb
+        ):
+            main_module.run_competition(main_module.Logger("Test"))
+        self.assertEqual(_FakeNetwork.send_calls, 6)
 
     def test_action_result_unexpected_type_handled_safely(self):
         fd1 = {"frame_id": "f1", "frame_url": "/f1.jpg", "gps_health": 1}
@@ -1504,3 +1675,284 @@ class TestVisualOdometryPredictOnly(unittest.TestCase):
         self.assertEqual(meta["state_source"], "vision_predict")
         self.assertEqual(meta["quality_flag"], "degraded")
         self.assertEqual(meta["reason_code"], "frame_download_failed")
+
+
+class TestFlowPolicy(unittest.TestCase):
+    def test_degrade_fetch_strategy_matrix(self):
+        from src.flow_policy import FetchStrategy, decide_degrade_fetch_strategy
+
+        normal = decide_degrade_fetch_strategy(False, 0, 5)
+        self.assertEqual(normal.strategy, FetchStrategy.FULL_FRAME)
+        self.assertEqual(normal.reason_code, "normal_mode")
+
+        degraded_slot = decide_degrade_fetch_strategy(True, 1, 5)
+        self.assertEqual(degraded_slot.strategy, FetchStrategy.FALLBACK_ONLY)
+
+        degraded_heavy = decide_degrade_fetch_strategy(True, 5, 5)
+        self.assertEqual(degraded_heavy.strategy, FetchStrategy.FULL_FRAME)
+
+        forced = decide_degrade_fetch_strategy(True, 2, 5, force_full_frame=True)
+        self.assertEqual(forced.strategy, FetchStrategy.FULL_FRAME)
+        self.assertEqual(forced.reason_code, "degrade_recovery_heavy_forced")
+
+    def test_duplicate_storm_action_terminal(self):
+        from src.flow_policy import DuplicateStormAction, decide_duplicate_storm_action
+
+        action = decide_duplicate_storm_action(5, 5, "terminate_session")
+        self.assertEqual(action, DuplicateStormAction.TERMINATE_SESSION)
+
+
+@unittest.skipUnless(main_module is not None, "main runtime missing")
+class TestPerformanceGuards(unittest.TestCase):
+    def setUp(self):
+        self._orig = {
+            "JSON_LOG_EVERY_N_FRAMES": Settings.JSON_LOG_EVERY_N_FRAMES,
+            "DYNAMIC_JSON_LOG_INTERVAL_ENABLED": Settings.DYNAMIC_JSON_LOG_INTERVAL_ENABLED,
+            "DYNAMIC_JSON_LOG_SLOW_INTERVAL": Settings.DYNAMIC_JSON_LOG_SLOW_INTERVAL,
+            "DYNAMIC_JSON_LOG_MEDIUM_INTERVAL": Settings.DYNAMIC_JSON_LOG_MEDIUM_INTERVAL,
+            "DYNAMIC_JSON_LOG_FAST_INTERVAL": Settings.DYNAMIC_JSON_LOG_FAST_INTERVAL,
+            "LOW_FPS_GUARD_ENABLED": Settings.LOW_FPS_GUARD_ENABLED,
+            "LOW_FPS_GUARD_RECOVERY_STREAK": Settings.LOW_FPS_GUARD_RECOVERY_STREAK,
+            "LOW_FPS_GUARD_THRESHOLD": Settings.LOW_FPS_GUARD_THRESHOLD,
+            "LOW_FPS_GUARD_RECOVERY_THRESHOLD": Settings.LOW_FPS_GUARD_RECOVERY_THRESHOLD,
+            "PROTECTIVE_DISABLE_SAHI": Settings.PROTECTIVE_DISABLE_SAHI,
+            "SAHI_ENABLED": Settings.SAHI_ENABLED,
+            "INFERENCE_SIZE": Settings.INFERENCE_SIZE,
+            "MAX_DETECTIONS": Settings.MAX_DETECTIONS,
+            "CONFIDENCE_THRESHOLD": Settings.CONFIDENCE_THRESHOLD,
+            "AUGMENTED_INFERENCE": Settings.AUGMENTED_INFERENCE,
+            "DEGRADE_SEND_INTERVAL_FRAMES": Settings.DEGRADE_SEND_INTERVAL_FRAMES,
+        }
+        Settings.DYNAMIC_JSON_LOG_INTERVAL_ENABLED = True
+        Settings.DYNAMIC_JSON_LOG_SLOW_INTERVAL = 40
+        Settings.DYNAMIC_JSON_LOG_MEDIUM_INTERVAL = 20
+        Settings.DYNAMIC_JSON_LOG_FAST_INTERVAL = 10
+        Settings.LOW_FPS_GUARD_ENABLED = True
+        Settings.LOW_FPS_GUARD_RECOVERY_STREAK = 3
+        Settings.LOW_FPS_GUARD_THRESHOLD = 1.0
+        Settings.LOW_FPS_GUARD_RECOVERY_THRESHOLD = 1.5
+        Settings.PROTECTIVE_DISABLE_SAHI = True
+        Settings.JSON_LOG_EVERY_N_FRAMES = 10
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(Settings, key, value)
+
+    def test_dynamic_json_interval_adjusts_by_fps(self):
+        kpi = {}
+        main_module._update_dynamic_json_log_interval(Logger("Test"), 0.8, kpi)
+        self.assertEqual(Settings.JSON_LOG_EVERY_N_FRAMES, 40)
+        main_module._update_dynamic_json_log_interval(Logger("Test"), 1.4, kpi)
+        self.assertEqual(Settings.JSON_LOG_EVERY_N_FRAMES, 20)
+        main_module._update_dynamic_json_log_interval(Logger("Test"), 2.4, kpi)
+        self.assertEqual(Settings.JSON_LOG_EVERY_N_FRAMES, 10)
+
+    def test_low_fps_guard_can_activate_and_recover(self):
+        guard_state = {
+            "active": False,
+            "recovery_streak": 0,
+            "orig_sahi": Settings.SAHI_ENABLED,
+            "orig_inference_size": Settings.INFERENCE_SIZE,
+            "orig_max_det": Settings.MAX_DETECTIONS,
+            "orig_conf": Settings.CONFIDENCE_THRESHOLD,
+            "orig_augmented": Settings.AUGMENTED_INFERENCE,
+            "orig_json_interval": Settings.JSON_LOG_EVERY_N_FRAMES,
+            "orig_degrade_interval": Settings.DEGRADE_SEND_INTERVAL_FRAMES,
+        }
+        kpi = {}
+        main_module._maybe_toggle_low_fps_guard(
+            Logger("Test"),
+            rolling_fps=0.5,
+            guard_state=guard_state,
+            kpi_counters=kpi,
+        )
+        self.assertTrue(guard_state["active"])
+        self.assertGreaterEqual(kpi.get("fps_guard_activations", 0), 1)
+
+        for _ in range(3):
+            main_module._maybe_toggle_low_fps_guard(
+                Logger("Test"),
+                rolling_fps=2.0,
+                guard_state=guard_state,
+                kpi_counters=kpi,
+            )
+        self.assertFalse(guard_state["active"])
+        self.assertGreaterEqual(kpi.get("fps_guard_recoveries", 0), 1)
+
+
+@unittest.skipUnless(main_module is not None, "main runtime missing")
+class TestCalibrationGuard(unittest.TestCase):
+    def setUp(self):
+        self._orig = {
+            "CAMERA_CALIBRATION_GUARD_ENABLED": Settings.CAMERA_CALIBRATION_GUARD_ENABLED,
+            "FOCAL_LENGTH_PX": Settings.FOCAL_LENGTH_PX,
+            "CAMERA_CX": Settings.CAMERA_CX,
+            "CAMERA_CY": Settings.CAMERA_CY,
+        }
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(Settings, key, value)
+
+    def test_guard_accepts_finite_positive_params(self):
+        Settings.CAMERA_CALIBRATION_GUARD_ENABLED = True
+        Settings.FOCAL_LENGTH_PX = 900.0
+        Settings.CAMERA_CX = 1000.0
+        Settings.CAMERA_CY = 550.0
+        main_module._assert_camera_calibration_ready(Logger("Test"))
+
+    def test_guard_rejects_invalid_params(self):
+        Settings.CAMERA_CALIBRATION_GUARD_ENABLED = True
+        Settings.FOCAL_LENGTH_PX = 0.0
+        with self.assertRaises(DataContractError):
+            main_module._assert_camera_calibration_ready(Logger("Test"))
+
+
+@unittest.skipUnless(ImageMatcher is not None, "image matcher deps missing")
+class TestTask3CapAndQuality(unittest.TestCase):
+    def setUp(self):
+        self._orig = {
+            "TASK3_MAX_REFERENCES": Settings.TASK3_MAX_REFERENCES,
+            "TASK3_REFERENCE_BATCH_SIZE": Settings.TASK3_REFERENCE_BATCH_SIZE,
+            "TASK3_INCLUDE_QUALITY_FIELDS": Settings.TASK3_INCLUDE_QUALITY_FIELDS,
+            "TASK3_DOMAIN_FALLBACK_ENABLED": Settings.TASK3_DOMAIN_FALLBACK_ENABLED,
+            "TASK3_DOMAIN_FALLBACK_INTERVAL": Settings.TASK3_DOMAIN_FALLBACK_INTERVAL,
+        }
+        Settings.TASK3_MAX_REFERENCES = 2
+        Settings.TASK3_REFERENCE_BATCH_SIZE = 1
+        Settings.TASK3_INCLUDE_QUALITY_FIELDS = True
+        Settings.TASK3_DOMAIN_FALLBACK_ENABLED = True
+        Settings.TASK3_DOMAIN_FALLBACK_INTERVAL = 1
+
+    def tearDown(self):
+        for key, value in self._orig.items():
+            setattr(Settings, key, value)
+
+    def test_cap_and_batch_stats_are_recorded(self):
+        matcher = ImageMatcher()
+        matcher.detector = Mock()
+        matcher.detector.detectAndCompute.return_value = (
+            [object(), object(), object(), object(), object()],
+            np.ones((5, 32), dtype=np.uint8),
+        )
+        refs = [
+            {"object_id": 1, "priority": 0, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 2, "priority": 10, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 3, "priority": 5, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+        ]
+        loaded = matcher.load_references(refs)
+        self.assertEqual(loaded, 2)
+        stats = matcher.last_load_stats
+        self.assertEqual(stats["dropped_by_cap"], 1)
+        self.assertEqual(stats["batch_count"], 2)
+        self.assertIn(2, matcher.id_lifecycle_states)
+        self.assertIn(3, matcher.id_lifecycle_states)
+
+    def test_match_can_emit_quality_fields(self):
+        matcher = ImageMatcher()
+        matcher.detector = Mock()
+        matcher.detector.detectAndCompute.return_value = (
+            [object(), object(), object(), object(), object()],
+            np.ones((5, 32), dtype=np.uint8),
+        )
+        matcher.load_references(
+            [{"object_id": 7, "image": np.zeros((16, 16, 3), dtype=np.uint8)}]
+        )
+        with patch.object(
+            matcher,
+            "_match_reference",
+            return_value={
+                "bbox": (1.0, 2.0, 10.0, 12.0),
+                "quality_score": 0.91,
+                "quality_flag": "high",
+            },
+        ):
+            out = matcher.match(np.zeros((32, 32, 3), dtype=np.uint8))
+        self.assertEqual(len(out), 1)
+        self.assertIn("quality_score", out[0])
+        self.assertIn("quality_flag", out[0])
+        self.assertEqual(out[0]["quality_flag"], "high")
+
+    def test_match_reference_can_use_domain_fallback_descriptor(self):
+        matcher = ImageMatcher()
+        matcher._frame_counter = matcher._domain_fallback_interval
+        matcher._domain_fallback_enabled = True
+        matcher._fallback_detector = object()
+        matcher._fallback_matcher = object()
+
+        ref_obj = type(
+            "Ref",
+            (),
+            {
+                "keypoints": [object(), object(), object(), object(), object()],
+                "descriptors": np.ones((5, 32), dtype=np.uint8),
+                "fallback_keypoints": [object(), object(), object(), object(), object()],
+                "fallback_descriptors": np.ones((5, 32), dtype=np.uint8),
+            },
+        )()
+
+        with patch.object(
+            matcher,
+            "_match_with_features",
+            side_effect=[
+                None,
+                {"bbox": (1.0, 2.0, 12.0, 14.0), "quality_score": 0.67},
+            ],
+        ):
+            out = matcher._match_reference(
+                ref=ref_obj,
+                frame_kp=[object(), object(), object(), object(), object()],
+                frame_desc=np.ones((5, 32), dtype=np.uint8),
+                frame_shape=(32, 32),
+                fallback_frame_kp=[object(), object(), object(), object(), object()],
+                fallback_frame_desc=np.ones((5, 32), dtype=np.uint8),
+            )
+        self.assertIsNotNone(out)
+        self.assertTrue(out["used_fallback_descriptor"])
+        self.assertIn("domain_fallback", out["quality_flag"])
+
+
+@unittest.skipUnless(NetworkManager is not None, "network deps missing")
+class TestNetworkUndefinedObjectSanitization(unittest.TestCase):
+    def setUp(self):
+        self._orig = Settings.TASK3_INCLUDE_QUALITY_FIELDS
+
+    def tearDown(self):
+        Settings.TASK3_INCLUDE_QUALITY_FIELDS = self._orig
+
+    def test_sanitizer_drops_invalid_rows(self):
+        Settings.TASK3_INCLUDE_QUALITY_FIELDS = False
+        out = NetworkManager._sanitize_undefined_objects(
+            [
+                {
+                    "object_id": 1,
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 10,
+                    "bottom_right_y": 20,
+                },
+                {"object_id": -1, "top_left_x": 1, "top_left_y": 2, "bottom_right_x": 0, "bottom_right_y": 1},
+                {"object_id": "x"},
+            ]
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["object_id"], 1)
+
+    def test_sanitizer_can_keep_quality_fields(self):
+        Settings.TASK3_INCLUDE_QUALITY_FIELDS = True
+        out = NetworkManager._sanitize_undefined_objects(
+            [
+                {
+                    "object_id": 5,
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 10,
+                    "bottom_right_y": 20,
+                    "quality_score": 1.3,
+                    "quality_flag": "high",
+                }
+            ]
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["quality_score"], 1.0)
+        self.assertEqual(out[0]["quality_flag"], "high")

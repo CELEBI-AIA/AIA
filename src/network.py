@@ -5,6 +5,7 @@ import random
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlparse
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import math
@@ -13,6 +14,8 @@ import numpy as np
 import requests
 
 from config.settings import Settings
+from src.gps_health import normalize_gps_health
+from src.payload_adapter import PayloadAdapter
 from src.payload_schema import CompetitionPayloadSchema
 from src.utils import Logger, log_json_to_disk
 
@@ -73,12 +76,15 @@ class NetworkManager:
         self._clip_ratio_window: Deque[int] = deque(maxlen=100)
         self._session_id: str = str(int(time.time()))
         self._task3_references: list = []
+        self._last_valid_translation: Dict[str, float] = {}
+        self._validate_base_url_policy()
 
     def get_task3_references(self) -> list:
         return list(self._task3_references)
 
     def assert_contract_ready(self) -> None:
         CompetitionPayloadSchema.self_check()
+        PayloadAdapter.self_check()
 
     def start_session(self) -> bool:
         if self.simulation_mode:
@@ -272,7 +278,7 @@ class NetworkManager:
         degrade: bool = False,
         detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> SendResultStatus:
-        frame_key = self._normalize_frame_key(frame_id)
+        frame_key = self._build_frame_key(frame_id, frame_data)
         if self._was_already_submitted(frame_key):
             self.log.warn(
                 f"Frame {frame_key}: duplicate submit prevented by idempotent client guard."
@@ -299,6 +305,13 @@ class NetworkManager:
                     frame_id=frame_id,
                 )
             )
+        try:
+            payload = PayloadAdapter.adapt_payload(payload)
+        except Exception as exc:
+            self.log.error(
+                f"Frame {frame_id}: payload adapter failed ({type(exc).__name__}): {exc}"
+            )
+            return SendResultStatus.PERMANENT_REJECTED
 
         if preflight_rejected:
             self._payload_guard_counters["preflight_reject"] += 1
@@ -384,6 +397,13 @@ class NetworkManager:
 
             fallback_payload = self._build_safe_fallback_payload(raw_payload)
             try:
+                fallback_payload = PayloadAdapter.adapt_payload(fallback_payload)
+            except Exception as exc:
+                self.log.error(
+                    f"Frame {frame_id}: fallback payload adapter failed ({type(exc).__name__}): {exc}"
+                )
+                return SendResultStatus.PERMANENT_REJECTED
+            try:
                 response = self.session.post(
                     url,
                     json=fallback_payload,
@@ -450,6 +470,9 @@ class NetworkManager:
         payload_id = frame_data.get("id", frame_id)
         payload_user = frame_data.get("user", Settings.TEAM_NAME)
         payload_frame = frame_data.get("url", frame_data.get("frame", frame_id))
+        clean_undefined = NetworkManager._sanitize_undefined_objects(
+            detected_undefined_objects or []
+        )
 
         payload = {
             "id": payload_id,
@@ -463,7 +486,7 @@ class NetworkManager:
                     "translation_z": tz,
                 }
             ],
-            "detected_undefined_objects": detected_undefined_objects or [],
+            "detected_undefined_objects": clean_undefined,
         }
         if alias_count > 0:
             Logger("Network").warn(
@@ -523,23 +546,17 @@ class NetworkManager:
         if not data.get("image_url") and data.get("frame_url"):
             data["image_url"] = data.get("frame_url")
 
-        health_val = data.get("gps_health")
-        if health_val is None:
-            health_val = data.get("gps_health_status", 0)
-        try:
-            if health_val is None or str(health_val).strip().lower() in {
-                "unknown",
-                "none",
-                "null",
-                "",
-            }:
-                data["gps_health"] = 0
-            else:
-                data["gps_health"] = int(float(health_val))
-        except (ValueError, TypeError):
-            self.log.warn(f"Corrupt gps_health value: {health_val!r}, forcing 0")
-            data["gps_health"] = 0
-        data["gps_health_status"] = data["gps_health"]
+        gps_value, gps_state = normalize_gps_health(
+            data.get("gps_health"),
+            gps_health_status=data.get("gps_health_status"),
+        )
+        if gps_value is None and gps_state == "unknown":
+            self.log.warn(
+                f"Frame {frame_id}: gps_health unknown (raw={data.get('gps_health')!r}, "
+                f"status={data.get('gps_health_status')!r})"
+            )
+        data["gps_health"] = gps_value
+        data["gps_health_status"] = gps_state
 
         for key in ["translation_x", "translation_y", "translation_z", "altitude"]:
             if key in data:
@@ -552,14 +569,18 @@ class NetworkManager:
                         "",
                         "nan",
                     }:
-                        data[key] = 0.0
+                        data[key] = self._last_valid_translation.get(key, 0.0)
                     else:
                         data[key] = float(val)
                         if math.isnan(data[key]):
-                            data[key] = 0.0
+                            data[key] = self._last_valid_translation.get(key, 0.0)
                 except (ValueError, TypeError):
-                    self.log.warn(f"Corrupt {key}: {val!r}, forcing 0.0")
-                    data[key] = 0.0
+                    data[key] = self._last_valid_translation.get(key, 0.0)
+                    self.log.warn(
+                        f"Corrupt {key}: {val!r}, using last valid value {data[key]:.3f}"
+                    )
+                else:
+                    self._last_valid_translation[key] = float(data[key])
 
         return True
 
@@ -664,8 +685,12 @@ class NetworkManager:
         frame_id: Any,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         class_order = ["0", "1", "2", "3"]
-        class_quota = {cls: 100000 for cls in class_order}  # Kotalar devredışı bırakıldı (mAP düşüşünü engellemek için)
-        global_cap = 100000  # Global sınır devredışı bırakıldı
+        configured_quota = getattr(Settings, "RESULT_CLASS_QUOTA", {}) or {}
+        global_cap = max(1, int(getattr(Settings, "RESULT_MAX_OBJECTS", 100)))
+        class_quota = {
+            cls: max(0, int(configured_quota.get(cls, global_cap)))
+            for cls in class_order
+        }
 
         grouped: Dict[str, List[Dict[str, Any]]] = {cls: [] for cls in class_order}
         for obj in normalized_objects:
@@ -747,9 +772,19 @@ class NetworkManager:
                     "bottom_right_y": int(obj["bottom_right_y"]),
                 }
                 if "landing_status" in obj:
-                     safe_obj["landing_status"] = int(obj["landing_status"])
-                if "motion_status" in obj:
-                     safe_obj["motion_status"] = int(obj["motion_status"])
+                    safe_obj["landing_status"] = CompetitionPayloadSchema.cast_status_value(
+                        int(float(obj["landing_status"]))
+                    )
+                motion_raw = obj.get(
+                    CompetitionPayloadSchema.CANONICAL_MOTION_FIELD,
+                    obj.get(CompetitionPayloadSchema.LEGACY_MOTION_FIELD),
+                )
+                if motion_raw is not None:
+                    safe_obj[
+                        CompetitionPayloadSchema.CANONICAL_MOTION_FIELD
+                    ] = CompetitionPayloadSchema.cast_status_value(
+                        int(float(motion_raw))
+                    )
                 safe_objects.append(safe_obj)
             except (KeyError, ValueError, TypeError):
                 continue
@@ -766,8 +801,49 @@ class NetworkManager:
                     "translation_z": tz,
                 }
             ],
-            "detected_undefined_objects": payload.get("detected_undefined_objects", []),
+            "detected_undefined_objects": NetworkManager._sanitize_undefined_objects(
+                payload.get("detected_undefined_objects", [])
+            ),
         }
+
+    @staticmethod
+    def _sanitize_undefined_objects(
+        undefined_objects: Any,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(undefined_objects, list):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        include_quality = bool(getattr(Settings, "TASK3_INCLUDE_QUALITY_FIELDS", False))
+        for obj in undefined_objects:
+            if not isinstance(obj, dict):
+                continue
+            try:
+                object_id = int(float(obj.get("object_id")))
+                x1 = float(obj.get("top_left_x"))
+                y1 = float(obj.get("top_left_y"))
+                x2 = float(obj.get("bottom_right_x"))
+                y2 = float(obj.get("bottom_right_y"))
+            except (TypeError, ValueError):
+                continue
+
+            if object_id < 0 or x2 <= x1 or y2 <= y1:
+                continue
+
+            rec: Dict[str, Any] = {
+                "object_id": object_id,
+                "top_left_x": x1,
+                "top_left_y": y1,
+                "bottom_right_x": x2,
+                "bottom_right_y": y2,
+            }
+            if include_quality:
+                quality_score = NetworkManager._safe_float(obj.get("quality_score", 0.0))
+                quality_flag = str(obj.get("quality_flag", "unknown"))
+                rec["quality_score"] = max(0.0, min(1.0, quality_score))
+                rec["quality_flag"] = quality_flag
+            out.append(rec)
+        return out
 
     def consume_timeout_counters(self) -> Dict[str, int]:
         snapshot = self._timeout_counters
@@ -788,6 +864,51 @@ class NetworkManager:
         if frame_id is None:
             return "unknown"
         return str(frame_id).strip() or "unknown"
+
+    def _build_frame_key(self, frame_id: Any, frame_data: Optional[Dict[str, Any]]) -> str:
+        primary = self._normalize_frame_key(frame_id)
+        if primary != "unknown" or not isinstance(frame_data, dict):
+            return primary
+
+        candidates = [
+            frame_data.get("frame_id"),
+            frame_data.get("id"),
+            frame_data.get("frame"),
+            frame_data.get("url"),
+            frame_data.get("frame_url"),
+            frame_data.get("image_url"),
+        ]
+        uniq_parts: List[str] = []
+        for raw in candidates:
+            key = self._normalize_frame_key(raw)
+            if key == "unknown" or key in uniq_parts:
+                continue
+            uniq_parts.append(key)
+            if len(uniq_parts) >= 3:
+                break
+        if not uniq_parts:
+            return primary
+        return "|".join(uniq_parts)
+
+    def _validate_base_url_policy(self) -> None:
+        if self.simulation_mode:
+            return
+
+        parsed = urlparse(str(self.base_url))
+        host = (parsed.hostname or "").strip().lower()
+        if not host:
+            raise ValueError(f"Invalid BASE_URL (host missing): {self.base_url!r}")
+
+        allowlist_raw = getattr(Settings, "BASE_URL_ALLOWLIST", ())
+        allowlist = {
+            str(item).strip().lower()
+            for item in allowlist_raw
+            if str(item).strip()
+        }
+        if allowlist and host not in allowlist:
+            raise ValueError(
+                f"BASE_URL host '{host}' is not in allowlist: {sorted(allowlist)}"
+            )
 
     def _mark_seen_frame(self, frame_id: Any) -> bool:
         key = self._normalize_frame_key(frame_id)
@@ -902,20 +1023,14 @@ class NetworkManager:
         frame_w: int,
         frame_h: int,
     ) -> tuple:
-        max_x = max(frame_w - 1, 0)
-        max_y = max(frame_h - 1, 0)
-
-        x1 = max(0, min(x1, max_x))
-        y1 = max(0, min(y1, max_y))
-        x2 = max(0, min(x2, max_x))
-        y2 = max(0, min(y2, max_y))
-
-        if x2 < x1:
-            x1, x2 = x2, x1
-        if y2 < y1:
-            y1, y2 = y2, y1
-
-        return x1, y1, x2, y2
+        return CompetitionPayloadSchema._clamp_bbox(
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
 
     @staticmethod
     def _safe_int(val: Any) -> int:
