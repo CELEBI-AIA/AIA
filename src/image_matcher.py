@@ -43,6 +43,10 @@ class ImageMatcher:
             "duplicate": 0,
             "quarantined": 0,
         }
+        self._telemetry_counters: Dict[str, int] = {
+            "task3_low_quality_drop": 0,
+            "task3_conflict_drop": 0,
+        }
         self._frame_counter: int = 0
 
         method = Settings.TASK3_FEATURE_METHOD.upper()
@@ -223,21 +227,76 @@ class ImageMatcher:
         if frame_desc is None or len(frame_kp) < 4:
             return []
 
-        results: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
 
         for ref in self.references:
-            bbox = self._match_reference(ref, frame_kp, frame_desc, gray.shape)
-            if bbox is not None:
-                if ref.object_id not in self._references_by_id:
-                    continue
-                self._reference_lifecycle[ref.object_id] = "matched"
-                results.append({
-                    "object_id": ref.object_id,
-                    "top_left_x": bbox[0],
-                    "top_left_y": bbox[1],
-                    "bottom_right_x": bbox[2],
-                    "bottom_right_y": bbox[3],
-                })
+            match_candidate = self._match_reference(ref, frame_kp, frame_desc, gray.shape)
+            if match_candidate is None:
+                continue
+            if ref.object_id not in self._references_by_id:
+                continue
+            if isinstance(match_candidate, tuple) and len(match_candidate) == 4:
+                x1, y1, x2, y2 = match_candidate
+                match_candidate = {
+                    "top_left_x": x1,
+                    "top_left_y": y1,
+                    "bottom_right_x": x2,
+                    "bottom_right_y": y2,
+                    "quality_score": 1.0,
+                    "similarity": 1.0,
+                    "inlier_ratio": 1.0,
+                }
+            if not isinstance(match_candidate, dict):
+                continue
+            candidate = dict(match_candidate)
+            candidate["object_id"] = ref.object_id
+            candidates.append(candidate)
+
+        if not candidates:
+            return []
+
+        # object_id başına en güçlü adayı tut.
+        best_per_id: Dict[int, Dict[str, Any]] = {}
+        for candidate in candidates:
+            object_id = int(candidate["object_id"])
+            prev = best_per_id.get(object_id)
+            if prev is None or self._candidate_rank(candidate) < self._candidate_rank(prev):
+                best_per_id[object_id] = candidate
+
+        conflict_iou = float(
+            max(0.0, min(1.0, getattr(Settings, "TASK3_CONFLICT_IOU_THRESHOLD", 0.35)))
+        )
+        sorted_candidates = sorted(best_per_id.values(), key=self._candidate_rank)
+        filtered: List[Dict[str, Any]] = []
+        conflict_drop_count = 0
+        for candidate in sorted_candidates:
+            conflict = any(
+                self._bbox_iou(candidate, kept) >= conflict_iou for kept in filtered
+            )
+            if conflict:
+                conflict_drop_count += 1
+                continue
+            filtered.append(candidate)
+
+        if conflict_drop_count > 0:
+            self._telemetry_counters["task3_conflict_drop"] += conflict_drop_count
+            self.log.warn(
+                f"event=task3_conflict_drop frame={self._frame_counter} dropped={conflict_drop_count}"
+            )
+
+        results: List[Dict[str, Any]] = []
+        for candidate in filtered:
+            object_id = int(candidate["object_id"])
+            self._reference_lifecycle[object_id] = "matched"
+            results.append(
+                {
+                    "object_id": object_id,
+                    "top_left_x": candidate["top_left_x"],
+                    "top_left_y": candidate["top_left_y"],
+                    "bottom_right_x": candidate["bottom_right_x"],
+                    "bottom_right_y": candidate["bottom_right_y"],
+                }
+            )
 
         if results:
             self.log.debug(
@@ -252,13 +311,15 @@ class ImageMatcher:
         frame_kp: list,
         frame_desc: np.ndarray,
         frame_shape: Tuple[int, int],
-    ) -> Optional[Tuple[float, float, float, float]]:
+    ) -> Optional[Dict[str, Any]]:
         if ref.descriptors is None:
+            self._telemetry_counters["task3_low_quality_drop"] += 1
             return None
 
         try:
             matches = self.matcher.knnMatch(ref.descriptors, frame_desc, k=2)
         except cv2.error:
+            self._telemetry_counters["task3_low_quality_drop"] += 1
             return None
 
         good_matches = []
@@ -271,6 +332,7 @@ class ImageMatcher:
 
         min_matches = max(4, int(len(ref.keypoints) * 0.05))
         if len(good_matches) < min_matches:
+            self._telemetry_counters["task3_low_quality_drop"] += 1
             return None
 
         similarity = len(good_matches) / max(1, len(ref.keypoints))
@@ -281,6 +343,7 @@ class ImageMatcher:
             threshold = Settings.TASK3_FALLBACK_THRESHOLD
 
         if similarity < threshold:
+            self._telemetry_counters["task3_low_quality_drop"] += 1
             return None
 
         try:
@@ -292,15 +355,22 @@ class ImageMatcher:
             ).reshape(-1, 1, 2)
 
             if len(np.unique(src_pts.reshape(-1, 2), axis=0)) < 4:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
                 return None
             if len(np.unique(dst_pts.reshape(-1, 2), axis=0)) < 4:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
                 return None
 
             M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            fallback_used = False
+            inlier_ratio = 0.0
             if M is None or M.shape != (3, 3):
+                fallback_used = True
                 self.log.warn("Homografi dejenere oldu, nokta bazlı bounding rect (fallback) çıkarıldı")
                 pts = dst_pts.reshape(-1, 2)
             else:
+                if mask is not None and len(mask) > 0:
+                    inlier_ratio = float(mask.sum()) / float(len(mask))
                 h, w = ref.h, ref.w
                 corners = np.float32(
                     [[0, 0], [w, 0], [w, h], [0, h]]
@@ -310,6 +380,7 @@ class ImageMatcher:
                 if len(pts) >= 4:
                     hull = cv2.convexHull(pts.astype(np.float32))
                     if hull is None or len(hull) < 4 or not cv2.isContourConvex(hull):
+                        self._telemetry_counters["task3_low_quality_drop"] += 1
                         return None
 
             x1 = float(max(0, pts[:, 0].min()))
@@ -320,13 +391,41 @@ class ImageMatcher:
             bbox_w = x2 - x1
             bbox_h = y2 - y1
             if bbox_w < 5 or bbox_h < 5:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
                 return None
             if bbox_w > frame_shape[1] * 0.8 or bbox_h > frame_shape[0] * 0.8:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
                 return None
 
-            return (x1, y1, x2, y2)
+            quality_score = 0.6 * similarity + 0.4 * inlier_ratio
+            min_quality = float(getattr(Settings, "TASK3_MIN_QUALITY_SCORE", 0.35))
+            fallback_min_quality = float(
+                getattr(Settings, "TASK3_FALLBACK_MIN_QUALITY_SCORE", 0.55)
+            )
+            min_inlier_ratio = float(getattr(Settings, "TASK3_MIN_INLIER_RATIO", 0.25))
+
+            if (not fallback_used) and inlier_ratio < min_inlier_ratio:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
+                return None
+            if fallback_used and quality_score < fallback_min_quality:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
+                return None
+            if quality_score < min_quality:
+                self._telemetry_counters["task3_low_quality_drop"] += 1
+                return None
+
+            return {
+                "top_left_x": x1,
+                "top_left_y": y1,
+                "bottom_right_x": x2,
+                "bottom_right_y": y2,
+                "similarity": similarity,
+                "inlier_ratio": inlier_ratio,
+                "quality_score": quality_score,
+            }
 
         except (cv2.error, ValueError, IndexError):
+            self._telemetry_counters["task3_low_quality_drop"] += 1
             return None
 
     @property
@@ -347,6 +446,10 @@ class ImageMatcher:
             "duplicate": 0,
             "quarantined": 0,
         }
+        self._telemetry_counters = {
+            "task3_low_quality_drop": 0,
+            "task3_conflict_drop": 0,
+        }
         self._frame_counter = 0
         self.log.info("ImageMatcher reset")
 
@@ -357,3 +460,43 @@ class ImageMatcher:
     @property
     def last_load_stats(self) -> Dict[str, int]:
         return dict(self._last_load_stats)
+
+    @property
+    def telemetry_counters(self) -> Dict[str, int]:
+        return dict(self._telemetry_counters)
+
+    @staticmethod
+    def _bbox_iou(det_a: Dict[str, Any], det_b: Dict[str, Any]) -> float:
+        ax1 = float(det_a.get("top_left_x", 0))
+        ay1 = float(det_a.get("top_left_y", 0))
+        ax2 = float(det_a.get("bottom_right_x", 0))
+        ay2 = float(det_a.get("bottom_right_y", 0))
+        bx1 = float(det_b.get("top_left_x", 0))
+        by1 = float(det_b.get("top_left_y", 0))
+        bx2 = float(det_b.get("bottom_right_x", 0))
+        by2 = float(det_b.get("bottom_right_y", 0))
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter = inter_w * inter_h
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = area_a + area_b - inter
+        if denom <= 0.0:
+            return 0.0
+        return inter / denom
+
+    @staticmethod
+    def _candidate_rank(candidate: Dict[str, Any]) -> Tuple[float, float, int, int]:
+        x1 = int(float(candidate.get("top_left_x", 0)))
+        y1 = int(float(candidate.get("top_left_y", 0)))
+        x2 = int(float(candidate.get("bottom_right_x", 0)))
+        y2 = int(float(candidate.get("bottom_right_y", 0)))
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        score = float(candidate.get("quality_score", 0.0))
+        return (-score, -float(area), x1, y1)

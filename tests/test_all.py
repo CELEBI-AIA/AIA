@@ -3,6 +3,7 @@
 import copy
 import json
 import time
+import threading
 import unittest
 from unittest.mock import Mock, patch, mock_open
 
@@ -168,7 +169,13 @@ class TestRuntimeProfile:
 class TestSendState:
     @staticmethod
     def _counters():
-        return {"send_ok": 0, "send_fallback_ok": 0, "send_fail": 0, "send_permanent_reject": 0}
+        return {
+            "send_ok": 0,
+            "send_fallback_ok": 0,
+            "send_fail": 0,
+            "send_permanent_reject": 0,
+            "submit_duplicate_blocked": 0,
+        }
 
     def test_acked(self):
         c = self._counters()
@@ -197,6 +204,12 @@ class TestSendState:
         assert p == {"x": 1} and not abort and not ok
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 0
 
+    def test_duplicate_blocked_is_success_noop(self):
+        c = self._counters()
+        p, abort, ok = apply_send_result_status("duplicate_blocked", {"x": 1}, c)
+        assert p is None and not abort and ok
+        assert c["send_ok"] == 1 and c["submit_duplicate_blocked"] == 1
+
 
 @unittest.skipUnless(ObjectDetector is not None, "detection deps missing")
 class TestEdgeMarginRatio(unittest.TestCase):
@@ -214,7 +227,13 @@ class TestEdgeMarginRatio(unittest.TestCase):
 class TestMainAckStateMachine:
     @staticmethod
     def _counters():
-        return {"send_ok": 0, "send_fail": 0, "send_fallback_ok": 0, "send_permanent_reject": 0}
+        return {
+            "send_ok": 0,
+            "send_fail": 0,
+            "send_fallback_ok": 0,
+            "send_permanent_reject": 0,
+            "submit_duplicate_blocked": 0,
+        }
 
     def test_retryable_failure_keeps_pending(self):
         pending = {"frame_id": "f-1"}
@@ -234,6 +253,13 @@ class TestMainAckStateMachine:
         p, abort, ok = apply_send_result_status("permanent_rejected", pending, c)
         assert p is None and not abort and not ok
         assert c["send_fail"] == 1 and c["send_permanent_reject"] == 1
+
+    def test_duplicate_blocked_closes_pending_without_fail(self):
+        c = self._counters()
+        pending = {"frame_id": "f-4"}
+        p, abort, ok = apply_send_result_status("duplicate_blocked", pending, c)
+        assert p is None and not abort and ok
+        assert c["send_fail"] == 0 and c["submit_duplicate_blocked"] == 1
 
 
 @unittest.skipUnless(main_module is not None, "main runtime missing")
@@ -333,6 +359,78 @@ class TestImageMatcherIdIntegrity(unittest.TestCase):
         self.assertEqual(out[0]["object_id"], 5)
         self.assertEqual(self.matcher.id_lifecycle_states[5], "matched")
 
+    def test_match_conflict_keeps_highest_quality_candidate(self):
+        refs = [
+            {"object_id": 1, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+            {"object_id": 2, "image": np.ones((16, 16, 3), dtype=np.uint8)},
+        ]
+        self.matcher.load_references(refs)
+        with patch.object(
+            self.matcher,
+            "_match_reference",
+            side_effect=[
+                {
+                    "top_left_x": 10.0,
+                    "top_left_y": 10.0,
+                    "bottom_right_x": 40.0,
+                    "bottom_right_y": 40.0,
+                    "quality_score": 0.95,
+                    "similarity": 0.9,
+                    "inlier_ratio": 0.8,
+                },
+                {
+                    "top_left_x": 12.0,
+                    "top_left_y": 12.0,
+                    "bottom_right_x": 42.0,
+                    "bottom_right_y": 42.0,
+                    "quality_score": 0.70,
+                    "similarity": 0.8,
+                    "inlier_ratio": 0.5,
+                },
+            ],
+        ):
+            out = self.matcher.match(np.zeros((64, 64, 3), dtype=np.uint8))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["object_id"], 1)
+        self.assertGreaterEqual(self.matcher.telemetry_counters["task3_conflict_drop"], 1)
+
+    def test_homography_fallback_low_quality_is_rejected(self):
+        class _Kp:
+            def __init__(self, x, y):
+                self.pt = (float(x), float(y))
+
+        class _M:
+            def __init__(self, q, t, d):
+                self.queryIdx = q
+                self.trainIdx = t
+                self.distance = d
+
+        refs = [{"object_id": 9, "image": np.zeros((16, 16, 3), dtype=np.uint8)}]
+        self.matcher.load_references(refs)
+        ref_obj = self.matcher.references[0]
+        ref_obj.keypoints = [_Kp(1, 1), _Kp(2, 2), _Kp(3, 3), _Kp(4, 4), _Kp(5, 5)]
+        ref_obj.descriptors = np.ones((5, 32), dtype=np.uint8)
+        frame_kp = [_Kp(10, 10), _Kp(20, 20), _Kp(30, 30), _Kp(40, 40), _Kp(50, 50)]
+        frame_desc = np.ones((5, 32), dtype=np.uint8)
+        self.matcher.matcher = Mock()
+        self.matcher.matcher.knnMatch.return_value = [
+            [_M(0, 0, 0.1), _M(0, 1, 0.3)],
+            [_M(1, 1, 0.1), _M(1, 2, 0.3)],
+            [_M(2, 2, 0.1), _M(2, 3, 0.3)],
+            [_M(3, 3, 0.1), _M(3, 4, 0.3)],
+            [_M(4, 4, 0.4), _M(4, 4, 0.5)],  # ratio fail -> 4/5 good
+        ]
+
+        with patch("src.image_matcher.cv2.findHomography", return_value=(None, None)):
+            out = self.matcher._match_reference(
+                ref=ref_obj,
+                frame_kp=frame_kp,
+                frame_desc=frame_desc,
+                frame_shape=(64, 64),
+            )
+        self.assertIsNone(out)
+        self.assertGreaterEqual(self.matcher.telemetry_counters["task3_low_quality_drop"], 1)
+
 
 class _StubLog:
     def __init__(self):
@@ -358,6 +456,8 @@ class TestSessionResilience:
         Settings.CB_OPEN_COOLDOWN_SEC = 0.2
         Settings.CB_MAX_OPEN_CYCLES = 2
         Settings.CB_SESSION_MAX_TRANSIENT_SEC = 0.4
+        Settings.CB_MAX_NO_PROGRESS_SEC = 0.2
+        Settings.CB_MAX_OPEN_CYCLES_WITHOUT_PROGRESS = 2
 
     def test_transient_window_opens_breaker(self):
         self._setup_settings()
@@ -384,25 +484,34 @@ class TestSessionResilience:
         assert c.state == ResilienceState.NORMAL
         assert c.stats.recovered_count >= 1
 
-    def test_session_wall_clock_abort(self):
+    def test_no_abort_when_ack_progress_exists(self):
         self._setup_settings()
         c = self._ctrl()
         c.on_ack_failure()
-        assert c.state == ResilienceState.DEGRADED
-        time.sleep(0.45)
-        reason = c.should_abort()
-        assert reason is not None
-        assert "Transient wall time" in reason or "aborting" in reason.lower()
+        c.on_fetch_transient()
+        c.on_fetch_transient()
+        c.on_fetch_transient()
+        assert c.state == ResilienceState.OPEN
+        c.on_ack_progress()
+        assert c.should_abort() is None
 
     def test_breaker_open_cycles_abort(self):
         self._setup_settings()
         c = self._ctrl()
         assert c.should_abort() is None
         c.on_ack_failure()
-        c._non_normal_since = time.monotonic() - 1.0
+        c.on_fetch_transient()
+        c.on_fetch_transient()
+        c.on_fetch_transient()  # first OPEN
+        c.on_fetch_transient()
+        c.on_fetch_transient()
+        c.on_fetch_transient()  # second OPEN
+        c._last_ack_progress_monotonic = time.monotonic() - 1.0
         c.state = ResilienceState.DEGRADED
         reason = c.should_abort()
         assert reason is not None
+        assert "reason_code=no_progress_open_cycles_exceeded" in reason
+        assert c.last_abort_reason_code == "no_progress_open_cycles_exceeded"
 
 
 @patch('src.data_loader.DatasetLoader')
@@ -563,9 +672,41 @@ class TestIdempotencySubmit(unittest.TestCase):
         second = mgr.send_result(**kw)
 
         self.assertEqual(first, SendResultStatus.ACKED)
-        self.assertEqual(second, SendResultStatus.ACKED)
+        self.assertEqual(second, SendResultStatus.DUPLICATE_BLOCKED)
 
-        self.assertEqual(mgr.session.post.call_count, 2)
+        self.assertEqual(mgr.session.post.call_count, 1)
+
+    def test_parallel_submit_same_frame_only_one_post(self):
+        mgr = NetworkManager(base_url="http://test", simulation_mode=False)
+
+        def slow_post(*args, **kwargs):
+            time.sleep(0.05)
+            return Mock(status_code=200)
+
+        mgr.session.post = Mock(side_effect=slow_post)
+        kw = dict(
+            frame_id="frame-parallel",
+            detected_objects=[],
+            detected_translation={"translation_x": 0, "translation_y": 0, "translation_z": 0},
+            frame_data={"id": "frame-parallel", "url": "/f/p"},
+            frame_shape=None,
+        )
+
+        out = []
+
+        def worker():
+            out.append(mgr.send_result(**kw))
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(mgr.session.post.call_count, 1)
+        self.assertIn(SendResultStatus.ACKED, out)
+        self.assertIn(SendResultStatus.DUPLICATE_BLOCKED, out)
 
 
 @unittest.skipUnless(requests is not None and NetworkManager is not None, "network deps missing")
@@ -649,10 +790,14 @@ class TestNetworkPayloadGuard(unittest.TestCase):
             "RESULT_MAX_OBJECTS": Settings.RESULT_MAX_OBJECTS,
             "RESULT_CLASS_QUOTA": dict(Settings.RESULT_CLASS_QUOTA),
             "MAX_RETRIES": Settings.MAX_RETRIES,
+            "PAYLOAD_DEDUP_IOU_THRESHOLD": Settings.PAYLOAD_DEDUP_IOU_THRESHOLD,
+            "PAYLOAD_DEDUP_LANDING_IOU_THRESHOLD": Settings.PAYLOAD_DEDUP_LANDING_IOU_THRESHOLD,
         }
         Settings.RESULT_MAX_OBJECTS = 100
         Settings.RESULT_CLASS_QUOTA = {"0": 40, "1": 40, "2": 10, "3": 10}
         Settings.MAX_RETRIES = 3
+        Settings.PAYLOAD_DEDUP_IOU_THRESHOLD = 0.55
+        Settings.PAYLOAD_DEDUP_LANDING_IOU_THRESHOLD = 0.45
         self.net = NetworkManager(base_url="http://localhost", simulation_mode=False)
         self.net._sleep_with_backoff = lambda attempt: None
 
@@ -691,6 +836,28 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         a, _ = self.net._apply_object_caps(src + src, frame_id="f-2")
         b, _ = self.net._apply_object_caps(list(reversed(copy.deepcopy(src + src))), frame_id="f-2")
         self.assertEqual(a, b)
+
+    def test_payload_bbox_dedup_removes_overlaps(self):
+        src = [
+            self._obj("0", 0.95, 10, 10),
+            self._obj("0", 0.90, 11, 11),
+            self._obj("0", 0.85, 120, 120),
+        ]
+        out, stats = self.net._deduplicate_payload_objects(src, frame_id="f-dedup-1")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(stats["dropped_total"], 1)
+        self.assertEqual(stats["dropped_by_class"]["0"], 1)
+
+    def test_payload_bbox_dedup_is_deterministic(self):
+        src = [
+            self._obj("2", 0.93, 20, 20),
+            self._obj("2", 0.92, 21, 21),
+            self._obj("3", 0.91, 200, 200),
+        ]
+        a, stats_a = self.net._deduplicate_payload_objects(copy.deepcopy(src), frame_id="f-dedup-2")
+        b, stats_b = self.net._deduplicate_payload_objects(list(reversed(copy.deepcopy(src))), frame_id="f-dedup-2")
+        self.assertEqual(a, b)
+        self.assertEqual(stats_a["dropped_total"], stats_b["dropped_total"])
 
     def test_preflight_invalid_payload_forces_fallback(self):
         payload, rej, clip = self.net._preflight_validate_and_normalize_payload(
@@ -843,7 +1010,12 @@ class _FakeNetwork:
         return {"fetch": 0, "image": 0, "submit": 0}
 
     def consume_payload_guard_counters(self):
-        return {"preflight_reject": 0, "payload_clipped": 0}
+        return {
+            "preflight_reject": 0,
+            "payload_clipped": 0,
+            "payload_bbox_dedup_dropped_total": 0,
+            "payload_bbox_dedup_dropped_by_class": {"0": 0, "1": 0, "2": 0, "3": 0},
+        }
 
     def download_image(self, frame_data):
         _FakeNetwork.download_calls += 1
@@ -880,6 +1052,8 @@ class TestCompetitionLoopHardening(unittest.TestCase):
             "CB_TRANSIENT_MAX_EVENTS": Settings.CB_TRANSIENT_MAX_EVENTS,
             "CB_OPEN_COOLDOWN_SEC": Settings.CB_OPEN_COOLDOWN_SEC,
             "CB_MAX_OPEN_CYCLES": Settings.CB_MAX_OPEN_CYCLES,
+            "CB_MAX_NO_PROGRESS_SEC": Settings.CB_MAX_NO_PROGRESS_SEC,
+            "CB_MAX_OPEN_CYCLES_WITHOUT_PROGRESS": Settings.CB_MAX_OPEN_CYCLES_WITHOUT_PROGRESS,
         }
         Settings.DEBUG = False
         Settings.MAX_FRAMES = 50
@@ -891,6 +1065,8 @@ class TestCompetitionLoopHardening(unittest.TestCase):
         Settings.CB_TRANSIENT_MAX_EVENTS = 100
         Settings.CB_OPEN_COOLDOWN_SEC = 0.01
         Settings.CB_MAX_OPEN_CYCLES = 100
+        Settings.CB_MAX_NO_PROGRESS_SEC = 300.0
+        Settings.CB_MAX_OPEN_CYCLES_WITHOUT_PROGRESS = 100
         _FakeNetwork.reset()
         self.summary_calls = []
 
@@ -1025,10 +1201,19 @@ class _LatencyNet:
 
     @staticmethod
     def consume_payload_guard_counters():
-        return {"preflight_reject": 0, "payload_clipped": 0}
+        return {
+            "preflight_reject": 0,
+            "payload_clipped": 0,
+            "payload_bbox_dedup_dropped_total": 0,
+            "payload_bbox_dedup_dropped_by_class": {"0": 0, "1": 0, "2": 0, "3": 0},
+        }
 
 
 class _LatencyResilience:
+    @staticmethod
+    def on_ack_progress():
+        return None
+
     @staticmethod
     def on_success_cycle():
         return None
@@ -1090,10 +1275,13 @@ class TestGps0LatencyCompensation(unittest.TestCase):
             "timeout_submit": 0,
             "payload_preflight_reject_count": 0,
             "payload_clipped_count": 0,
+            "payload_bbox_dedup_dropped_total": 0,
+            "payload_bbox_dedup_dropped_by_class": {"0": 0, "1": 0, "2": 0, "3": 0},
             "compensation_apply_count": 0,
             "compensation_sum_delta_m": 0.0,
             "compensation_avg_delta_m": 0.0,
             "compensation_max_delta_m": 0.0,
+            "submit_duplicate_blocked": 0,
         }
 
     @staticmethod

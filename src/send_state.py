@@ -15,6 +15,12 @@ def apply_send_result_status(
         kpi_counters["send_ok"] += 1
         kpi_counters["send_fallback_ok"] += 1
         return None, False, True
+    if status_value == "duplicate_blocked":
+        kpi_counters["send_ok"] += 1
+        kpi_counters["submit_duplicate_blocked"] = (
+            int(kpi_counters.get("submit_duplicate_blocked", 0)) + 1
+        )
+        return None, False, True
     if status_value == "permanent_rejected":
         kpi_counters["send_fail"] += 1
         kpi_counters["send_permanent_reject"] += 1

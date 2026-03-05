@@ -312,6 +312,41 @@ def _normalize_task3_object_id(raw_object_id: Any) -> Optional[int]:
     return object_id
 
 
+def _deduplicate_task3_matches_by_object_id(
+    log: Logger,
+    matches: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set = set()
+    dropped = 0
+
+    for item in matches:
+        if not isinstance(item, dict):
+            continue
+        object_id = _normalize_task3_object_id(item.get("object_id"))
+        if object_id is None:
+            continue
+        if object_id in seen:
+            dropped += 1
+            continue
+        seen.add(object_id)
+        deduped.append(
+            {
+                "object_id": object_id,
+                "top_left_x": item.get("top_left_x", 0),
+                "top_left_y": item.get("top_left_y", 0),
+                "bottom_right_x": item.get("bottom_right_x", 0),
+                "bottom_right_y": item.get("bottom_right_y", 0),
+            }
+        )
+
+    if dropped > 0:
+        log.warn(
+            f"event=task3_post_filter_duplicate_object_id dropped={dropped} kept={len(deduped)}"
+        )
+    return deduped
+
+
 def _build_task3_reference_source(
     ref_data: Dict[str, Any],
     object_id: int,
@@ -595,8 +630,16 @@ def run_competition(log: Logger) -> None:
         "send_fail": 0,
         "send_fallback_ok": 0,
         "send_permanent_reject": 0,
+        "submit_duplicate_blocked": 0,
         "payload_preflight_reject_count": 0,
         "payload_clipped_count": 0,
+        "payload_bbox_dedup_dropped_total": 0,
+        "payload_bbox_dedup_dropped_by_class": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
+        },
         "mode_gps": 0,
         "mode_of": 0,
         "degrade_frames": 0,
@@ -616,6 +659,7 @@ def run_competition(log: Logger) -> None:
         "reference_validation_stats": reference_validation_stats,
         "id_integrity_mode": id_integrity_mode,
         "id_integrity_reason_code": id_integrity_reason_code,
+        "resilience_abort_reason_code": "none",
     }
     pending_result: Optional[Dict] = None
 
@@ -638,6 +682,9 @@ def run_competition(log: Logger) -> None:
             try:
                 abort_reason = resilience.should_abort()
                 if abort_reason:
+                    kpi_counters["resilience_abort_reason_code"] = str(
+                        getattr(resilience, "last_abort_reason_code", "unknown")
+                    )
                     log.error(f"Resilience abort: {abort_reason}")
                     break
 
@@ -876,6 +923,7 @@ def _print_summary(
             f"Send OK={kpi_counters.get('send_ok', 0)} | "
             f"Send FAIL={kpi_counters.get('send_fail', 0)} | "
             f"Fallback ACK={kpi_counters.get('send_fallback_ok', 0)} | "
+            f"DupBlocked={kpi_counters.get('submit_duplicate_blocked', 0)} | "
             f"Permanent Reject={kpi_counters.get('send_permanent_reject', 0)} | "
             f"Preflight Reject={kpi_counters.get('payload_preflight_reject_count', 0)} | "
             f"Payload Clipped={kpi_counters.get('payload_clipped_count', 0)} | "
@@ -886,6 +934,11 @@ def _print_summary(
             f"{kpi_counters.get('timeout_fetch', 0)}/"
             f"{kpi_counters.get('timeout_image', 0)}/"
             f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+        log.info(
+            "KPI Payload Dedup: "
+            f"Dropped Total={kpi_counters.get('payload_bbox_dedup_dropped_total', 0)} | "
+            f"ByClass={kpi_counters.get('payload_bbox_dedup_dropped_by_class', {})}"
         )
         log.info(
             "KPI Compensation: "
@@ -916,7 +969,8 @@ def _print_summary(
             f"Breaker Open Count={int(resilience_stats.get('breaker_open_count', 0))} | "
             f"Degrade Entries={int(resilience_stats.get('degrade_entries', 0))} | "
             f"Recovery Count={int(resilience_stats.get('recovered_count', 0))} | "
-            f"Transient Wall Time={float(resilience_stats.get('transient_wall_time_sec', 0.0)):.1f}s"
+            f"Transient Wall Time={float(resilience_stats.get('transient_wall_time_sec', 0.0)):.1f}s | "
+            f"AbortReason={kpi_counters.get('resilience_abort_reason_code', 'none') if kpi_counters else 'none'}"
         )
 
     log.success("System shutdown complete")
@@ -1210,7 +1264,10 @@ def _fetch_competition_step(
         detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
         undefined_objects = []
         if image_matcher is not None:
-            undefined_objects = image_matcher.match(frame)
+            undefined_objects = _deduplicate_task3_matches_by_object_id(
+                log=log,
+                matches=image_matcher.match(frame),
+            )
         position = odometry.update(frame_ctx, frame_data)
         runtime_meta = (
             odometry.get_runtime_meta()
@@ -1269,6 +1326,10 @@ def _submit_competition_step(
         pending_result=pending_result,
         kpi_counters=kpi_counters,
     )
+    pending_result["detected_undefined_objects"] = _deduplicate_task3_matches_by_object_id(
+        log=log,
+        matches=pending_result.get("detected_undefined_objects", []),
+    )
 
     send_status = network.send_result(
         frame_id, detected_objects, detected_translation,
@@ -1285,6 +1346,17 @@ def _submit_competition_step(
     guard_snapshot = network.consume_payload_guard_counters()
     kpi_counters["payload_preflight_reject_count"] += guard_snapshot.get("preflight_reject", 0)
     kpi_counters["payload_clipped_count"] += guard_snapshot.get("payload_clipped", 0)
+    kpi_counters["payload_bbox_dedup_dropped_total"] += int(
+        guard_snapshot.get("payload_bbox_dedup_dropped_total", 0)
+    )
+    per_class_drop = guard_snapshot.get("payload_bbox_dedup_dropped_by_class", {})
+    if isinstance(per_class_drop, dict):
+        payload_drop_kpi = kpi_counters.get("payload_bbox_dedup_dropped_by_class", {})
+        for cls in ("0", "1", "2", "3"):
+            payload_drop_kpi[cls] = int(payload_drop_kpi.get(cls, 0)) + int(
+                per_class_drop.get(cls, 0)
+            )
+        kpi_counters["payload_bbox_dedup_dropped_by_class"] = payload_drop_kpi
 
     pending_result_snapshot = dict(pending_result)
 
@@ -1306,6 +1378,7 @@ def _submit_competition_step(
     if success_cycle:
         ack_failures = 0
         consecutive_permanent_rejects = 0
+        resilience.on_ack_progress()
         resilience.on_success_cycle()
         pending_result_snapshot["position"] = position_for_success
         success_info = {

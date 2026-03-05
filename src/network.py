@@ -2,6 +2,7 @@
 
 import time
 import random
+from threading import Lock
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -38,6 +39,7 @@ class SendResultStatus(str, Enum):
     FALLBACK_ACKED = "fallback_acked"
     RETRYABLE_FAILURE = "retryable_failure"
     PERMANENT_REJECTED = "permanent_rejected"
+    DUPLICATE_BLOCKED = "duplicate_blocked"
 
 
 class NetworkManager:
@@ -60,6 +62,8 @@ class NetworkManager:
         self._sim_image_cache: Optional[np.ndarray] = None
         self._seen_frames_lru: "OrderedDict[str, None]" = OrderedDict()
         self._submitted_frames_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._submit_ledger_lru: "OrderedDict[str, str]" = OrderedDict()
+        self._submit_ledger_lock = Lock()
         self._force_fallback_frames_lru: "OrderedDict[str, None]" = OrderedDict()
         self._timeout_counters: Dict[str, int] = {
             "fetch": 0,
@@ -69,6 +73,13 @@ class NetworkManager:
         self._payload_guard_counters: Dict[str, int] = {
             "preflight_reject": 0,
             "payload_clipped": 0,
+            "payload_bbox_dedup_dropped_total": 0,
+        }
+        self._payload_bbox_dedup_dropped_by_class: Dict[str, int] = {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
         }
         self._clip_ratio_window: Deque[int] = deque(maxlen=100)
         self._session_id: str = str(int(time.time()))
@@ -273,18 +284,25 @@ class NetworkManager:
         detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> SendResultStatus:
         frame_key = self._normalize_frame_key(frame_id)
-        if self._was_already_submitted(frame_key):
+        slot_reserved, ledger_state = self._reserve_submit_slot(frame_key)
+        if not slot_reserved:
             self.log.warn(
-                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard, sending gracefully."
+                f"Frame {frame_key}: duplicate submit blocked by frame ledger "
+                f"(state={ledger_state})"
             )
-        raw_payload = self.build_competition_payload(
-            frame_id=frame_id,
-            detected_objects=detected_objects,
-            detected_translation=detected_translation,
-            frame_data=frame_data,
-            frame_shape=frame_shape,
-            detected_undefined_objects=detected_undefined_objects,
-        )
+            return SendResultStatus.DUPLICATE_BLOCKED
+        try:
+            raw_payload = self.build_competition_payload(
+                frame_id=frame_id,
+                detected_objects=detected_objects,
+                detected_translation=detected_translation,
+                frame_data=frame_data,
+                frame_shape=frame_shape,
+                detected_undefined_objects=detected_undefined_objects,
+            )
+        except Exception:
+            self._release_submit_slot(frame_key)
+            raise
         force_fallback = self._should_force_fallback(frame_key)
         if force_fallback:
             payload = self._build_safe_fallback_payload(raw_payload)
@@ -316,11 +334,14 @@ class NetworkManager:
                 f"Objects: {len(payload['detected_objects'])} | "
                 f"Degrade: {'ON' if degrade else 'OFF'}"
             )
-            return (
+            sim_status = (
                 SendResultStatus.FALLBACK_ACKED
                 if preflight_rejected
                 else SendResultStatus.ACKED
             )
+            self._mark_submitted(frame_key, sim_status)
+            self._unmark_force_fallback(frame_key)
+            return sim_status
 
         url = f"{self.base_url}{Settings.ENDPOINT_SUBMIT_RESULT}"
         idempotency_key = self._build_idempotency_key(frame_key)
@@ -343,11 +364,14 @@ class NetworkManager:
                         f"Result sent successfully: Frame {frame_id} "
                         f"(degrade={'ON' if degrade else 'OFF'})"
                     )
-                    self._mark_submitted(frame_key)
+                    status = (
+                        SendResultStatus.FALLBACK_ACKED
+                        if (preflight_rejected or fallback_sent)
+                        else SendResultStatus.ACKED
+                    )
+                    self._mark_submitted(frame_key, status)
                     self._unmark_force_fallback(frame_key)
-                    if preflight_rejected or fallback_sent:
-                        return SendResultStatus.FALLBACK_ACKED
-                    return SendResultStatus.ACKED
+                    return status
 
                 if 400 <= response.status_code < 500:
                     saw_4xx = True
@@ -379,6 +403,7 @@ class NetworkManager:
                 self.log.error(
                     f"Frame {frame_id}: fallback payload also rejected (4xx), marking permanent reject"
                 )
+                self._mark_submitted(frame_key, SendResultStatus.PERMANENT_REJECTED)
                 return SendResultStatus.PERMANENT_REJECTED
 
             fallback_payload = self._build_safe_fallback_payload(raw_payload)
@@ -396,30 +421,35 @@ class NetworkManager:
                     self.log.warn(
                         f"Frame {frame_id}: 4xx recovered with safe fallback payload"
                     )
-                    self._mark_submitted(frame_key)
+                    self._mark_submitted(frame_key, SendResultStatus.FALLBACK_ACKED)
                     self._unmark_force_fallback(frame_key)
                     return SendResultStatus.FALLBACK_ACKED
                 if 400 <= response.status_code < 500:
                     self.log.error(
                         f"Frame {frame_id}: fallback payload rejected with HTTP {response.status_code}"
                     )
+                    self._mark_submitted(frame_key, SendResultStatus.PERMANENT_REJECTED)
                     return SendResultStatus.PERMANENT_REJECTED
 
                 self.log.warn(
                     f"Frame {frame_id}: fallback payload non-ACK HTTP {response.status_code}, retryable"
                 )
+                self._release_submit_slot(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
             except requests.Timeout:
                 self._increment_timeout_counter("submit")
                 self.log.warn(f"Frame {frame_id}: fallback submit timeout, retryable")
+                self._release_submit_slot(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
             except Exception as exc:
                 self.log.warn(
                     f"Frame {frame_id}: fallback submit transient error ({type(exc).__name__}): {exc}"
                 )
+                self._release_submit_slot(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
 
         self.log.error(f"Result submission failed after retries for frame {frame_id}")
+        self._release_submit_slot(frame_key)
         return SendResultStatus.RETRYABLE_FAILURE
 
     @staticmethod
@@ -616,8 +646,20 @@ class NetworkManager:
                 f"count={alias_count} frame_id={frame_id}"
             )
 
-        capped_objects, clip_stats = self._apply_object_caps(
+        deduped_objects, dedup_stats = self._deduplicate_payload_objects(
             normalized_objects=normalized_objects,
+            frame_id=frame_id,
+        )
+        self._payload_guard_counters["payload_bbox_dedup_dropped_total"] += int(
+            dedup_stats.get("dropped_total", 0)
+        )
+        for cls, dropped in dedup_stats.get("dropped_by_class", {}).items():
+            cls_key = str(cls)
+            if cls_key in self._payload_bbox_dedup_dropped_by_class:
+                self._payload_bbox_dedup_dropped_by_class[cls_key] += int(dropped)
+
+        capped_objects, clip_stats = self._apply_object_caps(
+            normalized_objects=deduped_objects,
             frame_id=frame_id,
         )
         payload_clipped = bool(clip_stats.get("dropped_total", 0) > 0)
@@ -726,6 +768,72 @@ class NetworkManager:
 
         return capped, stats
 
+    def _deduplicate_payload_objects(
+        self,
+        normalized_objects: List[Dict[str, Any]],
+        frame_id: Any,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        class_order = ["0", "1", "2", "3"]
+        grouped: Dict[str, List[Dict[str, Any]]] = {cls: [] for cls in class_order}
+        for obj in normalized_objects:
+            cls = str(obj.get("cls", ""))
+            if cls in grouped:
+                grouped[cls].append(obj)
+
+        base_iou = max(
+            0.0, min(1.0, self._safe_float(getattr(Settings, "PAYLOAD_DEDUP_IOU_THRESHOLD", 0.55)))
+        )
+        landing_iou = max(
+            0.0,
+            min(
+                1.0,
+                self._safe_float(
+                    getattr(Settings, "PAYLOAD_DEDUP_LANDING_IOU_THRESHOLD", 0.45)
+                ),
+            ),
+        )
+
+        def _rank_key(det: Dict[str, Any]) -> Tuple[float, float, int, int]:
+            x1 = self._safe_int(det.get("top_left_x", 0))
+            y1 = self._safe_int(det.get("top_left_y", 0))
+            x2 = self._safe_int(det.get("bottom_right_x", 0))
+            y2 = self._safe_int(det.get("bottom_right_y", 0))
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            conf = self._safe_float(det.get("_confidence", 0.0))
+            return (-conf, -float(area), x1, y1)
+
+        deduped: List[Dict[str, Any]] = []
+        dropped_by_class: Dict[str, int] = {cls: 0 for cls in class_order}
+
+        for cls in class_order:
+            ranked = sorted(grouped[cls], key=_rank_key)
+            kept_cls: List[Dict[str, Any]] = []
+            iou_threshold = landing_iou if cls in {"2", "3"} else base_iou
+            for det in ranked:
+                overlaps = any(
+                    self._bbox_iou(det, kept_det) >= iou_threshold for kept_det in kept_cls
+                )
+                if overlaps:
+                    dropped_by_class[cls] += 1
+                    continue
+                kept_cls.append(det)
+            deduped.extend(kept_cls)
+
+        dropped_total = sum(dropped_by_class.values())
+        if dropped_total > 0:
+            self.log.warn(
+                "Payload bbox dedup applied: "
+                f"frame_id={frame_id} dropped_total={dropped_total} "
+                f"dropped_by_class={dropped_by_class}"
+            )
+
+        return deduped, {
+            "raw_count": len(normalized_objects),
+            "kept_count": len(deduped),
+            "dropped_total": dropped_total,
+            "dropped_by_class": dropped_by_class,
+        }
+
     @staticmethod
     def _build_safe_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         tx = 0.0
@@ -759,14 +867,49 @@ class NetworkManager:
         self._timeout_counters = dict.fromkeys(snapshot, 0)
         return snapshot
 
-    def consume_payload_guard_counters(self) -> Dict[str, int]:
-        snapshot = self._payload_guard_counters
-        self._payload_guard_counters = dict.fromkeys(snapshot, 0)
+    def consume_payload_guard_counters(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = dict(self._payload_guard_counters)
+        snapshot["payload_bbox_dedup_dropped_by_class"] = dict(
+            self._payload_bbox_dedup_dropped_by_class
+        )
+        self._payload_guard_counters = dict.fromkeys(self._payload_guard_counters, 0)
+        self._payload_bbox_dedup_dropped_by_class = dict.fromkeys(
+            self._payload_bbox_dedup_dropped_by_class,
+            0,
+        )
         return snapshot
 
     def _increment_timeout_counter(self, key: str) -> None:
         if key in self._timeout_counters:
             self._timeout_counters[key] += 1
+
+    @staticmethod
+    def _bbox_iou(det_a: Dict[str, Any], det_b: Dict[str, Any]) -> float:
+        ax1 = float(det_a.get("top_left_x", 0))
+        ay1 = float(det_a.get("top_left_y", 0))
+        ax2 = float(det_a.get("bottom_right_x", 0))
+        ay2 = float(det_a.get("bottom_right_y", 0))
+        bx1 = float(det_b.get("top_left_x", 0))
+        by1 = float(det_b.get("top_left_y", 0))
+        bx2 = float(det_b.get("bottom_right_x", 0))
+        by2 = float(det_b.get("bottom_right_y", 0))
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter = inter_w * inter_h
+        if inter <= 0.0:
+            return 0.0
+
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = area_a + area_b - inter
+        if denom <= 0.0:
+            return 0.0
+        return inter / denom
 
     @staticmethod
     def _normalize_frame_key(frame_id: Any) -> str:
@@ -783,13 +926,66 @@ class NetworkManager:
         return False
 
     def _was_already_submitted(self, frame_key: str) -> bool:
+        state = self._get_submit_state(frame_key)
+        if state in {
+            SendResultStatus.ACKED.value,
+            SendResultStatus.FALLBACK_ACKED.value,
+            SendResultStatus.PERMANENT_REJECTED.value,
+        }:
+            return True
         if frame_key in self._submitted_frames_lru:
             self._submitted_frames_lru.move_to_end(frame_key)
             return True
         return False
 
-    def _mark_submitted(self, frame_key: str) -> None:
+    def _mark_submitted(
+        self,
+        frame_key: str,
+        status: SendResultStatus = SendResultStatus.ACKED,
+    ) -> None:
         self._touch_lru(self._submitted_frames_lru, frame_key)
+        self._set_submit_state(frame_key, status.value)
+
+    def _reserve_submit_slot(self, frame_key: str) -> Tuple[bool, str]:
+        with self._submit_ledger_lock:
+            current = self._submit_ledger_lru.get(frame_key)
+            if current is not None:
+                self._submit_ledger_lru.move_to_end(frame_key)
+            if current in {
+                "in_flight",
+                SendResultStatus.ACKED.value,
+                SendResultStatus.FALLBACK_ACKED.value,
+                SendResultStatus.PERMANENT_REJECTED.value,
+            }:
+                return False, str(current)
+            self._submit_ledger_lru[frame_key] = "in_flight"
+            self._submit_ledger_lru.move_to_end(frame_key)
+            self._trim_submit_ledger_locked()
+            return True, "in_flight"
+
+    def _release_submit_slot(self, frame_key: str) -> None:
+        with self._submit_ledger_lock:
+            current = self._submit_ledger_lru.get(frame_key)
+            if current == "in_flight":
+                self._submit_ledger_lru.pop(frame_key, None)
+
+    def _set_submit_state(self, frame_key: str, state: str) -> None:
+        with self._submit_ledger_lock:
+            self._submit_ledger_lru[frame_key] = str(state)
+            self._submit_ledger_lru.move_to_end(frame_key)
+            self._trim_submit_ledger_locked()
+
+    def _get_submit_state(self, frame_key: str) -> Optional[str]:
+        with self._submit_ledger_lock:
+            state = self._submit_ledger_lru.get(frame_key)
+            if state is not None:
+                self._submit_ledger_lru.move_to_end(frame_key)
+            return state
+
+    def _trim_submit_ledger_locked(self) -> None:
+        max_size = max(1, int(getattr(Settings, "SEEN_FRAME_LRU_SIZE", 512)))
+        while len(self._submit_ledger_lru) > max_size:
+            self._submit_ledger_lru.popitem(last=False)
 
     def _should_force_fallback(self, frame_key: str) -> bool:
         if frame_key in self._force_fallback_frames_lru:

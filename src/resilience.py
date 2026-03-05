@@ -38,6 +38,9 @@ class SessionResilienceController:
         self._non_normal_since: Optional[float] = None
         self._open_until_monotonic: float = 0.0
         self._degrade_frame_counter: int = 0
+        self._last_ack_progress_monotonic: float = self._now()
+        self._open_cycles_without_progress: int = 0
+        self._last_abort_reason_code: str = "none"
 
     def _now(self) -> float:
         return time.monotonic()
@@ -90,6 +93,7 @@ class SessionResilienceController:
     def _enter_open(self, reason: str, now: Optional[float] = None) -> None:
         curr = now if now is not None else self._now()
         self.stats.breaker_open_count += 1
+        self._open_cycles_without_progress += 1
         self._open_until_monotonic = curr + float(Settings.CB_OPEN_COOLDOWN_SEC)
         self._transition(ResilienceState.OPEN, reason=reason, now=curr)
 
@@ -121,6 +125,11 @@ class SessionResilienceController:
             self._transition(ResilienceState.NORMAL, reason="fetch_and_ack_success", now=now)
         self._degrade_frame_counter = 0
 
+    def on_ack_progress(self) -> None:
+        self._last_ack_progress_monotonic = self._now()
+        self._open_cycles_without_progress = 0
+        self._last_abort_reason_code = "none"
+
     def before_fetch(self) -> bool:
         now = self._now()
         if self.state != ResilienceState.OPEN:
@@ -141,11 +150,29 @@ class SessionResilienceController:
     def should_abort(self) -> Optional[str]:
         if self.state == ResilienceState.NORMAL:
             return None
-        wall_time = self._current_transient_wall_time()
-        limit = float(Settings.CB_SESSION_MAX_TRANSIENT_SEC)
-        if wall_time >= limit:
+
+        now = self._now()
+        no_progress_sec = max(0.0, now - self._last_ack_progress_monotonic)
+        max_no_progress = float(
+            getattr(Settings, "CB_MAX_NO_PROGRESS_SEC", Settings.CB_SESSION_MAX_TRANSIENT_SEC)
+        )
+        max_cycles = int(
+            getattr(
+                Settings,
+                "CB_MAX_OPEN_CYCLES_WITHOUT_PROGRESS",
+                Settings.CB_MAX_OPEN_CYCLES,
+            )
+        )
+
+        if (
+            no_progress_sec >= max_no_progress
+            and self._open_cycles_without_progress >= max_cycles
+        ):
+            self._last_abort_reason_code = "no_progress_open_cycles_exceeded"
             return (
-                f"Transient wall time {wall_time:.0f}s >= limit {limit:.0f}s; "
+                "reason_code=no_progress_open_cycles_exceeded "
+                f"no_progress={no_progress_sec:.0f}s>={max_no_progress:.0f}s "
+                f"open_cycles={self._open_cycles_without_progress}>={max_cycles}; "
                 "aborting session to avoid indefinite wait"
             )
         return None
@@ -159,3 +186,7 @@ class SessionResilienceController:
             self.stats.transient_wall_time_sec += max(0.0, now - self._non_normal_since)
             self._non_normal_since = None
         return self.stats
+
+    @property
+    def last_abort_reason_code(self) -> str:
+        return self._last_abort_reason_code
