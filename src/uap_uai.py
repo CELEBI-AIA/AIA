@@ -49,6 +49,9 @@ def determine_landing_status(
     """Şartname kurallarına göre UAP/UAİ iniş uygunluğunu hesaplar."""
     landing_zones: List[Tuple[int, Dict]] = []
     obstacles: List[Tuple[float, float, float, float]] = []
+    unknown_as_obstacles = bool(
+        getattr(Settings, "UNKNOWN_OBJECTS_AS_OBSTACLES", True)
+    )
 
     for idx, det in enumerate(detections):
         cls = str(det.get("cls", ""))
@@ -57,6 +60,9 @@ def determine_landing_status(
             landing_zones.append((idx, det))
         elif cls in ("0", "1"):
             # Engel
+            obstacles.append(_bbox(det))
+        elif unknown_as_obstacles:
+            # Modelin tanıyamadığı/şartname dışı objeler de iniş güvenliği için engel kabul edilir.
             obstacles.append(_bbox(det))
 
     if not landing_zones:
@@ -123,8 +129,8 @@ def determine_landing_status(
                     maxRadius=int(crop.shape[0]*0.8)
                 )
                 if circles is None:
-                    # Klasik CV "daire değil" diyor
-                    det["landing_status"] = "-1" # Şartname 170: İniş alanı niteliği taşımıyorsa -1
+                    # UAP/UAİ sınıfında iniş durumu sadece 0/1 olabilir; güvenli tarafta kal.
+                    det["landing_status"] = "0"
                     continue
 
         # Hepsi geçildi → İnişe Uygun

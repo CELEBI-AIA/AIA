@@ -66,6 +66,7 @@ from src.competition_contract import (
     RecoverableIOError,
 )
 from src.payload import CompetitionPayloadSchema, PayloadAdapter
+from src.class_contract import CompetitionClassContract
 from src.utils import Logger, log_json_to_disk, _sanitize_log_component, _prune_old_logs
 from main import run_simulation
 
@@ -311,6 +312,58 @@ class TestEdgeMarginRatio(unittest.TestCase):
             )
         finally:
             Settings.EDGE_MARGIN_RATIO = orig
+
+    def test_uap_uai_conflict_suppression_keeps_high_confidence(self):
+        from src.detection import ObjectDetector
+
+        orig_iou = getattr(Settings, "UAP_UAI_CONFLICT_IOU_THRESHOLD", 0.55)
+        orig_debug = Settings.DEBUG
+        Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = 0.4
+        Settings.DEBUG = False
+        try:
+            detector = ObjectDetector.__new__(ObjectDetector)
+            detector.log = Logger("DetectorTest")
+            detections = [
+                {
+                    "cls_int": 2,
+                    "cls": "2",
+                    "confidence": 0.92,
+                    "bbox": (100.0, 100.0, 200.0, 200.0),
+                    "top_left_x": 100.0,
+                    "top_left_y": 100.0,
+                    "bottom_right_x": 200.0,
+                    "bottom_right_y": 200.0,
+                },
+                {
+                    "cls_int": 3,
+                    "cls": "3",
+                    "confidence": 0.31,
+                    "bbox": (105.0, 105.0, 198.0, 198.0),
+                    "top_left_x": 105.0,
+                    "top_left_y": 105.0,
+                    "bottom_right_x": 198.0,
+                    "bottom_right_y": 198.0,
+                },
+                {
+                    "cls_int": 0,
+                    "cls": "0",
+                    "confidence": 0.88,
+                    "bbox": (20.0, 20.0, 60.0, 60.0),
+                    "top_left_x": 20.0,
+                    "top_left_y": 20.0,
+                    "bottom_right_x": 60.0,
+                    "bottom_right_y": 60.0,
+                },
+            ]
+
+            out = detector._suppress_landing_zone_class_conflicts(detections)
+            classes = [str(row["cls"]) for row in out]
+            self.assertIn("2", classes)
+            self.assertNotIn("3", classes)
+            self.assertIn("0", classes)
+        finally:
+            Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = orig_iou
+            Settings.DEBUG = orig_debug
 
 
 class TestMainAckStateMachine:
@@ -935,7 +988,7 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         )
         self.assertEqual(status, SendResultStatus.RETRYABLE_FAILURE)
 
-    def test_payload_adapter_legacy_is_applied_before_submit(self):
+    def test_payload_adapter_legacy_profile_uses_canonical_motion_field(self):
         Settings.PAYLOAD_ADAPTER_VERSION = "v1_legacy"
         self.net.session = Mock()
         self.net.session.post = Mock(return_value=_Response(200))
@@ -963,16 +1016,40 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         self.assertEqual(status, SendResultStatus.ACKED)
         sent_payload = self.net.session.post.call_args.kwargs["json"]
         sent_obj = sent_payload["detected_objects"][0]
-        self.assertIn("movement_status", sent_obj)
-        self.assertNotIn("motion_status", sent_obj)
+        self.assertIn("motion_status", sent_obj)
+        self.assertNotIn("movement_status", sent_obj)
+
+    def test_preflight_rejects_uap_uai_without_landing_status(self):
+        self.net.session = Mock()
+        self.net.session.post = Mock(return_value=_Response(200))
+        status = self.net.send_result(
+            frame_id="f-uap-missing-landing",
+            detected_objects=[
+                {
+                    "cls": "2",
+                    "motion_status": "-1",
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 20,
+                    "bottom_right_y": 30,
+                }
+            ],
+            detected_translation={
+                "translation_x": 0.0,
+                "translation_y": 0.0,
+                "translation_z": 0.0,
+            },
+            frame_data={"id": "f-uap-missing-landing", "user": "u", "url": "frame-url"},
+            frame_shape=(1080, 1920, 3),
+        )
+        self.assertEqual(status, SendResultStatus.FALLBACK_ACKED)
 
 
 class TestCompetitionPayloadSchema(unittest.TestCase):
-    def test_legacy_motion_alias_is_normalized_to_canonical(self):
+    def test_uap_uai_without_landing_status_is_rejected(self):
         obj = {
-            "cls": "0",
-            "landing_status": "1",
-            "movement_status": "0",
+            "cls": "2",
+            "motion_status": "-1",
             "top_left_x": 1,
             "top_left_y": 2,
             "bottom_right_x": 20,
@@ -981,11 +1058,59 @@ class TestCompetitionPayloadSchema(unittest.TestCase):
         out, alias_count = CompetitionPayloadSchema.canonicalize_objects(
             [obj], frame_shape=(100, 100)
         )
-        self.assertEqual(alias_count, 1)
+        self.assertEqual(alias_count, 0)
+        self.assertEqual(len(out), 0)
+
+    def test_uap_status_is_clamped_to_binary_landing(self):
+        obj = {
+            "cls": "2",
+            "landing_status": "-1",
+            "motion_status": "1",
+            "top_left_x": 1,
+            "top_left_y": 2,
+            "bottom_right_x": 20,
+            "bottom_right_y": 30,
+        }
+        out, _ = CompetitionPayloadSchema.canonicalize_objects(
+            [obj], frame_shape=(100, 100)
+        )
         self.assertEqual(len(out), 1)
-        self.assertIn("motion_status", out[0])
-        self.assertNotIn("movement_status", out[0])
-        self.assertEqual(out[0]["motion_status"], 0)
+        self.assertEqual(str(out[0]["landing_status"]), "0")
+        self.assertEqual(str(out[0]["motion_status"]), "-1")
+
+    def test_vehicle_status_forces_landing_minus1_and_motion_binary(self):
+        obj = {
+            "cls": "0",
+            "landing_status": "1",
+            "motion_status": "-1",
+            "top_left_x": 1,
+            "top_left_y": 2,
+            "bottom_right_x": 20,
+            "bottom_right_y": 30,
+        }
+        out, _ = CompetitionPayloadSchema.canonicalize_objects(
+            [obj], frame_shape=(100, 100)
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(str(out[0]["landing_status"]), "-1")
+        self.assertEqual(str(out[0]["motion_status"]), "0")
+
+    def test_human_status_forced_not_landing_not_moving(self):
+        obj = {
+            "cls": "1",
+            "landing_status": "1",
+            "motion_status": "1",
+            "top_left_x": 1,
+            "top_left_y": 2,
+            "bottom_right_x": 20,
+            "bottom_right_y": 30,
+        }
+        out, _ = CompetitionPayloadSchema.canonicalize_objects(
+            [obj], frame_shape=(100, 100)
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(str(out[0]["landing_status"]), "-1")
+        self.assertEqual(str(out[0]["motion_status"]), "-1")
 
     def test_settings_self_check_requires_canonical_motion_field(self):
         old = Settings.MOTION_FIELD_NAME
@@ -995,6 +1120,17 @@ class TestCompetitionPayloadSchema(unittest.TestCase):
                 CompetitionPayloadSchema.self_check()
         finally:
             Settings.MOTION_FIELD_NAME = old
+
+
+class TestClassContract(unittest.TestCase):
+    def test_settings_contract_matches_expected_order(self):
+        CompetitionClassContract.validate_settings_contract()
+
+    def test_model_class_order_validation_rejects_swapped_uap_uai(self):
+        bad_names = {0: "tasit", 1: "insan", 2: "uai", 3: "uap"}
+        with self.assertRaises(DataContractError):
+            CompetitionClassContract.validate_model_class_order(bad_names)
+
 
 
 class TestPayloadAdapter(unittest.TestCase):
@@ -1036,9 +1172,9 @@ class TestPayloadAdapter(unittest.TestCase):
         Settings.PAYLOAD_ADAPTER_VERSION = "v1_legacy"
         out = PayloadAdapter.adapt_payload(self._payload())
         obj = out["detected_objects"][0]
-        self.assertIn("movement_status", obj)
-        self.assertNotIn("motion_status", obj)
-        self.assertEqual(obj["movement_status"], "0")
+        self.assertIn("motion_status", obj)
+        self.assertNotIn("movement_status", obj)
+        self.assertEqual(obj["motion_status"], "0")
 
     def test_v2_int_casts_types(self):
         Settings.PAYLOAD_ADAPTER_VERSION = "v2_int"

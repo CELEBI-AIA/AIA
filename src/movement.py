@@ -29,6 +29,7 @@ class MovementEstimator:
         self._next_track_id: int = 1
         self._prev_gray: Optional[np.ndarray] = None
         self._prev_points: Optional[np.ndarray] = None
+        self._flow_inv_scale: float = 1.0
         self._cam_shift_hist: Deque[Tuple[float, float]] = deque(
             maxlen=Settings.MOVEMENT_WINDOW_FRAMES
         )
@@ -223,39 +224,69 @@ class MovementEstimator:
             (float(det.get("top_left_y", 0)) + float(det.get("bottom_right_y", 0))) / 2.0,
         )
 
+    @staticmethod
+    def _prepare_flow_gray(gray: np.ndarray) -> Tuple[np.ndarray, float]:
+        scale = float(getattr(Settings, "MOTION_COMP_DOWNSCALE", 1.0))
+        if scale >= 1.0 or scale <= 0.1:
+            return gray, 1.0
+
+        h, w = gray.shape[:2]
+        target_w = max(64, int(w * scale))
+        target_h = max(64, int(h * scale))
+        if target_w >= w or target_h >= h:
+            return gray, 1.0
+
+        resized = cv2.resize(gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        inv_scale = w / float(target_w)
+        return resized, inv_scale
+
+    @staticmethod
+    def _detect_features(gray: np.ndarray) -> Optional[np.ndarray]:
+        return cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
+            qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
+            minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
+        )
+
+    @staticmethod
+    def _robust_median_shift(
+        old: np.ndarray,
+        new: np.ndarray,
+    ) -> Tuple[float, float]:
+        deltas = new - old
+        dx = deltas[:, 0]
+        dy = deltas[:, 1]
+
+        low, high = 10, 90
+        dx_l, dx_h = np.percentile(dx, [low, high])
+        dy_l, dy_h = np.percentile(dy, [low, high])
+        keep = (dx >= dx_l) & (dx <= dx_h) & (dy >= dy_l) & (dy <= dy_h)
+        if np.count_nonzero(keep) >= 5:
+            dx = dx[keep]
+            dy = dy[keep]
+
+        return float(np.median(dx)), float(np.median(dy))
+
     def _estimate_camera_shift(self, frame_ctx: "FrameContext") -> Tuple[float, float]:
         if isinstance(frame_ctx, np.ndarray):
             from src.utils import FrameContext
             frame_ctx = FrameContext(frame_ctx)
-        gray = frame_ctx.gray
+        gray, self._flow_inv_scale = self._prepare_flow_gray(frame_ctx.gray)
+
         if self._prev_gray is None:
             self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._detect_features(gray)
             self._frame_diff = float("inf")
             return 0.0, 0.0
 
         self._frame_diff = float(cv2.absdiff(self._prev_gray, gray).mean())
 
         if self._prev_points is None or len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES:
-            self._prev_points = cv2.goodFeaturesToTrack(
-                self._prev_gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._detect_features(self._prev_gray)
             if self._prev_points is None or len(self._prev_points) < 5:
                 self._prev_gray = gray
-                self._prev_points = cv2.goodFeaturesToTrack(
-                    gray,
-                    maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                    qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                    minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-                )
+                self._prev_points = self._detect_features(gray)
                 return 0.0, 0.0
 
         if self._prev_points is None:
@@ -273,25 +304,35 @@ class MovementEstimator:
         )
         if next_pts is None or status is None:
             self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._detect_features(gray)
             return 0.0, 0.0
 
         valid = status.flatten() == 1
         old = self._prev_points[valid].reshape(-1, 2)
         new = next_pts[valid].reshape(-1, 2)
+        fb_max_error = float(getattr(Settings, "MOTION_COMP_FB_MAX_ERROR", 1.5))
+        if len(new) >= 5 and fb_max_error > 0.0:
+            back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                gray,
+                self._prev_gray,
+                new.reshape(-1, 1, 2),
+                None,
+                winSize=(win, win),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            )
+            if back_pts is not None and back_status is not None:
+                back_ok = back_status.flatten() == 1
+                back = back_pts.reshape(-1, 2)
+                fb_error = np.linalg.norm(back - old, axis=1)
+                fb_keep = back_ok & (fb_error <= fb_max_error)
+                if np.count_nonzero(fb_keep) >= 5:
+                    old = old[fb_keep]
+                    new = new[fb_keep]
+
         if len(new) < 5:
             self._prev_gray = gray
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._detect_features(gray)
             return 0.0, 0.0
 
         # Calculate shift based on chosen algorithm
@@ -300,38 +341,37 @@ class MovementEstimator:
         if algo == "homography" and len(new) >= 10:
             # Use RANSAC Homography for robust global camera motion estimation
             H, mask = cv2.findHomography(old, new, cv2.RANSAC, 3.0)
-            if H is not None:
+            valid_h = (
+                H is not None
+                and mask is not None
+                and int(np.count_nonzero(mask)) >= 6
+                and np.all(np.isfinite(H))
+            )
+            if valid_h:
                 # Extract pure translation from the 3x3 homography matrix
                 cam_dx = float(H[0, 2])
                 cam_dy = float(H[1, 2])
             else:
-                cam_dx = cam_dy = 0.0
+                cam_dx, cam_dy = self._robust_median_shift(old, new)
         else:
             # Standard median optical flow (fallback/default)
-            deltas = new - old
-            dx = deltas[:, 0]
-            dy = deltas[:, 1]
-    
-            low, high = 10, 90
-            dx_l, dx_h = np.percentile(dx, [low, high])
-            dy_l, dy_h = np.percentile(dy, [low, high])
-            keep = (dx >= dx_l) & (dx <= dx_h) & (dy >= dy_l) & (dy <= dy_h)
-            if np.count_nonzero(keep) >= 5:
-                dx = dx[keep]
-                dy = dy[keep]
-    
-            cam_dx = float(np.median(dx))
-            cam_dy = float(np.median(dy))
+            cam_dx, cam_dy = self._robust_median_shift(old, new)
+
+        cam_dx *= self._flow_inv_scale
+        cam_dy *= self._flow_inv_scale
+        max_shift = float(getattr(Settings, "MOTION_COMP_MAX_SHIFT_PX", 0.0))
+        if max_shift > 0.0:
+            cam_dx = max(-max_shift, min(max_shift, cam_dx))
+            cam_dy = max(-max_shift, min(max_shift, cam_dy))
+        if not np.isfinite(cam_dx):
+            cam_dx = 0.0
+        if not np.isfinite(cam_dy):
+            cam_dy = 0.0
 
         self._prev_gray = gray
         self._prev_points = new.reshape(-1, 1, 2)
         if len(self._prev_points) < Settings.MOTION_COMP_MIN_FEATURES // 2:
-            self._prev_points = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=Settings.MOTION_COMP_MAX_CORNERS,
-                qualityLevel=Settings.MOTION_COMP_QUALITY_LEVEL,
-                minDistance=Settings.MOTION_COMP_MIN_DISTANCE,
-            )
+            self._prev_points = self._detect_features(gray)
             if self._prev_points is None:
                 self._prev_points = None  # Açık atama, sonraki frame L210'da yakalar
 

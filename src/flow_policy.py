@@ -6,9 +6,9 @@ from enum import Enum
 
 class FrameLifecycleState(str, Enum):
     IDLE = "IDLE"
-    FETCHED = "FETCHED"
-    PROCESSED = "PROCESSED"
-    SUBMITTING = "SUBMITTING"
+    RECEIVED = "RECEIVED"
+    INFERRED = "INFERRED"
+    SENT = "SENT"
     ACKED = "ACKED"
     TERMINAL = "TERMINAL"
 

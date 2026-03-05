@@ -1,5 +1,13 @@
 # CHANGELOGS
 
+## 0.0.40 - 2026-03-05
+- **fix(payload)**: Şartnameye uygun sınıf-bazlı durum normalizasyonu eklendi (`Taşıt: landing=-1,motion=0/1`, `İnsan: landing=-1,motion=-1`, `UAP/UAİ: landing=0/1,motion=-1`).
+- **fix(detection)**: UAP/UAİ için `landing_status` güvenli biçimde `0/1` aralığına sabitlendi; eksik/değersiz durumlar `0` olarak ele alındı.
+- **fix(uap_uai)**: `UNKNOWN_OBJECTS_AS_OBSTACLES` aktif engel kontrolüne bağlandı ve opsiyonel CV doğrulamada UAP/UAİ için `-1` yerine `0` üretimi sağlandı.
+- **docs(readme)**: README şartname + mevcut implementasyonla hizalandı (karar mantığı, payload tip notu, dosya yapısı, test sayısı güncellendi).
+- **test(core)**: Şartname uyumu için yeni birim testleri eklendi; toplam test sayısı 90'a çıktı.
+- **release**: Bumped project version to `0.0.40`.
+
 ## 0.0.39 - 2026-03-05
 - **fix(localization)**: Rotasyon (pan/yaw) tespiti — kamera sağa/sola döndüğünde pozisyon güncellemesi bastırılıyor (VO_ROTATION_SUPPRESS_ENABLED, VO_ROTATION_DOT_THRESHOLD).
 - **fix(detection)**: UAP/UAİ için sınıfa özel confidence eşiği (CONFIDENCE_THRESHOLD_UAP_UAI=0.28); Taşıt/İnsan için global eşik (0.40) korunuyor.

@@ -751,18 +751,18 @@ def run_competition(log: Logger) -> None:
 
     valid_transitions = {
         FrameLifecycleState.IDLE: {
-            FrameLifecycleState.FETCHED,
+            FrameLifecycleState.RECEIVED,
             FrameLifecycleState.TERMINAL,
         },
-        FrameLifecycleState.FETCHED: {
-            FrameLifecycleState.PROCESSED,
+        FrameLifecycleState.RECEIVED: {
+            FrameLifecycleState.INFERRED,
             FrameLifecycleState.TERMINAL,
         },
-        FrameLifecycleState.PROCESSED: {
-            FrameLifecycleState.SUBMITTING,
+        FrameLifecycleState.INFERRED: {
+            FrameLifecycleState.SENT,
             FrameLifecycleState.TERMINAL,
         },
-        FrameLifecycleState.SUBMITTING: {
+        FrameLifecycleState.SENT: {
             FrameLifecycleState.ACKED,
             FrameLifecycleState.TERMINAL,
         },
@@ -796,6 +796,10 @@ def run_competition(log: Logger) -> None:
             f"event=frame_state_transition from={from_state.value} to={new_state.value} "
             f"frame_id={current_frame_id} reason_code={reason_code}"
         )
+
+    def _can_fetch_next_frame() -> bool:
+        """Single checkpoint: do not fetch a new frame until previous one is ACKed+reset."""
+        return frame_state == FrameLifecycleState.IDLE
 
     kpi_counters: Dict[str, Any] = {
         "send_ok": 0,
@@ -870,13 +874,13 @@ def run_competition(log: Logger) -> None:
 
                 # Bekleyen sonuç varsa önce gönder (fetch ile çakışmayı önle)
                 if pending_result is not None and submit_future is None:
-                    if frame_state == FrameLifecycleState.PROCESSED:
+                    if frame_state == FrameLifecycleState.INFERRED:
                         _transition_frame_state(
-                            FrameLifecycleState.SUBMITTING,
-                            reason_code="begin_submit",
+                            FrameLifecycleState.SENT,
+                            reason_code="result_send_started",
                             frame_id=pending_result.get("frame_id", "unknown"),
                         )
-                    elif frame_state != FrameLifecycleState.SUBMITTING:
+                    elif frame_state != FrameLifecycleState.SENT:
                         raise DataContractError(
                             f"Pending result exists but frame_state={frame_state.value}"
                         )
@@ -918,7 +922,7 @@ def run_competition(log: Logger) -> None:
                         log.error(
                             f"Unexpected action_result type: {type(action_result)}, skipping frame"
                         )
-                        if pending_result is None and frame_state == FrameLifecycleState.SUBMITTING:
+                        if pending_result is None and frame_state == FrameLifecycleState.SENT:
                             _transition_frame_state(
                                 FrameLifecycleState.ACKED,
                                 reason_code="unexpected_action_pending_cleared",
@@ -1018,7 +1022,7 @@ def run_competition(log: Logger) -> None:
                     continue
 
                 elif pending_result is None:
-                    if frame_state != FrameLifecycleState.IDLE:
+                    if not _can_fetch_next_frame():
                         raise DataContractError(
                             f"Fetch requested while frame_state={frame_state.value}"
                         )
@@ -1091,13 +1095,13 @@ def run_competition(log: Logger) -> None:
                         if pending_result is not None:
                             fetched_frame_id = str(pending_result.get("frame_id", "unknown"))
                             _transition_frame_state(
-                                FrameLifecycleState.FETCHED,
-                                reason_code="frame_metadata_fetched",
+                                FrameLifecycleState.RECEIVED,
+                                reason_code="frame_received",
                                 frame_id=fetched_frame_id,
                             )
                             _transition_frame_state(
-                                FrameLifecycleState.PROCESSED,
-                                reason_code="frame_processed",
+                                FrameLifecycleState.INFERRED,
+                                reason_code="frame_inferred",
                                 frame_id=fetched_frame_id,
                             )
                     else:

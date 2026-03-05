@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import Settings
+from src.class_contract import CompetitionClassContract
 from src.competition_contract import DataContractError
 
 
 # ─── CompetitionPayloadSchema ─────────────────────────────────────────────────
 class CompetitionPayloadSchema:
     CANONICAL_MOTION_FIELD = "motion_status"
-    LEGACY_MOTION_FIELD = "movement_status"
 
     @classmethod
     def self_check(cls) -> None:
@@ -30,12 +30,6 @@ class CompetitionPayloadSchema:
         if cls.CANONICAL_MOTION_FIELD in obj:
             raw = obj.get(cls.CANONICAL_MOTION_FIELD, "-1")
             return cls._normalize_motion(raw), False
-        if cls.LEGACY_MOTION_FIELD in obj:
-            raw = obj.get(cls.LEGACY_MOTION_FIELD, "-1")
-            return cls._normalize_motion(raw), True
-        if Settings.MOTION_FIELD_NAME in obj:
-            raw = obj.get(Settings.MOTION_FIELD_NAME, "-1")
-            return cls._normalize_motion(raw), Settings.MOTION_FIELD_NAME != cls.CANONICAL_MOTION_FIELD
         return "-1", False
 
     @classmethod
@@ -45,12 +39,17 @@ class CompetitionPayloadSchema:
         frame_shape: Optional[tuple] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         class_id = str(obj.get("cls", ""))
-        if class_id not in {"0", "1", "2", "3"}:
+        if class_id not in set(CompetitionClassContract.valid_id_strings()):
             return None, False
-        landing = str(obj.get("landing_status", "-1"))
-        if landing not in {"-1", "0", "1"}:
-            landing = "-1"
-        motion, used_alias = cls.normalize_motion_value(obj)
+        if class_id in {"2", "3"} and "landing_status" not in obj:
+            return None, False
+        landing_raw = str(obj.get("landing_status", "-1"))
+        motion_raw, used_alias = cls.normalize_motion_value(obj)
+        landing, motion = cls._normalize_status_by_class(
+            class_id=class_id,
+            landing_raw=landing_raw,
+            motion_raw=motion_raw,
+        )
         x1 = cls._safe_float(obj.get("top_left_x", 0))
         y1 = cls._safe_float(obj.get("top_left_y", 0))
         x2 = cls._safe_float(obj.get("bottom_right_x", 0))
@@ -73,8 +72,26 @@ class CompetitionPayloadSchema:
             "bottom_right_x": round(x2, 2),
             "bottom_right_y": round(y2, 2),
             "_confidence": cls._safe_float(obj.get("_confidence", obj.get("confidence", 0.0))),
+            "trace_id": str(obj.get("trace_id", "")).strip(),
         }
         return normalized, used_alias
+
+    @staticmethod
+    def _normalize_status_by_class(
+        class_id: str,
+        landing_raw: str,
+        motion_raw: str,
+    ) -> Tuple[str, str]:
+        if class_id == "0":
+            # Taşıt: landing=-1, motion=0/1
+            motion = motion_raw if motion_raw in {"0", "1"} else "0"
+            return "-1", motion
+        if class_id == "1":
+            # İnsan: landing=-1, motion=-1
+            return "-1", "-1"
+        # UAP/UAİ: landing=0/1, motion=-1
+        landing = landing_raw if landing_raw in {"0", "1"} else "0"
+        return landing, "-1"
 
     @staticmethod
     def _normalize_motion(value: Any) -> str:
@@ -182,7 +199,6 @@ class PayloadAdapter:
 
     _SUPPORTED = {"v1", "v1_legacy", "v2_int"}
     _CANONICAL_MOTION_FIELD = "motion_status"
-    _LEGACY_MOTION_FIELD = "movement_status"
 
     @classmethod
     def self_check(cls) -> None:
@@ -214,7 +230,7 @@ class PayloadAdapter:
                 version="v1_legacy",
                 cls_as_int=False,
                 status_type="string",
-                motion_field=cls._LEGACY_MOTION_FIELD,
+                motion_field=cls._CANONICAL_MOTION_FIELD,
             )
         return PayloadProfile(
             version="v2_int",
@@ -254,7 +270,7 @@ class PayloadAdapter:
         class_value = cls._safe_int(obj.get("cls", -1), default=-1)
         out_class: Any = class_value if profile.cls_as_int else str(class_value)
         landing = cls._cast_status(obj.get("landing_status", -1), profile.status_type)
-        motion_raw = obj.get(cls._CANONICAL_MOTION_FIELD, obj.get(cls._LEGACY_MOTION_FIELD, -1))
+        motion_raw = obj.get(cls._CANONICAL_MOTION_FIELD, -1)
         motion = cls._cast_status(motion_raw, profile.status_type)
         adapted: Dict[str, Any] = {
             "cls": out_class,

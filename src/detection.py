@@ -13,6 +13,7 @@ import torch
 from ultralytics import YOLO
 
 from config.settings import Settings
+from src.class_contract import CompetitionClassContract
 from src.utils import Logger
 
 
@@ -22,11 +23,14 @@ class ObjectDetector:
     def __init__(self) -> None:
         self.log = Logger("Detector")
         self._frame_count: int = 0
+        self._trace_seq: int = 0
         self._last_guardrail_stats: Dict[str, int] = {}
         self._temporal_filter: Optional[Any] = None
         self._use_half: bool = False
         self._class_map_mode: str = "unknown"
         self._model_class_map: Dict[int, int] = {}
+        self._uap_uai_model_class_ids: List[int] = []
+        self._uap_uai_absent_streak: int = 0
 
         if Settings.DEVICE == "cuda" and torch.cuda.is_available():
             self.device = "cuda"
@@ -87,6 +91,7 @@ class ObjectDetector:
                         source=dummy,
                         imgsz=Settings.INFERENCE_SIZE,
                         conf=Settings.CONFIDENCE_THRESHOLD,
+                        classes=None,
                         device=self.device,
                         verbose=False,
                         save=False,
@@ -105,33 +110,11 @@ class ObjectDetector:
     @staticmethod
     def _map_label_to_teknofest_id(label: str) -> int:
         normalized = ObjectDetector._normalize_label(label)
-        uap_aliases = {
-            "uap", "uap alan", "uap alani", "uap_alani", "ucan araba park",
-            "ucan araba park alani", "flying car park", "parking", "park",
-            "landing", "landing zone", "uap area", "flying_car_park", "2",
-        }
-        if normalized in uap_aliases:
-            return Settings.CLASS_UAP
-        uai_aliases = {
-            "uai", "uai alan", "uai alani", "ucan ambulans inis",
-            "ucan ambulans inis alani", "ambulance", "ambulance landing",
-            "ambulance landing zone", "uai area", "ucan ambulans", "3",
-        }
-        if normalized in uai_aliases:
-            return Settings.CLASS_UAI
-        if normalized in {
-            "insan", "human", "person", "pedestrian", "people", "man", "woman",
-        }:
-            return Settings.CLASS_INSAN
-        if normalized in {
-            "tasit", "vehicle", "car", "van", "truck", "bus", "train", "boat",
-            "bicycle", "motorcycle", "motor", "tricycle", "awning tricycle",
-        }:
-            return Settings.CLASS_TASIT
-        return -1
+        return CompetitionClassContract.resolve_alias(normalized)
 
     def _configure_class_mapping(self) -> None:
         """Model sınıf isimlerine göre COCO/VisDrone/resmi eşleme seçer."""
+        CompetitionClassContract.validate_settings_contract()
         custom_map = getattr(Settings, "CUSTOM_CLASS_MAP", None)
         if custom_map is not None and isinstance(custom_map, dict):
             self._class_map_mode = "custom"
@@ -148,6 +131,9 @@ class ObjectDetector:
                 items = [(i, str(v)) for i, v in enumerate(names_raw)]
 
             self.log.info(f"Model sınıfları (model.names): {dict(items) if items else 'boş'}")
+            names_for_validation = dict(items)
+            if names_for_validation:
+                CompetitionClassContract.validate_model_class_order(names_for_validation)
 
             name_based_map: Dict[int, int] = {}
             normalized_names: Dict[int, str] = {}
@@ -183,7 +169,6 @@ class ObjectDetector:
                 self._class_map_mode = "name_based"
                 self._model_class_map = name_based_map
 
-        teknofest_names = {0: "Taşıt", 1: "İnsan", 2: "UAP", 3: "UAİ"}
         log_items: List[Tuple[int, str]] = []
         for idx in sorted(self._model_class_map.keys()):
             label_str = ""
@@ -203,7 +188,7 @@ class ObjectDetector:
         )
         for idx, label in log_items:
             tf_id = self._model_class_map.get(idx, -1)
-            tf_name = teknofest_names.get(tf_id, "UNMAPPED")
+            tf_name = CompetitionClassContract.display_name(tf_id)
             marker = "✓" if tf_id != -1 else "✗"
             self.log.info(
                 f"  {marker} Model sınıf {idx}: '{label}' → TEKNOFEST {tf_id} ({tf_name})"
@@ -214,6 +199,17 @@ class ObjectDetector:
             self.log.warn("⚠ Model UAP (class 2) sınıfı İÇERMİYOR — UAP tespiti yapılamaz!")
         if not has_uai:
             self.log.warn("⚠ Model UAİ (class 3) sınıfı İÇERMİYOR — UAİ tespiti yapılamaz!")
+
+        self._uap_uai_model_class_ids = sorted(
+            model_cls
+            for model_cls, tf_cls in self._model_class_map.items()
+            if tf_cls in (Settings.CLASS_UAP, Settings.CLASS_UAI)
+        )
+        if self._uap_uai_model_class_ids:
+            self.log.info(
+                "UAP/UAİ focused-pass model class ids: "
+                f"{self._uap_uai_model_class_ids}"
+            )
 
     def _map_model_class_to_teknofest(self, model_cls_id: int) -> int:
         return self._model_class_map.get(model_cls_id, -1)
@@ -290,22 +286,42 @@ class ObjectDetector:
         try:
             inference_cfg = self._build_inference_config(runtime_profile)
             processed = self._preprocess(frame)
+            stage_trace: List[Dict[str, Any]] = []
             if inference_cfg["sahi_enabled"]:
                 raw_detections = self._sahi_detect(processed, inference_cfg=inference_cfg)
             else:
                 raw_detections = self._standard_inference(
                     processed, inference_cfg=inference_cfg
                 )
+            focused_dets = self._focused_uap_uai_inference(
+                processed, inference_cfg=inference_cfg
+            )
+            if focused_dets:
+                raw_detections.extend(focused_dets)
+            self._collect_stage_stats(stage_trace, "raw_model_output", raw_detections)
+            self._track_uap_uai_absence(raw_detections)
+
+            raw_detections = self._filter_by_confidence(raw_detections)
+            self._collect_stage_stats(stage_trace, "confidence_filter", raw_detections)
+
+            nms_mode = self._resolve_nms_mode()
+            if nms_mode == "agnostic":
+                self._log_nms_mode_comparison(raw_detections, inference_cfg)
             raw_detections = self._apply_runtime_nms(
                 raw_detections, inference_cfg=inference_cfg
             )
+            self._collect_stage_stats(stage_trace, f"nms_{nms_mode}", raw_detections)
+            raw_detections = self._suppress_landing_zone_class_conflicts(raw_detections)
+            self._collect_stage_stats(stage_trace, "uap_uai_conflict_suppress", raw_detections)
             raw_detections = self._post_filter(raw_detections, altitude=kwargs.get("altitude"))
+            self._collect_stage_stats(stage_trace, "min_size_post_filter", raw_detections)
             
             try:
                 from src.postprocess import apply_guardrails
                 raw_detections, self._last_guardrail_stats = apply_guardrails(raw_detections)
             except ImportError:
                 self._last_guardrail_stats = {}
+            self._collect_stage_stats(stage_trace, "guardrails", raw_detections)
 
             if getattr(Settings, "TEMPORAL_FILTER_ENABLED", True):
                 try:
@@ -315,6 +331,7 @@ class ObjectDetector:
                     raw_detections = self._temporal_filter.filter(raw_detections)
                 except ImportError:
                     pass
+            self._collect_stage_stats(stage_trace, "temporal_filter", raw_detections)
 
             frame_h, frame_w = frame.shape[:2]
             try:
@@ -324,6 +341,7 @@ class ObjectDetector:
                 )
             except ImportError:
                 final_detections = raw_detections
+            self._collect_stage_stats(stage_trace, "landing_status", final_detections)
 
             output: List[Dict] = []
             conf_tasit_insan = float(Settings.CONFIDENCE_THRESHOLD)
@@ -337,16 +355,30 @@ class ObjectDetector:
                 # Varsayılan -1; MovementEstimator.annotate() taşıtlar için sonra günceller
                 cls_id = det["cls_int"]
                 default_motion = "-1"
+                if cls_id in (Settings.CLASS_UAP, Settings.CLASS_UAI):
+                    landing_status = str(det.get("landing_status", "0"))
+                    if landing_status not in {"0", "1"}:
+                        landing_status = "0"
+                else:
+                    landing_status = "-1"
+                if cls_id in (Settings.CLASS_UAP, Settings.CLASS_UAI) and "landing_status" not in det:
+                    self.log.warn(
+                        "UAP/UAİ detection missing landing_status; defaulting to 0"
+                    )
                 output.append({
                     "cls": det["cls"],
-                    "landing_status": det["landing_status"],
+                    "landing_status": landing_status,
                     "motion_status": default_motion,
                     "top_left_x": det["top_left_x"],
                     "top_left_y": det["top_left_y"],
                     "bottom_right_x": det["bottom_right_x"],
                     "bottom_right_y": det["bottom_right_y"],
                     "confidence": det["confidence"],
+                    "trace_id": det.get("trace_id", ""),
                 })
+
+            self._collect_stage_stats(stage_trace, "final_json_candidates", output)
+            self._log_stage_trace(stage_trace)
 
             if Settings.DEBUG:
                 cls_counts = Counter(d["cls"] for d in output)
@@ -392,6 +424,7 @@ class ObjectDetector:
                 imgsz=int(inference_cfg["imgsz"]),
                 conf=float(inference_cfg["conf"]),
                 iou=float(inference_cfg["iou"]),
+                classes=None,
                 device=self.device,
                 verbose=False,
                 save=False,
@@ -401,6 +434,58 @@ class ObjectDetector:
                 augment=bool(inference_cfg["augment"]),
             )
         return self._parse_results(results)
+
+    def _focused_uap_uai_inference(
+        self,
+        frame: np.ndarray,
+        inference_cfg: Dict[str, Any],
+    ) -> List[Dict]:
+        if not bool(getattr(Settings, "UAP_UAI_FOCUSED_PASS_ENABLED", False)):
+            return []
+        if not self._uap_uai_model_class_ids:
+            return []
+
+        interval = max(1, int(getattr(Settings, "UAP_UAI_FOCUSED_PASS_INTERVAL", 2)))
+        if self._frame_count % interval != 0:
+            return []
+
+        focus_conf = float(
+            getattr(
+                Settings,
+                "UAP_UAI_FOCUSED_PASS_CONF",
+                getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", Settings.CONFIDENCE_THRESHOLD),
+            )
+        )
+        focus_conf = max(0.001, min(1.0, focus_conf))
+        focus_imgsz = max(
+            256,
+            int(getattr(Settings, "UAP_UAI_FOCUSED_PASS_IMG_SIZE", inference_cfg["imgsz"])),
+        )
+
+        with torch.no_grad():
+            results = self.model.predict(
+                source=frame,
+                imgsz=focus_imgsz,
+                conf=focus_conf,
+                iou=float(inference_cfg["iou"]),
+                device=self.device,
+                verbose=False,
+                save=False,
+                half=self._use_half,
+                classes=list(self._uap_uai_model_class_ids),
+                agnostic_nms=False,
+                max_det=int(inference_cfg["max_det"]),
+                augment=False,
+            )
+        focused = self._parse_results(results)
+        if bool(getattr(Settings, "DEBUG", False)) and focused:
+            cls_counts = Counter(str(d.get("cls", "")) for d in focused)
+            self.log.debug(
+                "FocusedPass(UAP/UAİ) "
+                f"total={len(focused)} uap={cls_counts.get('2', 0)} "
+                f"uai={cls_counts.get('3', 0)} conf={focus_conf:.2f} imgsz={focus_imgsz}"
+            )
+        return focused
 
     def _sahi_detect(
         self,
@@ -444,6 +529,7 @@ class ObjectDetector:
                         imgsz=slice_size,
                         conf=float(inference_cfg["conf"]),
                         iou=float(inference_cfg["iou"]),
+                        classes=None,
                         device=self.device,
                         verbose=False,
                         save=False,
@@ -486,8 +572,10 @@ class ObjectDetector:
                 tf_id = self._map_model_class_to_teknofest(model_cls_id)
 
                 detections.append({
+                    "trace_id": self._next_trace_id(),
                     "cls_int": tf_id,
                     "cls": str(tf_id),
+                    "class_label": CompetitionClassContract.display_name(tf_id),
                     "source_cls_id": model_cls_id,
                     "confidence": int(conf * 10000) / 10000,
                     "top_left_x": round(x1, 2),
@@ -497,6 +585,103 @@ class ObjectDetector:
                     "bbox": (x1, y1, x2, y2),
                 })
         return detections
+
+    def _next_trace_id(self) -> str:
+        self._trace_seq += 1
+        return f"f{self._frame_count:06d}-d{self._trace_seq:08d}"
+
+    @staticmethod
+    def _filter_by_confidence(detections: List[Dict]) -> List[Dict]:
+        conf_global = float(Settings.CONFIDENCE_THRESHOLD)
+        conf_uap_uai = getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", None)
+        if conf_uap_uai is None:
+            conf_uap_uai = conf_global
+        conf_uap_uai = float(conf_uap_uai)
+
+        filtered: List[Dict] = []
+        for det in detections:
+            cls_int = int(det.get("cls_int", -1))
+            conf = float(det.get("confidence", 0.0))
+            threshold = conf_uap_uai if cls_int in (Settings.CLASS_UAP, Settings.CLASS_UAI) else conf_global
+            if conf >= threshold:
+                filtered.append(det)
+        return filtered
+
+    def _track_uap_uai_absence(self, detections: List[Dict]) -> None:
+        has_uap_uai = any(
+            int(det.get("cls_int", -1)) in (Settings.CLASS_UAP, Settings.CLASS_UAI)
+            for det in detections
+        )
+        if has_uap_uai:
+            self._uap_uai_absent_streak = 0
+            return
+
+        self._uap_uai_absent_streak += 1
+        if self._uap_uai_absent_streak in (120, 360):
+            self.log.warn(
+                "Ham model çıktısında uzun süredir UAP/UAİ yok "
+                f"(streak={self._uap_uai_absent_streak}). "
+                "Veri sekansında UAP/UAİ bulunmuyor olabilir veya model eşiği yüksek kalıyor olabilir."
+            )
+
+    def _collect_stage_stats(
+        self,
+        stage_trace: List[Dict[str, Any]],
+        stage: str,
+        detections: List[Dict],
+    ) -> None:
+        counts = Counter(str(det.get("cls", "")) for det in detections)
+        stage_trace.append(
+            {
+                "stage": stage,
+                "total": len(detections),
+                "uap": int(counts.get("2", 0)),
+                "uai": int(counts.get("3", 0)),
+            }
+        )
+
+    def _log_stage_trace(self, stage_trace: List[Dict[str, Any]]) -> None:
+        if not bool(getattr(Settings, "DEBUG", False)) or not stage_trace:
+            return
+        frame_token = f"f{self._frame_count:06d}"
+        parts: List[str] = []
+        previous = None
+        for row in stage_trace:
+            if previous is None:
+                delta_total = 0
+                delta_uap = 0
+                delta_uai = 0
+            else:
+                delta_total = previous["total"] - row["total"]
+                delta_uap = previous["uap"] - row["uap"]
+                delta_uai = previous["uai"] - row["uai"]
+            parts.append(
+                f"{row['stage']} total={row['total']} (drop={delta_total}), "
+                f"uap={row['uap']} (drop={delta_uap}), uai={row['uai']} (drop={delta_uai})"
+            )
+            previous = row
+        self.log.debug(f"PipelineTrace[{frame_token}] " + " | ".join(parts))
+
+    def _log_nms_mode_comparison(
+        self,
+        detections: List[Dict],
+        inference_cfg: Dict[str, Any],
+    ) -> None:
+        if not bool(getattr(Settings, "DEBUG", False)):
+            return
+        class_aware = self._merge_detections_nms(detections)
+        agnostic = self._merge_detections_nms_agnostic(
+            detections,
+            iou_threshold=float(inference_cfg["merge_iou"]),
+        )
+        aware_ids = {d.get("trace_id") for d in class_aware}
+        agnostic_ids = {d.get("trace_id") for d in agnostic}
+        cross_class_drop = len(aware_ids - agnostic_ids)
+        self.log.debug(
+            "NMSCompare mode=agnostic "
+            f"class_aware={len(class_aware)} agnostic={len(agnostic)} "
+            f"cross_class_drop={cross_class_drop}"
+        )
 
     def _apply_runtime_nms(
         self,
@@ -768,6 +953,77 @@ class ObjectDetector:
         area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
         union = max(area_a + area_b - inter_area, 1e-6)
         return inter_area / union
+
+    def _suppress_landing_zone_class_conflicts(
+        self,
+        detections: List[Dict],
+    ) -> List[Dict]:
+        if not detections:
+            return []
+
+        threshold = float(
+            getattr(Settings, "UAP_UAI_CONFLICT_IOU_THRESHOLD", 0.55)
+        )
+        if threshold <= 0.0:
+            return detections
+
+        landing_zone_ids = {Settings.CLASS_UAP, Settings.CLASS_UAI}
+        candidate_indices = [
+            idx
+            for idx, det in enumerate(detections)
+            if int(det.get("cls_int", -1)) in landing_zone_ids
+        ]
+        if len(candidate_indices) < 2:
+            return detections
+
+        def _bbox(det: Dict) -> Tuple[float, float, float, float]:
+            if "bbox" in det and len(det["bbox"]) == 4:
+                x1, y1, x2, y2 = det["bbox"]
+            else:
+                x1 = float(det.get("top_left_x", 0.0))
+                y1 = float(det.get("top_left_y", 0.0))
+                x2 = float(det.get("bottom_right_x", x1 + 1.0))
+                y2 = float(det.get("bottom_right_y", y1 + 1.0))
+            return (float(x1), float(y1), float(x2), float(y2))
+
+        def _area(box: Tuple[float, float, float, float]) -> float:
+            return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+        keep_mask = np.ones(len(detections), dtype=bool)
+        ranked_indices = sorted(
+            candidate_indices,
+            key=lambda idx: (
+                float(detections[idx].get("confidence", 0.0)),
+                _area(_bbox(detections[idx])),
+            ),
+            reverse=True,
+        )
+
+        suppressed = 0
+        for rank_pos, idx in enumerate(ranked_indices):
+            if not keep_mask[idx]:
+                continue
+            det_i = detections[idx]
+            cls_i = int(det_i.get("cls_int", -1))
+            box_i = _bbox(det_i)
+            for jdx in ranked_indices[rank_pos + 1 :]:
+                if not keep_mask[jdx]:
+                    continue
+                det_j = detections[jdx]
+                cls_j = int(det_j.get("cls_int", -1))
+                if cls_i == cls_j:
+                    continue
+                if self._bbox_iou(box_i, _bbox(det_j)) >= threshold:
+                    keep_mask[jdx] = False
+                    suppressed += 1
+
+        if suppressed > 0 and bool(getattr(Settings, "DEBUG", False)):
+            self.log.debug(
+                "LandingZoneConflictSuppress "
+                f"removed={suppressed} iou_threshold={threshold:.2f}"
+            )
+
+        return [det for idx, det in enumerate(detections) if bool(keep_mask[idx])]
 
     # =========================================================================
 

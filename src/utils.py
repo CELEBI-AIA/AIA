@@ -19,6 +19,7 @@ except ImportError:
     _HAS_COLORAMA = False
 
 from config.settings import Settings
+from src.class_contract import CompetitionClassContract
 
 
 # ─── GPS Health (gps_health.py birleşik) ────────────────────────────────────
@@ -153,10 +154,8 @@ class Visualizer:
     }
 
     CLASS_NAMES: Dict[int, str] = {
-        0: "Tasit",
-        1: "Insan",
-        2: "UAP",
-        3: "UAI",
+        cid: CompetitionClassContract.display_name(cid)
+        for cid in CompetitionClassContract.ORDERED_IDS
     }
 
     LANDING_LABELS: Dict[str, str] = {

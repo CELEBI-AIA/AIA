@@ -16,6 +16,8 @@ import requests
 from config.settings import Settings
 from src.utils import normalize_gps_health
 from src.payload import PayloadAdapter, CompetitionPayloadSchema
+from src.class_contract import CompetitionClassContract
+from src.net.client import SubmitAttemptGuard, build_idempotency_key
 from src.utils import Logger, log_json_to_disk
 
 
@@ -62,6 +64,9 @@ class NetworkManager:
         self._sim_image_cache: Optional[np.ndarray] = None
         self._seen_frames_lru: "OrderedDict[str, None]" = OrderedDict()
         self._submitted_frames_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._submit_guard = SubmitAttemptGuard(
+            max_size=max(1, int(getattr(Settings, "SEEN_FRAME_LRU_SIZE", 512)))
+        )
         self._force_fallback_frames_lru: "OrderedDict[str, None]" = OrderedDict()
         self._timeout_counters: Dict[str, int] = {
             "fetch": 0,
@@ -82,6 +87,7 @@ class NetworkManager:
         return list(self._task3_references)
 
     def assert_contract_ready(self) -> None:
+        CompetitionClassContract.validate_settings_contract()
         CompetitionPayloadSchema.self_check()
         PayloadAdapter.self_check()
 
@@ -278,11 +284,25 @@ class NetworkManager:
         detected_undefined_objects: Optional[List[Dict]] = None,
     ) -> SendResultStatus:
         frame_key = self._build_frame_key(frame_id, frame_data)
-        if self._was_already_submitted(frame_key):
+        if self._submit_guard.is_already_acked(frame_key):
             self.log.warn(
-                f"Frame {frame_key}: duplicate submit prevented by idempotent client guard."
+                f"Frame {frame_key}: duplicate submit prevented by idempotent ACK cache."
             )
             return SendResultStatus.ACKED
+        if self._submit_guard.should_block_new_send(frame_key):
+            self.log.warn(
+                f"Frame {frame_key}: duplicate in-flight submit blocked before ACK."
+            )
+            return SendResultStatus.RETRYABLE_FAILURE
+
+        has_missing_landing_status = self._has_missing_landing_status_in_raw_objects(
+            detected_objects
+        )
+        if has_missing_landing_status:
+            self.log.error(
+                f"Frame {frame_id}: raw detected_objects contains UAP/UAİ without landing_status; forcing safe fallback"
+            )
+
         raw_payload = self.build_competition_payload(
             frame_id=frame_id,
             detected_objects=detected_objects,
@@ -291,7 +311,7 @@ class NetworkManager:
             frame_shape=frame_shape,
             detected_undefined_objects=detected_undefined_objects,
         )
-        force_fallback = self._should_force_fallback(frame_key)
+        force_fallback = self._should_force_fallback(frame_key) or has_missing_landing_status
         if force_fallback:
             payload = self._build_safe_fallback_payload(raw_payload)
             preflight_rejected = True
@@ -340,6 +360,8 @@ class NetworkManager:
         fallback_sent = preflight_rejected
         saw_4xx = False
 
+        self._submit_guard.mark_in_flight(frame_key)
+
         for attempt in range(1, Settings.MAX_RETRIES + 1):
             try:
                 response = self.session.post(
@@ -357,6 +379,7 @@ class NetworkManager:
                         f"(degrade={'ON' if degrade else 'OFF'})"
                     )
                     self._mark_submitted(frame_key)
+                    self._submit_guard.mark_acked(frame_key)
                     self._unmark_force_fallback(frame_key)
                     if preflight_rejected or fallback_sent:
                         return SendResultStatus.FALLBACK_ACKED
@@ -392,6 +415,7 @@ class NetworkManager:
                 self.log.error(
                     f"Frame {frame_id}: fallback payload also rejected (4xx), marking permanent reject"
                 )
+                self._submit_guard.clear_in_flight(frame_key)
                 return SendResultStatus.PERMANENT_REJECTED
 
             fallback_payload = self._build_safe_fallback_payload(raw_payload)
@@ -401,6 +425,7 @@ class NetworkManager:
                 self.log.error(
                     f"Frame {frame_id}: fallback payload adapter failed ({type(exc).__name__}): {exc}"
                 )
+                self._submit_guard.clear_in_flight(frame_key)
                 return SendResultStatus.PERMANENT_REJECTED
             try:
                 response = self.session.post(
@@ -417,29 +442,35 @@ class NetworkManager:
                         f"Frame {frame_id}: 4xx recovered with safe fallback payload"
                     )
                     self._mark_submitted(frame_key)
+                    self._submit_guard.mark_acked(frame_key)
                     self._unmark_force_fallback(frame_key)
                     return SendResultStatus.FALLBACK_ACKED
                 if 400 <= response.status_code < 500:
                     self.log.error(
                         f"Frame {frame_id}: fallback payload rejected with HTTP {response.status_code}"
                     )
+                    self._submit_guard.clear_in_flight(frame_key)
                     return SendResultStatus.PERMANENT_REJECTED
 
                 self.log.warn(
                     f"Frame {frame_id}: fallback payload non-ACK HTTP {response.status_code}, retryable"
                 )
+                self._submit_guard.clear_in_flight(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
             except requests.Timeout:
                 self._increment_timeout_counter("submit")
                 self.log.warn(f"Frame {frame_id}: fallback submit timeout, retryable")
+                self._submit_guard.clear_in_flight(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
             except Exception as exc:
                 self.log.warn(
                     f"Frame {frame_id}: fallback submit transient error ({type(exc).__name__}): {exc}"
                 )
+                self._submit_guard.clear_in_flight(frame_key)
                 return SendResultStatus.RETRYABLE_FAILURE
 
         self.log.error(f"Result submission failed after retries for frame {frame_id}")
+        self._submit_guard.clear_in_flight(frame_key)
         return SendResultStatus.RETRYABLE_FAILURE
 
     @staticmethod
@@ -457,7 +488,7 @@ class NetworkManager:
             frame_h = int(frame_shape[0])
             frame_w = int(frame_shape[1])
 
-        clean_objects, alias_count = CompetitionPayloadSchema.canonicalize_objects(
+        clean_objects, _ = CompetitionPayloadSchema.canonicalize_objects(
             detected_objects,
             frame_shape=(frame_h, frame_w) if frame_h is not None and frame_w is not None else None,
         )
@@ -487,11 +518,6 @@ class NetworkManager:
             ],
             "detected_undefined_objects": clean_undefined,
         }
-        if alias_count > 0:
-            Logger("Network").warn(
-                f"event=payload_alias_used alias_field={CompetitionPayloadSchema.LEGACY_MOTION_FIELD} "
-                f"count={alias_count}"
-            )
         return payload
 
     def _get_simulation_frame(self) -> Dict[str, Any]:
@@ -583,6 +609,26 @@ class NetworkManager:
 
         return True
 
+    @staticmethod
+    def _has_missing_landing_status_in_raw_objects(
+        detected_objects: Any,
+    ) -> bool:
+        if not isinstance(detected_objects, list):
+            return False
+        for obj in detected_objects:
+            if not isinstance(obj, dict):
+                continue
+            cls_raw = obj.get("cls")
+            cls_text = str(cls_raw).strip()
+            try:
+                cls_int = int(float(cls_raw))
+            except (TypeError, ValueError):
+                cls_int = None
+            is_landing_zone = cls_text in {"2", "3"} or cls_int in {2, 3}
+            if is_landing_zone and "landing_status" not in obj:
+                return True
+        return False
+
     def _preflight_validate_and_normalize_payload(
         self,
         payload: Dict[str, Any],
@@ -627,15 +673,19 @@ class NetworkManager:
             frame_h = self._safe_int(frame_shape[0])
             frame_w = self._safe_int(frame_shape[1])
 
-        normalized_objects, alias_count = CompetitionPayloadSchema.canonicalize_objects(
+        normalized_objects, _ = CompetitionPayloadSchema.canonicalize_objects(
             objects,
             frame_shape=(frame_h, frame_w) if frame_h is not None and frame_w is not None else None,
         )
-        if alias_count > 0:
-            self.log.warn(
-                f"event=payload_alias_used alias_field={CompetitionPayloadSchema.LEGACY_MOTION_FIELD} "
-                f"count={alias_count} frame_id={frame_id}"
-            )
+
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            if str(obj.get("cls")) in {"2", "3"} and "landing_status" not in obj:
+                self.log.error(
+                    f"Frame {frame_id}: preflight reject (UAP/UAİ detection missing landing_status), forcing safe fallback"
+                )
+                return self._build_safe_fallback_payload(payload), True, False
 
         capped_objects, clip_stats = self._apply_object_caps(
             normalized_objects=normalized_objects,
@@ -655,6 +705,7 @@ class NetworkManager:
                 "top_left_y": obj["top_left_y"],
                 "bottom_right_x": obj["bottom_right_x"],
                 "bottom_right_y": obj["bottom_right_y"],
+                "trace_id": obj.get("trace_id", ""),
             }
             for obj in capped_objects
         ]
@@ -774,10 +825,7 @@ class NetworkManager:
                     safe_obj["landing_status"] = CompetitionPayloadSchema.cast_status_value(
                         int(float(obj["landing_status"]))
                     )
-                motion_raw = obj.get(
-                    CompetitionPayloadSchema.CANONICAL_MOTION_FIELD,
-                    obj.get(CompetitionPayloadSchema.LEGACY_MOTION_FIELD),
-                )
+                motion_raw = obj.get(CompetitionPayloadSchema.CANONICAL_MOTION_FIELD)
                 if motion_raw is not None:
                     safe_obj[
                         CompetitionPayloadSchema.CANONICAL_MOTION_FIELD
@@ -960,7 +1008,7 @@ class NetworkManager:
         import uuid
         if not hasattr(self, "_run_uuid"):
             self._run_uuid = uuid.uuid4().hex[:8]
-        return f"{prefix}:{self._session_id}:{self._run_uuid}:{frame_key}"
+        return build_idempotency_key(prefix, self._session_id, self._run_uuid, frame_key)
 
     def _timeout_tuple(self, read_timeout: float) -> Tuple[float, float]:
         connect_timeout = self._connect_timeout()

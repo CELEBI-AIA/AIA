@@ -1,0 +1,27 @@
+version: 2025
+source: TEKNOFEST 2025 paylasilan intrinsics
+
+cameras:
+  thermal:
+    intrinsic_matrix:
+      - [731.7965, 0.0, 0.0]
+      - [0.0, 732.0172, 0.0]
+      - [319.2367, 251.2424, 1.0]
+    focal_length: [731.7965, 732.0172]
+    principal_point: [319.2367, 251.2424]
+    skew: 0.0
+    radial_distortion: [-0.3507, 0.1137]
+    tangential_distortion: [0.0, 0.0]
+    image_size_hw: [512, 640]
+
+  rgb:
+    intrinsic_matrix:
+      - [2792.2, 0.0, 0.0]
+      - [0.0, 2795.2, 0.0]
+      - [1988.0, 1562.2, 1.0]
+    focal_length: [2792.2, 2795.2]
+    principal_point: [1988.0, 1562.2]
+    skew: 0.0
+    radial_distortion: [0.0798, -0.1867]
+    tangential_distortion: [0.0, 0.0]
+    image_size_hw: [3000, 4000]

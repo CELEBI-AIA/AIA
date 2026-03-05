@@ -26,7 +26,7 @@
 - [Dosya Yapısı](#-dosya-yapısı)
 - [Audit & Sağlamlaştırma](#-audit--sağlamlaştırma)
 - [Yarışma Kuralları](#-yarışma-kuralları)
-- [Görev 1 Temporal Karar Mantığı](#-görev-1-temporal-karar-mantığı)
+- [Görev 1 Karar Mantığı](#-görev-1-karar-mantığı)
 - [Eğitim ve Test Veri Setleri](#-eğitim-ve-test-veri-setleri)
 
 ---
@@ -81,7 +81,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 | Özellik | Detay |
 |---------|-------|
 | **Model** | YOLOv8 (Ultralytics) — COCO/VisDrone → TEKNOFEST sınıf eşleştirmesi, custom eğitim destekli |
-| **Hız** | FP16 half-precision + model warmup → **~33 FPS** (RTX 3060) |
+| **Hız** | Donanıma bağlı performans; şartname minimumu olan **1 FPS** ve üzeri hedeflenir |
 | **İniş Tespiti** | Intersection-over-area + kenar temas kontrolü + perspektif marjı |
 | **Hareket Tespiti** | Temporal pencere tabanlı karar + kamera hareket kompanzasyonu |
 | **Lokalizasyon** | Hibrit GPS + Lucas-Kanade optik akış + `gps_health` tri-state + dinamik Z + yumuşak re-anchor |
@@ -90,7 +90,7 @@ Bu proje, **TEKNOFEST 2026 Havacılıkta Yapay Zeka Yarışması** kapsamında g
 | **Debug** | Renkli konsol çıktısı, tespit görselleştirme, periyodik kayıt |
 | **Güvenilirlik** | Global hata yakalama, SIGINT/SIGTERM handler, degrade mode, soft/hard abort politikası |
 | **Offline** | İnternet bağlantısı gerektirmez — yarışma kurallarına uygun (şartname 6.2) |
-| **Test** | 66 birim testi, pytest-timeout (10s), tek dosyada (`tests/test_all.py`) |
+| **Test** | 90 birim testi, pytest-timeout (10s), tek dosyada (`tests/test_all.py`) |
 
 ---
 
@@ -210,6 +210,8 @@ Desteklenen tutarlılık profilleri:
 }
 ```
 
+> Not: `cls`, `landing_status` ve `motion_status` alanlarının tipi profil ayarına göre `int|string` olabilir (`PAYLOAD_CLS_AS_INT`, `PAYLOAD_STATUS_TYPE_PROFILE`).
+
 ---
 
 > **Not:** `detected_objects` → Görev 1 sonuçları, `detected_translations` → Görev 2, `detected_undefined_objects` → Görev 3 referans obje tespitleri. Hareket alanı sunucuda `motion_status` adıyla iletilir.
@@ -235,6 +237,7 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | Parametre | Varsayılan | Açıklama |
 |-----------|-----------|----------|
 | `CONFIDENCE_THRESHOLD` | `0.40` | Minimum tespit güven eşiği |
+| `UAP_UAI_CONFLICT_IOU_THRESHOLD` | `0.55` | UAP/UAİ cross-class çakışma bastırma IoU eşiği (yüksek güvenli kutu korunur) |
 | `NMS_IOU_THRESHOLD` | `0.15` | NMS IoU eşiği (çift tespit bastırma) |
 | `INFERENCE_SIZE` | `1280` | Inference çözünürlüğü (piksel) |
 | `HALF_PRECISION` | `True` | FP16 hızlandırma (CUDA) |
@@ -307,7 +310,7 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 |-----------|-----------|----------|
 | `MOVEMENT_WINDOW_FRAMES` | `24` | Temporal pencere boyutu |
 | `MOVEMENT_MIN_HISTORY` | `6` | Karar için minimum geçmiş frame sayısı |
-| `MOVEMENT_THRESHOLD_PX` | `12.0` | Hareket eşiği (piksel) |
+| `MOVEMENT_THRESHOLD_PX` | `24.0` | Hareket eşiği (piksel) |
 | `MOVEMENT_MATCH_DISTANCE_PX` | `80.0` | Frame arası bbox eşleştirme mesafesi |
 | `MOVEMENT_MAX_MISSED_FRAMES` | `8` | Takip kaybı toleransı |
 
@@ -321,6 +324,9 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `MOTION_COMP_QUALITY_LEVEL` | `0.01` | Köşe kalite eşiği |
 | `MOTION_COMP_MIN_DISTANCE` | `20` | Köşeler arası minimum mesafe |
 | `MOTION_COMP_WIN_SIZE` | `21` | LK optik akış pencere boyutu |
+| `MOTION_COMP_DOWNSCALE` | `0.60` | LK hesaplamasını hızlandırmak için akış çözünürlük ölçeği |
+| `MOTION_COMP_FB_MAX_ERROR` | `1.50` | Forward-backward optik akış doğrulama hata eşiği |
+| `MOTION_COMP_MAX_SHIFT_PX` | `120.0` | Tek frame global kamera kayması üst sınırı (spike koruması) |
 
 ### Ağ / Resilience / Payload Guard
 
@@ -333,6 +339,10 @@ Tüm ayarlar [`config/settings.py`](config/settings.py) içinde merkezi olarak y
 | `RESULT_CLASS_QUOTA` | `{"0":40,"1":40,"2":10,"3":10}` | Sınıf bazlı payload kotası |
 | `PAYLOAD_STATUS_TYPE_PROFILE` | `"int"` | `landing_status`/`motion_status` tip profili (`int` veya `string`) |
 | `PAYLOAD_CLS_AS_INT` | `False` | `cls` alanını `int`/`string` gönderim profili |
+
+> Payload guard notu: Ham `detected_objects` içinde UAP/UAİ (`cls=2/3`) için `landing_status` eksikse payload güvenli fallback'e zorlanır.
+> Şartname uyumu: `landing_status`/`motion_status` değerleri sınıfa göre normalize edilir
+> (`Taşıt: landing=-1,motion=0/1`, `İnsan: landing=-1,motion=-1`, `UAP/UAİ: landing=0/1,motion=-1`).
 
 ### Tutarlılık ve Tekrarlanabilirlik (Best-Effort)
 
@@ -405,15 +415,16 @@ HavaciliktaYZ/
 ├── src/
 │   ├── __init__.py
 │   ├── detection.py        # Görev 1: YOLOv8 nesne tespiti + iniş durumu
-│   ├── frame_context.py    # Ortak gri dönüşüm (detection/movement/localization)
 │   ├── movement.py         # Görev 1: Temporal hareket kararı + kamera kompanzasyonu
 │   ├── localization.py     # Görev 2: GPS + optik akış + EMA pozisyon kestirimi
 │   ├── image_matcher.py    # Görev 3: ORB/SIFT referans obje eşleştirme
-│   ├── gps_health.py       # gps_health tri-state normalize yardımcıları
+│   ├── payload.py          # Payload şeması + adapter + class/status normalizasyonu
+│   ├── class_contract.py   # Sınıf ID sözleşmesi (0/1/2/3)
 │   ├── network.py          # Sunucu iletişimi + retry + idempotency + payload guard
 │   ├── resilience.py       # Circuit breaker + degrade mode kontrolü
 │   ├── data_loader.py      # Simülasyon veri yükleme (VID/DET)
 │   ├── runtime_profile.py  # Deterministik profil uygulaması
+│   ├── flow_policy.py      # Competition fetch/send akış kararları
 │   ├── send_state.py       # SendResultStatus enum tanımları
 │   └── utils.py            # Logger, Visualizer, yardımcı araçlar
 │
@@ -422,7 +433,7 @@ HavaciliktaYZ/
 │
 ├── tests/
 │   ├── conftest.py         # ML mock'ları + 10s global timeout
-│   └── test_all.py         # 66 konsolide birim testi
+│   └── test_all.py         # 90 konsolide birim testi
 │
 ├── model/
 │   └── best_*.pt           # Eğitilmiş YOLOv8 modeli (Git'e dahil değil)
@@ -457,10 +468,10 @@ Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirme
 | 9 | **Resilience soft/hard abort** | `resilience.py` | Soft/hard limit ayrımı + pending varken hard-abort erteleme |
 | 10 | **ACK güvenliği** | `main.py` | `pending_ttl` drop yolu kaldırıldı; ACK gelmeden frame kapanışı yok |
 | 11 | **Controlled permanent reject retry** | `main.py` | `permanent_rejected` sonrası kontrollü yeniden deneme |
-| 12 | **Payload type profile** | `payload_schema.py` | `landing_status`/`motion_status` için `int|string` profil desteği |
+| 12 | **Payload type profile** | `payload.py` | `landing_status`/`motion_status` için `int|string` profil desteği |
 | 13 | **Object cap hardening** | `network.py` | `RESULT_CLASS_QUOTA` + `RESULT_MAX_OBJECTS` gerçek limitleri |
 | 14 | **BASE_URL startup guard** | `network.py` | Allowlist dışı host ile competition başlangıcını engelleme |
-| 15 | **gps_health tri-state** | `gps_health.py`, `main.py`, `network.py` | `0/1/unknown` tek kaynak normalize semantiği |
+| 15 | **gps_health tri-state** | `utils.py`, `main.py`, `network.py` | `0/1/unknown` tek kaynak normalize semantiği |
 
 ### Testler
 
@@ -511,35 +522,25 @@ Gereksinimler: `pytest`, `pytest-timeout`, `PyYAML` (`requirements.txt` içinde)
 - Farklı kamera (termal, RGB), farklı açı/irtifa veya uydu görüntüsü olabilir
 - Referans obje her karede aranır ve bulunursa `detected_undefined_objects` ile raporlanır
 
-## ⏱️ Görev 1 Temporal Karar Mantığı
+## ⏱️ Görev 1 Karar Mantığı
 
-Görev 1 kararları tek frame üzerinden verilmez. Tüm hareket ve iniş uygunluk çıktıları pencere (window) tabanlı temporal birikim ile üretilir.
+### 1) Taşıt Hareket Durumu (`motion_status`)
 
-### 1) Window (Pencere) Yapısı
+- Taşıtlar takip penceresi (`MOVEMENT_WINDOW_FRAMES`) ile izlenir.
+- Karar, merkez yer değişimi + kamera hareket kompanzasyonu üzerinden üretilir.
+- Kamera hareketi, downscale + forward/backward doğrulamalı LK optik akış ve robust global kayma kompanzasyonu ile ayrıştırılır.
+- Şartname uyumu: Taşıt için `motion_status` yalnızca `0/1`; `landing_status=-1`.
 
-- Her hedef nesne/alan için son `W` frame tutulur (örnek: `W=24`).
-- `W` değeri sabit konfigürasyon parametresidir; çalışma sırasında dinamik değiştirilmez.
-- Karar, tek bir frame yerine pencere içindeki kanıtların birleşimi ile verilir.
+### 2) UAP/UAİ İniş Uygunluğu (`landing_status`)
 
-### 2) Decay (Ağırlıklandırma)
+- UAP/UAİ için iniş kararı frame-bazlı şartname kurallarıyla verilir.
+- Alanın tamamı kadraj içinde değilse veya alan üzerinde herhangi bir engel algılanırsa sonuç `0` olur.
+- Perspektif toleransı için iniş alanı kutusu marj ile genişletilir ve kesişim kontrolü yapılır.
+- Şartname uyumu: UAP/UAİ için `landing_status` yalnızca `0/1`; `motion_status=-1`.
 
-- Yakın frame'lere daha yüksek, eski frame'lere daha düşük ağırlık verilir.
-- Örnek ağırlık şeması: üstel veya doğrusal decay (`w_t`) ve normalize toplam.
-- Amaç kısa süreli gürültü/yanlış tespitten etkilenmeden stabil karar üretmektir.
+### 3) İnsan Sınıfı
 
-### 3) Threshold (Karar Eşiği)
-
-- Pencere boyunca biriken temporal skor `S` hesaplanır.
-- `S >= T_move` ise taşıt için `movement_status=1`, aksi halde `movement_status=0`.
-- Runtime çıktısında bu alan şartname uyumu için `motion_status` adıyla gönderilir.
-- Kamera hareketi, global median optical-flow kompanzasyonu ile ayrıştırılır.
-- UAP/UAİ için `S >= T_land` ise `landing_status=1`, aksi halde `landing_status=0`.
-- `T_move` ve `T_land` kalibrasyon testleri ile sabitlenir.
-
-### 4) Tek-Frame Karar Yasağı
-
-- Tek frame ile doğrudan `movement_status` veya `landing_status` kararı verilmez.
-- Anlık kararlar yalnızca geçici kanıt olarak temporal havuza yazılır; nihai karar pencere sonunda üretilir.
+- İnsan için `landing_status=-1`, `motion_status=-1` sabitlenir.
 
 ### Teknik Kısıtlamalar (Şartname 6.2 / 8.1)
 

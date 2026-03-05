@@ -31,7 +31,13 @@ class Settings:
         0.40  # 0.0-1.0, düşük = daha fazla tespit (noise riski)
     )
     # UAP/UAİ için düşük eşik — model bazen daha düşük conf ile tespit eder
-    CONFIDENCE_THRESHOLD_UAP_UAI: Optional[float] = 0.28  # None = global eşik kullan
+    CONFIDENCE_THRESHOLD_UAP_UAI: Optional[float] = 0.20  # None = global eşik kullan
+    # UAP/UAİ için ek odaklı inference (yalnızca bu sınıflar)
+    UAP_UAI_FOCUSED_PASS_ENABLED: bool = True
+    UAP_UAI_FOCUSED_PASS_INTERVAL: int = 2
+    UAP_UAI_FOCUSED_PASS_CONF: float = 0.12
+    UAP_UAI_FOCUSED_PASS_IMG_SIZE: int = 1280
+    UAP_UAI_CONFLICT_IOU_THRESHOLD: float = 0.55
     NMS_IOU_THRESHOLD: float = 0.15  # Çakışan kutuları bastırma eşiği
     NMS_MODE: str = "class_aware"  # class_aware|agnostic|hybrid
     HYBRID_NMS_IOU_THRESHOLD: float = 0.65
@@ -155,10 +161,18 @@ class Settings:
 
     # Kamera (kalibrasyon)
     FOCAL_LENGTH_PX: float = 800.0
+    CAMERA_FX_PX: float = 800.0
+    CAMERA_FY_PX: float = 800.0
 
     # Görüntü Merkez Noktası (piksel)
     CAMERA_CX: float = 960.0
     CAMERA_CY: float = 540.0
+    CAMERA_RADIAL_DISTORTION: tuple = (0.0, 0.0)
+    CAMERA_TANGENTIAL_DISTORTION: tuple = (0.0, 0.0)
+    CAMERA_IMAGE_SIZE_HW: tuple = (0, 0)
+    CAMERA_CALIBRATION_FILE: str = str(PROJECT_ROOT / "config" / "camera_calibration_2025.yaml")
+    CAMERA_PROFILE: str = os.getenv("AIA_CAMERA_PROFILE", "rgb").strip().lower()
+    CAMERA_CALIBRATION_AUTO_APPLY: bool = True
     DEFAULT_ALTITUDE: float = 50.0
     CAMERA_CALIBRATION_GUARD_ENABLED: bool = True
 
@@ -266,6 +280,9 @@ class Settings:
     MOTION_COMP_QUALITY_LEVEL: float = 0.01
     MOTION_COMP_MIN_DISTANCE: int = 20
     MOTION_COMP_WIN_SIZE: int = 21
+    MOTION_COMP_DOWNSCALE: float = 0.60
+    MOTION_COMP_FB_MAX_ERROR: float = 1.50
+    MOTION_COMP_MAX_SHIFT_PX: float = 120.0
 
     # Visual Odometry (GPS=0): piksel→metre işaret düzeltmesi (drift azaltma)
     # İleri gidince haritada geri görünüyorsa VO_SIGN_Y veya VO_SIGN_X'i 1 yapın
@@ -322,3 +339,82 @@ if _TASK3_YAML_PATH.is_file():
                 Settings.TASK3_GRID_STRIDE = int(_task3_override["grid_stride"])
     except (ImportError, OSError, ValueError, TypeError):
         pass
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_pair(values, default: tuple = (0.0, 0.0)) -> tuple:
+    if isinstance(values, (list, tuple)) and len(values) >= 2:
+        return (_safe_float(values[0], default[0]), _safe_float(values[1], default[1]))
+    return (float(default[0]), float(default[1]))
+
+
+def _safe_hw(values) -> tuple:
+    if isinstance(values, (list, tuple)) and len(values) >= 2:
+        h = int(max(0, _safe_float(values[0], 0.0)))
+        w = int(max(0, _safe_float(values[1], 0.0)))
+        return (h, w)
+    return (0, 0)
+
+
+def _apply_camera_calibration_from_yaml() -> None:
+    if not bool(getattr(Settings, "CAMERA_CALIBRATION_AUTO_APPLY", False)):
+        return
+
+    calib_path = Path(str(getattr(Settings, "CAMERA_CALIBRATION_FILE", "")))
+    if not calib_path.is_file():
+        return
+
+    try:
+        import yaml
+    except ImportError:
+        return
+
+    try:
+        with open(calib_path, encoding="utf-8") as f:
+            calib_data = yaml.safe_load(f) or {}
+    except (OSError, ValueError, TypeError):
+        return
+
+    if not isinstance(calib_data, dict):
+        return
+
+    cameras = calib_data.get("cameras")
+    if not isinstance(cameras, dict):
+        return
+
+    profile = str(getattr(Settings, "CAMERA_PROFILE", "rgb")).strip().lower()
+    profile_data = cameras.get(profile)
+    if not isinstance(profile_data, dict):
+        return
+
+    fx, fy = _safe_pair(profile_data.get("focal_length"), (Settings.CAMERA_FX_PX, Settings.CAMERA_FY_PX))
+    cx, cy = _safe_pair(profile_data.get("principal_point"), (Settings.CAMERA_CX, Settings.CAMERA_CY))
+    radial = _safe_pair(profile_data.get("radial_distortion"), Settings.CAMERA_RADIAL_DISTORTION)
+    tangential = _safe_pair(
+        profile_data.get("tangential_distortion"),
+        Settings.CAMERA_TANGENTIAL_DISTORTION,
+    )
+    image_size_hw = _safe_hw(profile_data.get("image_size_hw"))
+    if image_size_hw == (0, 0):
+        image_size_hw = _safe_hw(profile_data.get("image_size"))
+
+    if fx > 0.0 and fy > 0.0:
+        Settings.CAMERA_FX_PX = fx
+        Settings.CAMERA_FY_PX = fy
+        Settings.FOCAL_LENGTH_PX = (fx + fy) / 2.0
+    if cx >= 0.0 and cy >= 0.0:
+        Settings.CAMERA_CX = cx
+        Settings.CAMERA_CY = cy
+
+    Settings.CAMERA_RADIAL_DISTORTION = radial
+    Settings.CAMERA_TANGENTIAL_DISTORTION = tangential
+    Settings.CAMERA_IMAGE_SIZE_HW = image_size_hw
+
+
+_apply_camera_calibration_from_yaml()
