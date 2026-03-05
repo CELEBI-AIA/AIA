@@ -1230,6 +1230,46 @@ class TestCompetitionPayloadSchema(unittest.TestCase):
         finally:
             Settings.MOTION_FIELD_NAME = old
 
+    def test_status_fields_default_to_string_contract(self):
+        obj = {
+            "cls": "0",
+            "landing_status": "1",
+            "motion_status": "0",
+            "top_left_x": 1,
+            "top_left_y": 2,
+            "bottom_right_x": 20,
+            "bottom_right_y": 30,
+        }
+        out, alias_count = CompetitionPayloadSchema.canonicalize_objects(
+            [obj], frame_shape=(100, 100)
+        )
+        self.assertEqual(alias_count, 0)
+        self.assertEqual(out[0]["landing_status"], "-1")
+        self.assertEqual(out[0]["motion_status"], "0")
+
+    def test_status_fields_can_be_serialized_as_int_when_contract_requires(self):
+        old = Settings.PAYLOAD_STATUS_TYPE_PROFILE
+        obj = {
+            "cls": "2",
+            "landing_status": "1",
+            "motion_status": "0",
+            "top_left_x": 1,
+            "top_left_y": 2,
+            "bottom_right_x": 20,
+            "bottom_right_y": 30,
+        }
+        try:
+            Settings.PAYLOAD_STATUS_TYPE_PROFILE = "int"
+            out, alias_count = CompetitionPayloadSchema.canonicalize_objects(
+                [obj], frame_shape=(100, 100)
+            )
+        finally:
+            Settings.PAYLOAD_STATUS_TYPE_PROFILE = old
+
+        self.assertEqual(alias_count, 0)
+        self.assertEqual(out[0]["landing_status"], 1)
+        self.assertEqual(out[0]["motion_status"], -1)
+
 
 class TestClassContract(unittest.TestCase):
     def test_settings_contract_matches_expected_order(self):

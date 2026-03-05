@@ -298,3 +298,8 @@
 - Added critical duplicate-threshold controls in `config/settings.py` (`TASK3_DUPLICATE_DEGRADE_RATIO`, `TASK3_DUPLICATE_DEGRADE_MIN_COUNT`) and controlled Task3 passive mode when threshold is exceeded.
 - Hardened `src/image_matcher.py` with defensive duplicate/invalid ID filtering, canonical `object_id -> reference` contract, ID lifecycle tracking (`received/validated/loaded/matched`), and validated-only match output.
 - Added Task3 ID-integrity unit/integration coverage in `tests/test_all.py` for unique IDs, duplicate quarantine, invalid ID rejection, canonical matcher ingestion, and duplicate-free match outputs.
+
+## 0.0.37 - 2026-03-05
+- Closed OR-2 typed-status contract risk by switching the default outbound status profile to spec-aligned strings in `config/settings.py` and `src/payload.py`.
+- Kept the format versioned and reversible through `PAYLOAD_STATUS_TYPE_PROFILE`, so a final server schema can still be adopted centrally if it requires integers.
+- Added contract regression coverage in `tests/test_all.py` and `tests/test_e2e_smoke_contract.py` for both default string serialization and controlled integer override behavior.

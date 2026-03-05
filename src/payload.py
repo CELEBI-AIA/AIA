@@ -110,7 +110,7 @@ class CompetitionPayloadSchema:
     @staticmethod
     def _read_status_type_profile() -> str:
         profile_raw = str(
-            getattr(Settings, "PAYLOAD_STATUS_TYPE_PROFILE", "int")
+            getattr(Settings, "PAYLOAD_STATUS_TYPE_PROFILE", "string")
         ).strip().lower()
         if profile_raw in {"int", "integer"}:
             return "int"
@@ -221,7 +221,7 @@ class PayloadAdapter:
                 version="v1",
                 cls_as_int=bool(getattr(Settings, "PAYLOAD_CLS_AS_INT", False)),
                 status_type=str(
-                    getattr(Settings, "PAYLOAD_STATUS_TYPE_PROFILE", "int")
+                    getattr(Settings, "PAYLOAD_STATUS_TYPE_PROFILE", "string")
                 ).strip().lower(),
                 motion_field=cls._CANONICAL_MOTION_FIELD,
             )

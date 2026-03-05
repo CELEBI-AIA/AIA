@@ -263,7 +263,7 @@ class Settings:
     DETERMINISM_CPU_THREADS: int = 1
     MOTION_FIELD_NAME: str = "motion_status"
     PAYLOAD_CLS_AS_INT: bool = False
-    PAYLOAD_STATUS_TYPE_PROFILE: str = "int"  # int|string
+    PAYLOAD_STATUS_TYPE_PROFILE: str = "string"  # int|string
     PAYLOAD_ADAPTER_VERSION: str = "v1"  # v1|v1_legacy|v2_int
 
     # Hareket (movement_status)
