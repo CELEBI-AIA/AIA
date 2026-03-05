@@ -317,8 +317,12 @@ class TestEdgeMarginRatio(unittest.TestCase):
         from src.detection import ObjectDetector
 
         orig_iou = getattr(Settings, "UAP_UAI_CONFLICT_IOU_THRESHOLD", 0.55)
+        orig_gap = getattr(Settings, "UAP_UAI_CONFLICT_MIN_CONF_GAP", 0.12)
+        orig_ratio = getattr(Settings, "UAP_UAI_CONFLICT_MIN_AREA_RATIO", 1.30)
         orig_debug = Settings.DEBUG
         Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = 0.4
+        Settings.UAP_UAI_CONFLICT_MIN_CONF_GAP = 0.12
+        Settings.UAP_UAI_CONFLICT_MIN_AREA_RATIO = 1.30
         Settings.DEBUG = False
         try:
             detector = ObjectDetector.__new__(ObjectDetector)
@@ -363,7 +367,112 @@ class TestEdgeMarginRatio(unittest.TestCase):
             self.assertIn("0", classes)
         finally:
             Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = orig_iou
+            Settings.UAP_UAI_CONFLICT_MIN_CONF_GAP = orig_gap
+            Settings.UAP_UAI_CONFLICT_MIN_AREA_RATIO = orig_ratio
             Settings.DEBUG = orig_debug
+
+    def test_uap_uai_conflict_suppression_keeps_ambiguous_overlap(self):
+        from src.detection import ObjectDetector
+
+        orig_iou = getattr(Settings, "UAP_UAI_CONFLICT_IOU_THRESHOLD", 0.55)
+        orig_gap = getattr(Settings, "UAP_UAI_CONFLICT_MIN_CONF_GAP", 0.12)
+        orig_ratio = getattr(Settings, "UAP_UAI_CONFLICT_MIN_AREA_RATIO", 1.30)
+        orig_debug = Settings.DEBUG
+        Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = 0.4
+        Settings.UAP_UAI_CONFLICT_MIN_CONF_GAP = 0.12
+        Settings.UAP_UAI_CONFLICT_MIN_AREA_RATIO = 1.30
+        Settings.DEBUG = False
+        try:
+            detector = ObjectDetector.__new__(ObjectDetector)
+            detector.log = Logger("DetectorTest")
+            detections = [
+                {
+                    "cls_int": 2,
+                    "cls": "2",
+                    "confidence": 0.72,
+                    "bbox": (100.0, 100.0, 200.0, 200.0),
+                    "top_left_x": 100.0,
+                    "top_left_y": 100.0,
+                    "bottom_right_x": 200.0,
+                    "bottom_right_y": 200.0,
+                },
+                {
+                    "cls_int": 3,
+                    "cls": "3",
+                    "confidence": 0.67,
+                    "bbox": (102.0, 102.0, 198.0, 198.0),
+                    "top_left_x": 102.0,
+                    "top_left_y": 102.0,
+                    "bottom_right_x": 198.0,
+                    "bottom_right_y": 198.0,
+                },
+            ]
+
+            out = detector._suppress_landing_zone_class_conflicts(detections)
+            self.assertEqual(len(out), 2)
+            classes = {str(row["cls"]) for row in out}
+            self.assertEqual(classes, {"2", "3"})
+        finally:
+            Settings.UAP_UAI_CONFLICT_IOU_THRESHOLD = orig_iou
+            Settings.UAP_UAI_CONFLICT_MIN_CONF_GAP = orig_gap
+            Settings.UAP_UAI_CONFLICT_MIN_AREA_RATIO = orig_ratio
+            Settings.DEBUG = orig_debug
+
+    def test_should_run_uap_uai_focused_pass_rescue_absent_streak(self):
+        from src.detection import ObjectDetector
+
+        orig_interval = getattr(Settings, "UAP_UAI_FOCUSED_PASS_INTERVAL", 2)
+        orig_rescue_enabled = getattr(Settings, "UAP_UAI_RESCUE_ENABLED", True)
+        orig_rescue_streak = getattr(Settings, "UAP_UAI_RESCUE_ABSENT_STREAK", 2)
+        try:
+            Settings.UAP_UAI_FOCUSED_PASS_INTERVAL = 10
+            Settings.UAP_UAI_RESCUE_ENABLED = True
+            Settings.UAP_UAI_RESCUE_ABSENT_STREAK = 2
+
+            detector = ObjectDetector.__new__(ObjectDetector)
+            detector._frame_count = 3
+            detector._uap_uai_absent_streak = 2
+            detector._prev_raw_has_uap_uai = False
+
+            should_run, reason = detector._should_run_uap_uai_focused_pass([])
+            self.assertTrue(should_run)
+            self.assertEqual(reason, "absent_streak")
+        finally:
+            Settings.UAP_UAI_FOCUSED_PASS_INTERVAL = orig_interval
+            Settings.UAP_UAI_RESCUE_ENABLED = orig_rescue_enabled
+            Settings.UAP_UAI_RESCUE_ABSENT_STREAK = orig_rescue_streak
+
+    def test_build_pipeline_metrics_reports_uap_uai_drop(self):
+        from src.detection import ObjectDetector
+
+        detector = ObjectDetector.__new__(ObjectDetector)
+        detector._uap_uai_absent_streak = 1
+        detector._uap_uai_absent_streak_max = 4
+        detector._last_uap_uai_missing_landing_status_count = 0
+
+        stage_trace = [
+            {
+                "stage": "raw_model_output",
+                "total": 3,
+                "counts": {"0": 1, "1": 0, "2": 1, "3": 1, "unknown": 0},
+            },
+            {
+                "stage": "confidence_filter",
+                "total": 2,
+                "counts": {"0": 1, "1": 0, "2": 1, "3": 0, "unknown": 0},
+            },
+            {
+                "stage": "final_json_candidates",
+                "total": 2,
+                "counts": {"0": 1, "1": 0, "2": 1, "3": 0, "unknown": 0},
+            },
+        ]
+
+        metrics = detector._build_pipeline_metrics(stage_trace)
+        self.assertEqual(metrics["uap_uai_raw_seen"], 2)
+        self.assertEqual(metrics["uap_uai_final_seen"], 1)
+        self.assertEqual(metrics["uap_uai_drop_total"], 1)
+        self.assertEqual(metrics["uap_uai_drop_by_stage"]["confidence_filter"], 1)
 
 
 class TestMainAckStateMachine:
@@ -1863,6 +1972,7 @@ class TestPerformanceGuards(unittest.TestCase):
             "INFERENCE_SIZE": Settings.INFERENCE_SIZE,
             "MAX_DETECTIONS": Settings.MAX_DETECTIONS,
             "CONFIDENCE_THRESHOLD": Settings.CONFIDENCE_THRESHOLD,
+            "CONFIDENCE_THRESHOLD_UAP_UAI": Settings.CONFIDENCE_THRESHOLD_UAP_UAI,
             "AUGMENTED_INFERENCE": Settings.AUGMENTED_INFERENCE,
             "DEGRADE_SEND_INTERVAL_FRAMES": Settings.DEGRADE_SEND_INTERVAL_FRAMES,
         }
@@ -1921,6 +2031,28 @@ class TestPerformanceGuards(unittest.TestCase):
             )
         self.assertFalse(guard_state["active"])
         self.assertGreaterEqual(kpi.get("fps_guard_recoveries", 0), 1)
+
+    def test_detection_pipeline_metrics_accumulate(self):
+        class DummyDetector:
+            @staticmethod
+            def get_last_pipeline_metrics():
+                return {
+                    "uap_uai_raw_seen": 3,
+                    "uap_uai_final_seen": 2,
+                    "uap_uai_drop_total": 1,
+                    "uap_uai_drop_by_stage": {"confidence_filter": 1},
+                    "uap_uai_absent_streak_max": 5,
+                    "uap_uai_missing_landing_status_count": 2,
+                }
+
+        kpi = {}
+        main_module._accumulate_detection_pipeline_metrics(kpi, DummyDetector())
+        self.assertEqual(kpi["uap_uai_raw_seen"], 3)
+        self.assertEqual(kpi["uap_uai_final_seen"], 2)
+        self.assertEqual(kpi["uap_uai_drop_total"], 1)
+        self.assertEqual(kpi["uap_uai_drop_by_stage"]["confidence_filter"], 1)
+        self.assertEqual(kpi["uap_uai_absent_streak_max"], 5)
+        self.assertEqual(kpi["uap_uai_missing_landing_status_count"], 2)
 
 
 @unittest.skipUnless(main_module is not None, "main runtime missing")

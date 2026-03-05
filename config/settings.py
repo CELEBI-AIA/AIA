@@ -37,16 +37,22 @@ class Settings:
     UAP_UAI_FOCUSED_PASS_INTERVAL: int = 2
     UAP_UAI_FOCUSED_PASS_CONF: float = 0.12
     UAP_UAI_FOCUSED_PASS_IMG_SIZE: int = 1280
+    UAP_UAI_RESCUE_ENABLED: bool = True
+    UAP_UAI_RESCUE_ABSENT_STREAK: int = 2
+    UAP_UAI_RESCUE_MIN_CONF: float = 0.16
     UAP_UAI_CONFLICT_IOU_THRESHOLD: float = 0.55
+    UAP_UAI_CONFLICT_MIN_CONF_GAP: float = 0.12
+    UAP_UAI_CONFLICT_MIN_AREA_RATIO: float = 1.30
     NMS_IOU_THRESHOLD: float = 0.15  # Çakışan kutuları bastırma eşiği
     NMS_MODE: str = "class_aware"  # class_aware|agnostic|hybrid
     HYBRID_NMS_IOU_THRESHOLD: float = 0.65
     DEVICE: str = "cuda"
     HALF_PRECISION: bool = True
     INFERENCE_SIZE: int = 1280
-    AGNOSTIC_NMS: bool = True
+    AGNOSTIC_NMS: bool = True  # Legacy fallback; NMS_MODE ayarı varken yok sayılır
     MAX_DETECTIONS: int = 300
     AUGMENTED_INFERENCE: bool = False
+    PIPELINE_STAGE_METRICS_ENABLED: bool = True
 
     # Ön-işleme (CLAHE)
     CLAHE_ENABLED: bool = True

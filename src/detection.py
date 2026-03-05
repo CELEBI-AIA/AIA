@@ -25,12 +25,18 @@ class ObjectDetector:
         self._frame_count: int = 0
         self._trace_seq: int = 0
         self._last_guardrail_stats: Dict[str, int] = {}
+        self._last_pipeline_metrics: Dict[str, Any] = {}
         self._temporal_filter: Optional[Any] = None
         self._use_half: bool = False
         self._class_map_mode: str = "unknown"
         self._model_class_map: Dict[int, int] = {}
         self._uap_uai_model_class_ids: List[int] = []
         self._uap_uai_absent_streak: int = 0
+        self._uap_uai_absent_streak_max: int = 0
+        self._last_uap_uai_missing_landing_status_count: int = 0
+        self._prev_raw_has_uap_uai: bool = False
+        self._warned_nms_mode_invalid: bool = False
+        self._warned_nms_mode_legacy: bool = False
 
         if Settings.DEVICE == "cuda" and torch.cuda.is_available():
             self.device = "cuda"
@@ -214,12 +220,26 @@ class ObjectDetector:
     def _map_model_class_to_teknofest(self, model_cls_id: int) -> int:
         return self._model_class_map.get(model_cls_id, -1)
 
-    @staticmethod
-    def _resolve_nms_mode() -> str:
+    def _resolve_nms_mode(self) -> str:
         mode = str(getattr(Settings, "NMS_MODE", "")).strip().lower()
-        if mode in {"class_aware", "agnostic", "hybrid"}:
+        legacy_agnostic = bool(getattr(Settings, "AGNOSTIC_NMS", False))
+        valid_modes = {"class_aware", "agnostic", "hybrid"}
+
+        if mode in valid_modes:
+            if legacy_agnostic and mode != "agnostic" and not self._warned_nms_mode_legacy:
+                self.log.warn(
+                    "AGNOSTIC_NMS ayarı deprecated; NMS_MODE kullanılıyor, AGNOSTIC_NMS yok sayıldı."
+                )
+                self._warned_nms_mode_legacy = True
             return mode
-        return "agnostic" if bool(getattr(Settings, "AGNOSTIC_NMS", False)) else "class_aware"
+
+        fallback = "agnostic" if legacy_agnostic else "class_aware"
+        if not self._warned_nms_mode_invalid:
+            self.log.warn(
+                f"Geçersiz NMS_MODE='{mode or '<empty>'}', fallback={fallback} uygulanıyor."
+            )
+            self._warned_nms_mode_invalid = True
+        return fallback
 
     def _build_inference_config(self, runtime_profile: str) -> Dict[str, Any]:
         profile = str(runtime_profile or "default").strip().lower()
@@ -288,13 +308,18 @@ class ObjectDetector:
             processed = self._preprocess(frame)
             stage_trace: List[Dict[str, Any]] = []
             if inference_cfg["sahi_enabled"]:
-                raw_detections = self._sahi_detect(processed, inference_cfg=inference_cfg)
+                primary_detections = self._sahi_detect(processed, inference_cfg=inference_cfg)
             else:
-                raw_detections = self._standard_inference(
+                primary_detections = self._standard_inference(
                     processed, inference_cfg=inference_cfg
                 )
+            self._collect_stage_stats(stage_trace, "raw_model_primary", primary_detections)
+
+            raw_detections = list(primary_detections)
             focused_dets = self._focused_uap_uai_inference(
-                processed, inference_cfg=inference_cfg
+                processed,
+                inference_cfg=inference_cfg,
+                primary_detections=primary_detections,
             )
             if focused_dets:
                 raw_detections.extend(focused_dets)
@@ -345,6 +370,7 @@ class ObjectDetector:
 
             output: List[Dict] = []
             conf_tasit_insan = float(Settings.CONFIDENCE_THRESHOLD)
+            missing_landing_status_count = 0
             for det in final_detections:
                 if det["cls_int"] == -1:
                     continue
@@ -365,6 +391,7 @@ class ObjectDetector:
                     self.log.warn(
                         "UAP/UAİ detection missing landing_status; defaulting to 0"
                     )
+                    missing_landing_status_count += 1
                 output.append({
                     "cls": det["cls"],
                     "landing_status": landing_status,
@@ -378,6 +405,11 @@ class ObjectDetector:
                 })
 
             self._collect_stage_stats(stage_trace, "final_json_candidates", output)
+            self._last_uap_uai_missing_landing_status_count = int(missing_landing_status_count)
+            self._last_pipeline_metrics = self._build_pipeline_metrics(stage_trace)
+            self._last_pipeline_metrics["uap_uai_missing_landing_status_count"] = int(
+                missing_landing_status_count
+            )
             self._log_stage_trace(stage_trace)
 
             if Settings.DEBUG:
@@ -408,9 +440,31 @@ class ObjectDetector:
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+            self._last_pipeline_metrics = {
+                "stage_count": 0,
+                "stages": [],
+                "uap_uai_raw_seen": 0,
+                "uap_uai_final_seen": 0,
+                "uap_uai_drop_total": 0,
+                "uap_uai_drop_by_stage": {},
+                "uap_uai_absent_streak": int(self._uap_uai_absent_streak),
+                "uap_uai_absent_streak_max": int(self._uap_uai_absent_streak_max),
+                "uap_uai_missing_landing_status_count": 0,
+            }
             return []
         except Exception as e:
             self.log.error(f"Tespit hatası: {e}")
+            self._last_pipeline_metrics = {
+                "stage_count": 0,
+                "stages": [],
+                "uap_uai_raw_seen": 0,
+                "uap_uai_final_seen": 0,
+                "uap_uai_drop_total": 0,
+                "uap_uai_drop_by_stage": {},
+                "uap_uai_absent_streak": int(self._uap_uai_absent_streak),
+                "uap_uai_absent_streak_max": int(self._uap_uai_absent_streak_max),
+                "uap_uai_missing_landing_status_count": 0,
+            }
             return []
 
     def _standard_inference(
@@ -439,22 +493,33 @@ class ObjectDetector:
         self,
         frame: np.ndarray,
         inference_cfg: Dict[str, Any],
+        primary_detections: Optional[List[Dict]] = None,
     ) -> List[Dict]:
         if not bool(getattr(Settings, "UAP_UAI_FOCUSED_PASS_ENABLED", False)):
             return []
         if not self._uap_uai_model_class_ids:
             return []
 
-        interval = max(1, int(getattr(Settings, "UAP_UAI_FOCUSED_PASS_INTERVAL", 2)))
-        if self._frame_count % interval != 0:
+        should_run, trigger_reason = self._should_run_uap_uai_focused_pass(
+            primary_detections or []
+        )
+        if not should_run:
             return []
 
-        focus_conf = float(
+        base_focus_conf = float(
             getattr(
                 Settings,
                 "UAP_UAI_FOCUSED_PASS_CONF",
                 getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", Settings.CONFIDENCE_THRESHOLD),
             )
+        )
+        rescue_floor_conf = float(
+            getattr(Settings, "UAP_UAI_RESCUE_MIN_CONF", base_focus_conf)
+        )
+        focus_conf = (
+            min(base_focus_conf, rescue_floor_conf)
+            if trigger_reason != "interval"
+            else base_focus_conf
         )
         focus_conf = max(0.001, min(1.0, focus_conf))
         focus_imgsz = max(
@@ -483,7 +548,8 @@ class ObjectDetector:
             self.log.debug(
                 "FocusedPass(UAP/UAİ) "
                 f"total={len(focused)} uap={cls_counts.get('2', 0)} "
-                f"uai={cls_counts.get('3', 0)} conf={focus_conf:.2f} imgsz={focus_imgsz}"
+                f"uai={cls_counts.get('3', 0)} conf={focus_conf:.2f} "
+                f"imgsz={focus_imgsz} trigger={trigger_reason}"
             )
         return focused
 
@@ -612,11 +678,16 @@ class ObjectDetector:
             int(det.get("cls_int", -1)) in (Settings.CLASS_UAP, Settings.CLASS_UAI)
             for det in detections
         )
+        self._prev_raw_has_uap_uai = has_uap_uai
         if has_uap_uai:
             self._uap_uai_absent_streak = 0
             return
 
         self._uap_uai_absent_streak += 1
+        self._uap_uai_absent_streak_max = max(
+            int(self._uap_uai_absent_streak_max),
+            int(self._uap_uai_absent_streak),
+        )
         if self._uap_uai_absent_streak in (120, 360):
             self.log.warn(
                 "Ham model çıktısında uzun süredir UAP/UAİ yok "
@@ -624,21 +695,154 @@ class ObjectDetector:
                 "Veri sekansında UAP/UAİ bulunmuyor olabilir veya model eşiği yüksek kalıyor olabilir."
             )
 
+    @staticmethod
+    def _class_counts(detections: List[Dict]) -> Dict[str, int]:
+        canonical_ids = tuple(CompetitionClassContract.valid_id_strings())
+        counts: Counter = Counter()
+        for det in detections:
+            raw_cls = det.get("cls")
+            if raw_cls is None:
+                raw_cls = det.get("cls_int", -1)
+            counts[str(raw_cls)] += 1
+
+        class_counts: Dict[str, int] = {
+            cls_id: int(counts.get(cls_id, 0)) for cls_id in canonical_ids
+        }
+        class_counts["unknown"] = int(
+            sum(v for k, v in counts.items() if str(k) not in class_counts)
+        )
+        return class_counts
+
+    @staticmethod
+    def _uap_uai_count_and_max_conf(detections: List[Dict]) -> Tuple[int, float]:
+        count = 0
+        max_conf = 0.0
+        for det in detections:
+            cls_int = int(det.get("cls_int", -1))
+            if cls_int not in (Settings.CLASS_UAP, Settings.CLASS_UAI):
+                continue
+            count += 1
+            max_conf = max(max_conf, float(det.get("confidence", 0.0)))
+        return count, max_conf
+
+    def _should_run_uap_uai_focused_pass(
+        self, primary_detections: List[Dict]
+    ) -> Tuple[bool, str]:
+        interval = max(1, int(getattr(Settings, "UAP_UAI_FOCUSED_PASS_INTERVAL", 2)))
+        if self._frame_count % interval == 0:
+            return True, "interval"
+
+        if not bool(getattr(Settings, "UAP_UAI_RESCUE_ENABLED", True)):
+            return False, "rescue_disabled"
+
+        rescue_streak = max(
+            1, int(getattr(Settings, "UAP_UAI_RESCUE_ABSENT_STREAK", 2))
+        )
+        if int(self._uap_uai_absent_streak) >= rescue_streak:
+            return True, "absent_streak"
+
+        raw_count, raw_max_conf = self._uap_uai_count_and_max_conf(primary_detections)
+        rescue_min_conf = float(
+            getattr(
+                Settings,
+                "UAP_UAI_RESCUE_MIN_CONF",
+                getattr(
+                    Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", Settings.CONFIDENCE_THRESHOLD
+                ),
+            )
+        )
+        rescue_min_conf = max(0.001, min(1.0, rescue_min_conf))
+        if raw_count > 0 and raw_max_conf < rescue_min_conf:
+            return True, "low_conf"
+
+        if bool(self._prev_raw_has_uap_uai) and raw_count == 0:
+            return True, "continuity"
+
+        return False, "interval_skip"
+
     def _collect_stage_stats(
         self,
         stage_trace: List[Dict[str, Any]],
         stage: str,
         detections: List[Dict],
     ) -> None:
-        counts = Counter(str(det.get("cls", "")) for det in detections)
+        if not bool(getattr(Settings, "PIPELINE_STAGE_METRICS_ENABLED", True)):
+            return
+        counts = self._class_counts(detections)
         stage_trace.append(
             {
                 "stage": stage,
                 "total": len(detections),
-                "uap": int(counts.get("2", 0)),
-                "uai": int(counts.get("3", 0)),
+                "counts": counts,
             }
         )
+
+    def _build_pipeline_metrics(self, stage_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "stage_count": 0,
+            "stages": [],
+            "uap_uai_raw_seen": 0,
+            "uap_uai_final_seen": 0,
+            "uap_uai_drop_total": 0,
+            "uap_uai_drop_by_stage": {},
+            "uap_uai_absent_streak": int(self._uap_uai_absent_streak),
+            "uap_uai_absent_streak_max": int(self._uap_uai_absent_streak_max),
+            "uap_uai_missing_landing_status_count": int(
+                self._last_uap_uai_missing_landing_status_count
+            ),
+        }
+        if not stage_trace:
+            return metrics
+
+        previous = None
+        stages_out: List[Dict[str, Any]] = []
+        drop_by_stage: Dict[str, int] = {}
+        for row in stage_trace:
+            counts = dict(row.get("counts", {}))
+            if previous is None:
+                drop_total = 0
+                drop_counts = {k: 0 for k in counts.keys()}
+            else:
+                prev_counts = dict(previous.get("counts", {}))
+                drop_total = max(0, int(previous["total"]) - int(row["total"]))
+                drop_counts = {
+                    k: max(0, int(prev_counts.get(k, 0)) - int(counts.get(k, 0)))
+                    for k in counts.keys()
+                }
+
+            drop_by_stage[str(row["stage"])] = int(drop_counts.get("2", 0)) + int(
+                drop_counts.get("3", 0)
+            )
+            stages_out.append(
+                {
+                    "stage": str(row["stage"]),
+                    "total": int(row["total"]),
+                    "counts": counts,
+                    "drop_total": int(drop_total),
+                    "drop_counts": drop_counts,
+                }
+            )
+            previous = row
+
+        raw_counts = stages_out[0].get("counts", {})
+        final_counts = stages_out[-1].get("counts", {})
+        raw_uap_uai = int(raw_counts.get("2", 0)) + int(raw_counts.get("3", 0))
+        final_uap_uai = int(final_counts.get("2", 0)) + int(final_counts.get("3", 0))
+
+        metrics.update(
+            {
+                "stage_count": len(stages_out),
+                "stages": stages_out,
+                "uap_uai_raw_seen": raw_uap_uai,
+                "uap_uai_final_seen": final_uap_uai,
+                "uap_uai_drop_total": max(0, raw_uap_uai - final_uap_uai),
+                "uap_uai_drop_by_stage": drop_by_stage,
+            }
+        )
+        return metrics
+
+    def get_last_pipeline_metrics(self) -> Dict[str, Any]:
+        return dict(self._last_pipeline_metrics)
 
     def _log_stage_trace(self, stage_trace: List[Dict[str, Any]]) -> None:
         if not bool(getattr(Settings, "DEBUG", False)) or not stage_trace:
@@ -653,11 +857,16 @@ class ObjectDetector:
                 delta_uai = 0
             else:
                 delta_total = previous["total"] - row["total"]
-                delta_uap = previous["uap"] - row["uap"]
-                delta_uai = previous["uai"] - row["uai"]
+                delta_uap = int(previous["counts"].get("2", 0)) - int(
+                    row["counts"].get("2", 0)
+                )
+                delta_uai = int(previous["counts"].get("3", 0)) - int(
+                    row["counts"].get("3", 0)
+                )
             parts.append(
                 f"{row['stage']} total={row['total']} (drop={delta_total}), "
-                f"uap={row['uap']} (drop={delta_uap}), uai={row['uai']} (drop={delta_uai})"
+                f"uap={int(row['counts'].get('2', 0))} (drop={delta_uap}), "
+                f"uai={int(row['counts'].get('3', 0))} (drop={delta_uai})"
             )
             previous = row
         self.log.debug(f"PipelineTrace[{frame_token}] " + " | ".join(parts))
@@ -966,6 +1175,12 @@ class ObjectDetector:
         )
         if threshold <= 0.0:
             return detections
+        min_conf_gap = max(
+            0.0, float(getattr(Settings, "UAP_UAI_CONFLICT_MIN_CONF_GAP", 0.12))
+        )
+        min_area_ratio = max(
+            1.0, float(getattr(Settings, "UAP_UAI_CONFLICT_MIN_AREA_RATIO", 1.30))
+        )
 
         landing_zone_ids = {Settings.CLASS_UAP, Settings.CLASS_UAI}
         candidate_indices = [
@@ -1006,6 +1221,8 @@ class ObjectDetector:
             det_i = detections[idx]
             cls_i = int(det_i.get("cls_int", -1))
             box_i = _bbox(det_i)
+            area_i = _area(box_i)
+            conf_i = float(det_i.get("confidence", 0.0))
             for jdx in ranked_indices[rank_pos + 1 :]:
                 if not keep_mask[jdx]:
                     continue
@@ -1013,14 +1230,36 @@ class ObjectDetector:
                 cls_j = int(det_j.get("cls_int", -1))
                 if cls_i == cls_j:
                     continue
-                if self._bbox_iou(box_i, _bbox(det_j)) >= threshold:
-                    keep_mask[jdx] = False
+                box_j = _bbox(det_j)
+                if self._bbox_iou(box_i, box_j) < threshold:
+                    continue
+
+                area_j = _area(box_j)
+                conf_j = float(det_j.get("confidence", 0.0))
+                conf_gap = abs(conf_i - conf_j)
+                area_ratio = max(area_i, area_j) / max(min(area_i, area_j), 1e-6)
+
+                # Belirsiz (yakın güven + yakın alan) durumlarında iki aday da korunur.
+                if conf_gap < min_conf_gap and area_ratio < min_area_ratio:
+                    continue
+
+                loser_idx = jdx
+                if conf_j > conf_i:
+                    loser_idx = idx
+                elif abs(conf_j - conf_i) <= 1e-6 and area_j > area_i:
+                    loser_idx = idx
+
+                if keep_mask[loser_idx]:
+                    keep_mask[loser_idx] = False
                     suppressed += 1
+                if loser_idx == idx:
+                    break
 
         if suppressed > 0 and bool(getattr(Settings, "DEBUG", False)):
             self.log.debug(
                 "LandingZoneConflictSuppress "
-                f"removed={suppressed} iou_threshold={threshold:.2f}"
+                f"removed={suppressed} iou_threshold={threshold:.2f} "
+                f"min_conf_gap={min_conf_gap:.2f} min_area_ratio={min_area_ratio:.2f}"
             )
 
         return [det for idx, det in enumerate(detections) if bool(keep_mask[idx])]

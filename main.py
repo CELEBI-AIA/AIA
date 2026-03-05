@@ -340,9 +340,7 @@ def _print_simulation_result(
     log.success(
         f"Frame: {frame_idx:04d} | "
         f"Det: {len(detected_objects)} "
-        f"({tasit} Vehicle, {insan} Human"
-        f"{f', {uap} UAP' if uap else ''}"
-        f"{f', {uai} UAI' if uai else ''}) | "
+        f"({tasit} Vehicle, {insan} Human, {uap} UAP, {uai} UAI) | "
         f"Pos: {pos_str} ({loc_mode})"
     )
 
@@ -483,6 +481,52 @@ def _rolling_fps_from_durations(frame_cycle_window: deque) -> float:
     return float(len(frame_cycle_window)) / float(total)
 
 
+def _accumulate_detection_pipeline_metrics(
+    kpi_counters: Dict[str, Any],
+    detector: Any,
+) -> None:
+    metrics = {}
+    getter = getattr(detector, "get_last_pipeline_metrics", None)
+    if callable(getter):
+        try:
+            metrics = getter() or {}
+        except Exception:
+            metrics = {}
+    elif hasattr(detector, "_last_pipeline_metrics"):
+        maybe_metrics = getattr(detector, "_last_pipeline_metrics", {}) or {}
+        if isinstance(maybe_metrics, dict):
+            metrics = maybe_metrics
+
+    if not isinstance(metrics, dict) or not metrics:
+        return
+
+    kpi_counters["uap_uai_raw_seen"] = int(kpi_counters.get("uap_uai_raw_seen", 0)) + int(
+        metrics.get("uap_uai_raw_seen", 0)
+    )
+    kpi_counters["uap_uai_final_seen"] = int(
+        kpi_counters.get("uap_uai_final_seen", 0)
+    ) + int(metrics.get("uap_uai_final_seen", 0))
+    kpi_counters["uap_uai_drop_total"] = int(kpi_counters.get("uap_uai_drop_total", 0)) + int(
+        metrics.get("uap_uai_drop_total", 0)
+    )
+    kpi_counters["uap_uai_missing_landing_status_count"] = int(
+        kpi_counters.get("uap_uai_missing_landing_status_count", 0)
+    ) + int(metrics.get("uap_uai_missing_landing_status_count", 0))
+    kpi_counters["uap_uai_absent_streak_max"] = max(
+        int(kpi_counters.get("uap_uai_absent_streak_max", 0)),
+        int(metrics.get("uap_uai_absent_streak_max", 0)),
+    )
+
+    incoming_drop = metrics.get("uap_uai_drop_by_stage", {}) or {}
+    aggregated_drop = kpi_counters.get("uap_uai_drop_by_stage", {}) or {}
+    if not isinstance(aggregated_drop, dict):
+        aggregated_drop = {}
+    for stage_name, value in dict(incoming_drop).items():
+        stage_key = str(stage_name)
+        aggregated_drop[stage_key] = int(aggregated_drop.get(stage_key, 0)) + int(value)
+    kpi_counters["uap_uai_drop_by_stage"] = aggregated_drop
+
+
 def _update_dynamic_json_log_interval(
     log: Logger,
     rolling_fps: float,
@@ -543,6 +587,21 @@ def _maybe_toggle_low_fps_guard(
             float(Settings.CONFIDENCE_THRESHOLD),
             float(getattr(Settings, "PROTECTIVE_CONFIDENCE_THRESHOLD", 0.50)),
         )
+        severe_fps_threshold = float(
+            getattr(Settings, "LOW_FPS_GUARD_UAP_UAI_CONF_TRIGGER", 0.60)
+        )
+        if rolling_fps < severe_fps_threshold:
+            protective_uap_uai_conf = getattr(
+                Settings, "PROTECTIVE_UAP_UAI_CONFIDENCE_THRESHOLD", None
+            )
+            if (
+                protective_uap_uai_conf is not None
+                and getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", None) is not None
+            ):
+                Settings.CONFIDENCE_THRESHOLD_UAP_UAI = max(
+                    float(Settings.CONFIDENCE_THRESHOLD_UAP_UAI),
+                    float(protective_uap_uai_conf),
+                )
         Settings.AUGMENTED_INFERENCE = False
         Settings.DEGRADE_SEND_INTERVAL_FRAMES = max(
             int(Settings.DEGRADE_SEND_INTERVAL_FRAMES),
@@ -580,6 +639,8 @@ def _maybe_toggle_low_fps_guard(
     Settings.INFERENCE_SIZE = int(guard_state["orig_inference_size"])
     Settings.MAX_DETECTIONS = int(guard_state["orig_max_det"])
     Settings.CONFIDENCE_THRESHOLD = float(guard_state["orig_conf"])
+    if "orig_uap_uai_conf" in guard_state:
+        Settings.CONFIDENCE_THRESHOLD_UAP_UAI = guard_state.get("orig_uap_uai_conf")
     Settings.AUGMENTED_INFERENCE = bool(
         guard_state.get("orig_augmented", Settings.AUGMENTED_INFERENCE)
     )
@@ -744,6 +805,7 @@ def run_competition(log: Logger) -> None:
         "orig_inference_size": int(Settings.INFERENCE_SIZE),
         "orig_max_det": int(Settings.MAX_DETECTIONS),
         "orig_conf": float(Settings.CONFIDENCE_THRESHOLD),
+        "orig_uap_uai_conf": getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", None),
         "orig_augmented": bool(Settings.AUGMENTED_INFERENCE),
         "orig_json_interval": int(Settings.JSON_LOG_EVERY_N_FRAMES),
         "orig_degrade_interval": int(Settings.DEGRADE_SEND_INTERVAL_FRAMES),
@@ -836,6 +898,12 @@ def run_competition(log: Logger) -> None:
         "fps_guard_activations": 0,
         "fps_guard_recoveries": 0,
         "gpu_maintenance_runs": 0,
+        "uap_uai_raw_seen": 0,
+        "uap_uai_final_seen": 0,
+        "uap_uai_drop_total": 0,
+        "uap_uai_drop_by_stage": {},
+        "uap_uai_absent_streak_max": 0,
+        "uap_uai_missing_landing_status_count": 0,
         "reference_validation_stats": reference_validation_stats,
         "id_integrity_mode": id_integrity_mode,
         "id_integrity_reason_code": id_integrity_reason_code,
@@ -1184,6 +1252,10 @@ def run_competition(log: Logger) -> None:
         Settings.INFERENCE_SIZE = int(low_fps_guard_state["orig_inference_size"])
         Settings.MAX_DETECTIONS = int(low_fps_guard_state["orig_max_det"])
         Settings.CONFIDENCE_THRESHOLD = float(low_fps_guard_state["orig_conf"])
+        if "orig_uap_uai_conf" in low_fps_guard_state:
+            Settings.CONFIDENCE_THRESHOLD_UAP_UAI = low_fps_guard_state.get(
+                "orig_uap_uai_conf"
+            )
         Settings.AUGMENTED_INFERENCE = bool(low_fps_guard_state["orig_augmented"])
         Settings.JSON_LOG_EVERY_N_FRAMES = int(low_fps_guard_state["orig_json_interval"])
         Settings.DEGRADE_SEND_INTERVAL_FRAMES = int(
@@ -1271,6 +1343,14 @@ def _print_summary(
             f"{kpi_counters.get('timeout_fetch', 0)}/"
             f"{kpi_counters.get('timeout_image', 0)}/"
             f"{kpi_counters.get('timeout_submit', 0)}"
+        )
+        log.info(
+            "KPI Detection: "
+            f"UAP/UAI Raw={kpi_counters.get('uap_uai_raw_seen', 0)} | "
+            f"Final={kpi_counters.get('uap_uai_final_seen', 0)} | "
+            f"Drop={kpi_counters.get('uap_uai_drop_total', 0)} | "
+            f"MissingLanding={kpi_counters.get('uap_uai_missing_landing_status_count', 0)} | "
+            f"AbsentStreakMax={kpi_counters.get('uap_uai_absent_streak_max', 0)}"
         )
         send_ok = int(kpi_counters.get("send_ok", 0))
         send_fail = int(kpi_counters.get("send_fail", 0))
@@ -1810,6 +1890,7 @@ def _fetch_competition_step(
             detected_objects = detector.detect(frame, runtime_profile=detect_profile)
         except TypeError:
             detected_objects = detector.detect(frame)
+        _accumulate_detection_pipeline_metrics(kpi_counters, detector)
         detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
         if detected_objects:
             max_objects = max(1, int(getattr(Settings, "DEGRADE_REPLAY_MAX_OBJECTS", 40)))

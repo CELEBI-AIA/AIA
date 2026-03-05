@@ -1,5 +1,14 @@
 # CHANGELOGS
 
+## 0.0.41 - 2026-03-05
+- **feat(detection)**: Strengthened the UAP/UAI focused-pass flow with conditional rescue triggers (`absent_streak`, `low_conf`, `continuity`) and removed pure interval-only dependence.
+- **feat(detection)**: Added stage-level pipeline metrics (`raw/final UAP-UAI`, per-stage drop distribution, missing `landing_status` counter, max absent streak).
+- **fix(detection)**: Revised UAP/UAI cross-class conflict suppression with confidence-gap and area-ratio thresholds to preserve ambiguous overlaps.
+- **feat(main)**: Integrated detection pipeline metrics into competition KPI counters and run-summary outputs.
+- **fix(main)**: Hardened Low-FPS guard to safely preserve and restore UAP/UAI confidence settings.
+- **test(core)**: Added new unit tests for UAP/UAI rescue triggers, ambiguous conflict suppression behavior, pipeline metric computation, and KPI aggregation (total: 94 tests).
+- **release**: Bumped project version to `0.0.41`.
+
 ## 0.0.40 - 2026-03-05
 - **fix(payload)**: Şartnameye uygun sınıf-bazlı durum normalizasyonu eklendi (`Taşıt: landing=-1,motion=0/1`, `İnsan: landing=-1,motion=-1`, `UAP/UAİ: landing=0/1,motion=-1`).
 - **fix(detection)**: UAP/UAİ için `landing_status` güvenli biçimde `0/1` aralığına sabitlendi; eksik/değersiz durumlar `0` olarak ele alındı.

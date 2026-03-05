@@ -477,7 +477,10 @@ Sistem kapsamlı bir audit sürecinden geçirilmiş ve aşağıdaki iyileştirme
 
 ```bash
 # Tüm testleri çalıştır
-python -m pytest -q
+pytest -q
+
+# Alternatif (özellikle Python 3 ortamlarında)
+python3 -m pytest -q
 ```
 
 Gereksinimler: `pytest`, `pytest-timeout`, `PyYAML` (`requirements.txt` içinde)
