@@ -122,6 +122,7 @@ class ObjectDetector:
 
         if bool(getattr(Settings, "NON_CUDA_DISABLE_UAP_UAI_FOCUSED_PASS", False)):
             Settings.UAP_UAI_FOCUSED_PASS_ENABLED = False
+        Settings.PIPELINE_STAGE_METRICS_ENABLED = False
 
         if self.device == "mps":
             self.log.info(

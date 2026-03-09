@@ -312,3 +312,7 @@
 - Added platform-safe device auto-selection in `config/settings.py` and `src/detection.py`, preserving Windows/CUDA behavior while enabling Apple Metal (`mps`) on supported macOS machines.
 - Added non-CUDA local optimization fallbacks for simulation runs: lighter warmup, automatic light-profile preference, and disabling the most expensive CPU/MPS-only extras (`CLAHE`, temporal filter, focused UAP/UAİ pass) to improve interactive throughput without changing competition-mode contracts.
 - Updated `src/runtime_profile.py` to raise the CPU thread budget on non-CUDA runs, preventing single-thread throttling during local validation on Macs and similar developer machines.
+
+## 0.0.40 - 2026-03-09
+- Tightened the non-CUDA light simulation profile to `512px` / `80` max detections so local Mac validation trades a bit of recall for materially better responsiveness.
+- Disabled pipeline stage metric aggregation for non-CUDA runs in `src/detection.py`, reducing per-frame bookkeeping overhead during local simulation without changing the CUDA competition path.
