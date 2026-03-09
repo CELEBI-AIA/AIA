@@ -213,7 +213,16 @@ def _process_simulation_step(
     frame_ctx = FrameContext(frame)
     position = odometry.update(frame_ctx, server_data)
     current_z = position.get("z", 50.0) if position else 50.0
-    detected_objects = detector.detect(frame, altitude=current_z)
+    detect_profile = (
+        "light"
+        if getattr(detector, "prefers_light_profile", False)
+        else "default"
+    )
+    detected_objects = detector.detect(
+        frame,
+        runtime_profile=detect_profile,
+        altitude=current_z,
+    )
     detected_objects = movement.annotate(detected_objects, frame_ctx=frame_ctx)
 
     if image_matcher is not None:
@@ -1885,7 +1894,9 @@ def _fetch_competition_step(
         }
     else:
         frame_ctx = FrameContext(frame)
-        detect_profile = "light" if degrade_mode else "default"
+        detect_profile = "light" if (
+            degrade_mode or getattr(detector, "prefers_light_profile", False)
+        ) else "default"
         try:
             detected_objects = detector.detect(frame, runtime_profile=detect_profile)
         except TypeError:

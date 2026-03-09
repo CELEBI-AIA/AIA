@@ -37,15 +37,17 @@ class ObjectDetector:
         self._prev_raw_has_uap_uai: bool = False
         self._warned_nms_mode_invalid: bool = False
         self._warned_nms_mode_legacy: bool = False
+        self.prefers_light_profile: bool = False
 
-        if Settings.DEVICE == "cuda" and torch.cuda.is_available():
-            self.device = "cuda"
+        self.device = self._resolve_device()
+        if self.device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             self.log.success(f"GPU aktif: {gpu_name} ({gpu_mem:.1f} GB)")
+        elif self.device == "mps":
+            self.log.success("Apple Metal (MPS) aktif ✓")
         else:
-            self.device = "cpu"
-            self.log.warn("CUDA bulunamadı! CPU modunda çalışılıyor (yavaş olacak)")
+            self.log.warn("Donanım hızlandırıcı bulunamadı! CPU modunda çalışılıyor")
 
         self.log.info(f"YOLOv8 modeli yükleniyor: {Settings.MODEL_PATH}")
         try:
@@ -67,6 +69,7 @@ class ObjectDetector:
             self.log.error(f"Model yükleme hatası: {e}")
             raise RuntimeError(f"YOLOv8 modeli yüklenemedi: {e}")
 
+        self._apply_non_cuda_runtime_optimizations()
         self._warmup()
 
         uap_uai_conf = getattr(Settings, "CONFIDENCE_THRESHOLD_UAP_UAI", None)
@@ -87,12 +90,63 @@ class ObjectDetector:
         else:
             self._clahe = None
 
+    def _resolve_device(self) -> str:
+        requested = str(getattr(Settings, "DEVICE", "auto")).strip().lower()
+        mps_backend = getattr(torch.backends, "mps", None)
+        mps_available = bool(mps_backend and mps_backend.is_available())
+
+        if requested == "cuda":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if requested == "mps":
+            return "mps" if mps_available else "cpu"
+        if requested == "cpu":
+            return "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if mps_available:
+            return "mps"
+        return "cpu"
+
+    def _apply_non_cuda_runtime_optimizations(self) -> None:
+        if self.device == "cuda":
+            return
+
+        if bool(getattr(Settings, "AUTO_LIGHT_PROFILE_ON_NON_CUDA", True)):
+            self.prefers_light_profile = True
+
+        if bool(getattr(Settings, "NON_CUDA_DISABLE_CLAHE", False)):
+            Settings.CLAHE_ENABLED = False
+
+        if bool(getattr(Settings, "NON_CUDA_DISABLE_TEMPORAL_FILTER", False)):
+            Settings.TEMPORAL_FILTER_ENABLED = False
+
+        if bool(getattr(Settings, "NON_CUDA_DISABLE_UAP_UAI_FOCUSED_PASS", False)):
+            Settings.UAP_UAI_FOCUSED_PASS_ENABLED = False
+
+        if self.device == "mps":
+            self.log.info(
+                "Non-CUDA optimization profile applied for MPS runtime"
+            )
+        else:
+            self.log.info(
+                "Non-CUDA optimization profile applied for CPU runtime"
+            )
+
     def _warmup(self) -> None:
-        self.log.info(f"Model ısınması başlıyor ({Settings.WARMUP_ITERATIONS} iterasyon)...")
+        iterations = int(Settings.WARMUP_ITERATIONS)
+        if self.device != "cuda":
+            iterations = max(
+                0,
+                int(getattr(Settings, "NON_CUDA_WARMUP_ITERATIONS", iterations)),
+            )
+        self.log.info(f"Model ısınması başlıyor ({iterations} iterasyon)...")
+        if iterations == 0:
+            self.log.info("Warmup atlandı")
+            return
         try:
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
             with torch.no_grad():
-                for i in range(Settings.WARMUP_ITERATIONS):
+                for i in range(iterations):
                     self.model.predict(
                         source=dummy,
                         imgsz=Settings.INFERENCE_SIZE,
@@ -244,16 +298,44 @@ class ObjectDetector:
     def _build_inference_config(self, runtime_profile: str) -> Dict[str, Any]:
         profile = str(runtime_profile or "default").strip().lower()
         if profile == "light":
+            light_imgsz = int(
+                getattr(
+                    Settings,
+                    "NON_CUDA_LIGHT_PROFILE_INFERENCE_SIZE",
+                    getattr(
+                        Settings,
+                        "LIGHT_PROFILE_INFERENCE_SIZE",
+                        Settings.INFERENCE_SIZE,
+                    ),
+                )
+            ) if self.device != "cuda" else int(
+                getattr(
+                    Settings,
+                    "LIGHT_PROFILE_INFERENCE_SIZE",
+                    Settings.INFERENCE_SIZE,
+                )
+            )
+            light_max_det = int(
+                getattr(
+                    Settings,
+                    "NON_CUDA_LIGHT_PROFILE_MAX_DETECTIONS",
+                    getattr(
+                        Settings,
+                        "LIGHT_PROFILE_MAX_DETECTIONS",
+                        Settings.MAX_DETECTIONS,
+                    ),
+                )
+            ) if self.device != "cuda" else int(
+                getattr(
+                    Settings,
+                    "LIGHT_PROFILE_MAX_DETECTIONS",
+                    Settings.MAX_DETECTIONS,
+                )
+            )
             return {
                 "imgsz": max(
                     256,
-                    int(
-                        getattr(
-                            Settings,
-                            "LIGHT_PROFILE_INFERENCE_SIZE",
-                            Settings.INFERENCE_SIZE,
-                        )
-                    ),
+                    light_imgsz,
                 ),
                 "conf": float(
                     max(
@@ -268,13 +350,7 @@ class ObjectDetector:
                 "iou": float(Settings.NMS_IOU_THRESHOLD),
                 "max_det": max(
                     1,
-                    int(
-                        getattr(
-                            Settings,
-                            "LIGHT_PROFILE_MAX_DETECTIONS",
-                            Settings.MAX_DETECTIONS,
-                        )
-                    ),
+                    light_max_det,
                 ),
                 "augment": bool(
                     getattr(Settings, "LIGHT_PROFILE_AUGMENTED_INFERENCE", False)
@@ -348,7 +424,12 @@ class ObjectDetector:
                 self._last_guardrail_stats = {}
             self._collect_stage_stats(stage_trace, "guardrails", raw_detections)
 
-            if getattr(Settings, "TEMPORAL_FILTER_ENABLED", True):
+            temporal_filter_enabled = bool(
+                getattr(Settings, "TEMPORAL_FILTER_ENABLED", True)
+            )
+            if runtime_profile == "light" and self.device != "cuda":
+                temporal_filter_enabled = False
+            if temporal_filter_enabled:
                 try:
                     from src.temporal_filter import TemporalConsistencyFilter
                     if self._temporal_filter is None:
@@ -496,6 +577,8 @@ class ObjectDetector:
         primary_detections: Optional[List[Dict]] = None,
     ) -> List[Dict]:
         if not bool(getattr(Settings, "UAP_UAI_FOCUSED_PASS_ENABLED", False)):
+            return []
+        if self.device != "cuda":
             return []
         if not self._uap_uai_model_class_ids:
             return []

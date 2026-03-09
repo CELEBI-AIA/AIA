@@ -303,3 +303,12 @@
 - Closed OR-2 typed-status contract risk by switching the default outbound status profile to spec-aligned strings in `config/settings.py` and `src/payload.py`.
 - Kept the format versioned and reversible through `PAYLOAD_STATUS_TYPE_PROFILE`, so a final server schema can still be adopted centrally if it requires integers.
 - Added contract regression coverage in `tests/test_all.py` and `tests/test_e2e_smoke_contract.py` for both default string serialization and controlled integer override behavior.
+
+## 0.0.38 - 2026-03-09
+- Fixed `src/data_loader.py` so simulation startup no longer fails when `datasets/` contains only video files and no standalone images.
+- Expanded startup logging to report both supported image/video extensions and discovered video counts, which makes local validation setup easier on macOS and similar dev environments.
+
+## 0.0.39 - 2026-03-09
+- Added platform-safe device auto-selection in `config/settings.py` and `src/detection.py`, preserving Windows/CUDA behavior while enabling Apple Metal (`mps`) on supported macOS machines.
+- Added non-CUDA local optimization fallbacks for simulation runs: lighter warmup, automatic light-profile preference, and disabling the most expensive CPU/MPS-only extras (`CLAHE`, temporal filter, focused UAP/UAİ pass) to improve interactive throughput without changing competition-mode contracts.
+- Updated `src/runtime_profile.py` to raise the CPU thread budget on non-CUDA runs, preventing single-thread throttling during local validation on Macs and similar developer machines.

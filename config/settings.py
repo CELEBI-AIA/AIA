@@ -46,7 +46,7 @@ class Settings:
     NMS_IOU_THRESHOLD: float = 0.15  # Çakışan kutuları bastırma eşiği
     NMS_MODE: str = "class_aware"  # class_aware|agnostic|hybrid
     HYBRID_NMS_IOU_THRESHOLD: float = 0.65
-    DEVICE: str = "cuda"
+    DEVICE: str = "auto"  # auto|cuda|mps|cpu
     HALF_PRECISION: bool = True
     INFERENCE_SIZE: int = 1280
     AGNOSTIC_NMS: bool = True  # Legacy fallback; NMS_MODE ayarı varken yok sayılır
@@ -259,8 +259,16 @@ class Settings:
     LIGHT_PROFILE_CONFIDENCE_THRESHOLD: float = 0.50
     LIGHT_PROFILE_AUGMENTED_INFERENCE: bool = False
     LIGHT_PROFILE_SAHI_ENABLED: bool = False
+    AUTO_LIGHT_PROFILE_ON_NON_CUDA: bool = True
+    NON_CUDA_LIGHT_PROFILE_INFERENCE_SIZE: int = 640
+    NON_CUDA_LIGHT_PROFILE_MAX_DETECTIONS: int = 120
+    NON_CUDA_DISABLE_CLAHE: bool = True
+    NON_CUDA_DISABLE_TEMPORAL_FILTER: bool = True
+    NON_CUDA_DISABLE_UAP_UAI_FOCUSED_PASS: bool = True
+    NON_CUDA_WARMUP_ITERATIONS: int = 1
     DETERMINISM_SEED: int = 42
     DETERMINISM_CPU_THREADS: int = 1
+    NON_CUDA_CPU_THREADS: int = max(2, min(8, (os.cpu_count() or 4)))
     MOTION_FIELD_NAME: str = "motion_status"
     PAYLOAD_CLS_AS_INT: bool = False
     PAYLOAD_STATUS_TYPE_PROFILE: str = "string"  # int|string

@@ -23,6 +23,17 @@ def _collect_images_recursive(root: str) -> List[str]:
     return sorted(paths)
 
 
+def _collect_videos_recursive(root: str) -> List[str]:
+    """datasets/ altında recursive tara, sadece uzantıya göre eşleşen videoları topla."""
+    exts = tuple(e.lower() for e in Settings.VIDEO_EXTENSIONS)
+    paths: List[str] = []
+    for dirpath, _, filenames in os.walk(root):
+        for f in filenames:
+            if f.lower().endswith(exts):
+                paths.append(os.path.join(dirpath, f))
+    return sorted(paths)
+
+
 def _group_by_directory(paths: List[str]) -> Dict[str, List[str]]:
     """Dosyaları üst klasörlerine göre grupla (VID sekans seçimi için)."""
     groups: Dict[str, List[str]] = defaultdict(list)
@@ -88,13 +99,22 @@ class DatasetLoader:
         self.log.info(f"Veri seti taranıyor (recursive): {datasets_dir}")
 
         all_images = _collect_images_recursive(datasets_dir)
+        all_videos = _collect_videos_recursive(datasets_dir)
 
-        if not all_images:
+        if not all_images and not all_videos:
             self.log.error("Hiçbir görüntü bulunamadı!")
-            self.log.error(f"  → Desteklenen uzantılar: {Settings.IMAGE_EXTENSIONS}")
+            self.log.error(
+                f"  → Desteklenen görüntü uzantıları: {Settings.IMAGE_EXTENSIONS}"
+            )
+            self.log.error(
+                f"  → Desteklenen video uzantıları: {Settings.VIDEO_EXTENSIONS}"
+            )
             return
 
-        self.log.success(f"Toplam {len(all_images)} görüntü bulundu")
+        if all_images:
+            self.log.success(f"Toplam {len(all_images)} görüntü bulundu")
+        if all_videos:
+            self.log.success(f"Toplam {len(all_videos)} video bulundu")
 
         if seed is not None:
             random.seed(seed)

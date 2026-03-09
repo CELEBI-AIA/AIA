@@ -2,6 +2,7 @@
 
 import os
 import random
+import platform
 from typing import Literal, Optional
 
 import numpy as np
@@ -48,7 +49,12 @@ def apply_runtime_profile(profile: ProfileName, requested_profile: Optional[str]
     except Exception:
         pass
 
-    cpu_threads = max(1, int(Settings.DETERMINISM_CPU_THREADS))
+    cpu_threads_cfg = int(Settings.DETERMINISM_CPU_THREADS)
+    if not torch.cuda.is_available():
+        cpu_threads_cfg = int(
+            getattr(Settings, "NON_CUDA_CPU_THREADS", cpu_threads_cfg)
+        )
+    cpu_threads = max(1, cpu_threads_cfg)
     try:
         torch.set_num_threads(cpu_threads)
     except Exception:
@@ -59,6 +65,12 @@ def apply_runtime_profile(profile: ProfileName, requested_profile: Optional[str]
         Settings.AUGMENTED_INFERENCE = False
     if profile == "max":
         Settings.HALF_PRECISION = False
+
+    if platform.system() == "Darwin" and not torch.cuda.is_available():
+        log.info(
+            "Non-CUDA runtime detected on macOS; CPU thread budget raised to "
+            f"{cpu_threads} for better local throughput"
+        )
 
     log.success(
         f"Deterministic profile applied | requested={requested} | effective={profile} | "
