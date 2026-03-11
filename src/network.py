@@ -798,8 +798,7 @@ class NetworkManager:
 
         return capped, stats
 
-    @staticmethod
-    def _build_safe_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_safe_fallback_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         tx = 0.0
         ty = 0.0
         tz = 0.0
@@ -807,33 +806,79 @@ class NetworkManager:
         if isinstance(translations, list) and len(translations) > 0:
             first_trans = translations[0]
             if isinstance(first_trans, dict):
-                tx = float(first_trans.get("translation_x", 0.0))
-                ty = float(first_trans.get("translation_y", 0.0))
-                tz = float(first_trans.get("translation_z", 0.0))
+                tx = self._safe_float(first_trans.get("translation_x", 0.0))
+                ty = self._safe_float(first_trans.get("translation_y", 0.0))
+                tz = self._safe_float(first_trans.get("translation_z", 0.0))
 
         safe_objects = []
         for obj in payload.get("detected_objects", []):
+            if not isinstance(obj, dict):
+                self.log.debug("Fallback object dropped: invalid object type")
+                continue
+
             try:
+                raw_cls = float(obj["cls"])
+                if not math.isfinite(raw_cls):
+                    raise ValueError
+                cls = int(raw_cls)
+            except (KeyError, TypeError, ValueError):
+                self.log.debug(
+                    f"Fallback object dropped: invalid cls ({obj.get('cls')})"
+                )
+                continue
+
+            if cls < 0 or cls > 3:
+                self.log.debug(
+                    f"Fallback object dropped: invalid cls range ({obj.get('cls')})"
+                )
+                continue
+
+            try:
+                x1 = int(obj["top_left_x"])
+                y1 = int(obj["top_left_y"])
+                x2 = int(obj["bottom_right_x"])
+                y2 = int(obj["bottom_right_y"])
+                if x2 <= x1 or y2 <= y1:
+                    self.log.debug(
+                        "Fallback object dropped: invalid bbox "
+                        f"({x1}, {y1}, {x2}, {y2})"
+                    )
+                    continue
+
                 safe_obj = {
-                    "cls": int(obj["cls"]),
-                    "top_left_x": int(obj["top_left_x"]),
-                    "top_left_y": int(obj["top_left_y"]),
-                    "bottom_right_x": int(obj["bottom_right_x"]),
-                    "bottom_right_y": int(obj["bottom_right_y"]),
+                    "cls": cls,
+                    "top_left_x": x1,
+                    "top_left_y": y1,
+                    "bottom_right_x": x2,
+                    "bottom_right_y": y2,
                 }
                 if "landing_status" in obj:
+                    landing_raw = self._safe_float(obj.get("landing_status"))
+                    if not math.isfinite(landing_raw):
+                        raise ValueError("invalid landing_status")
                     safe_obj["landing_status"] = CompetitionPayloadSchema.cast_status_value(
-                        int(float(obj["landing_status"]))
+                        int(landing_raw)
                     )
                 motion_raw = obj.get(CompetitionPayloadSchema.CANONICAL_MOTION_FIELD)
                 if motion_raw is not None:
+                    motion_status_raw = self._safe_float(motion_raw)
+                    if not math.isfinite(motion_status_raw):
+                        raise ValueError("invalid motion_status")
                     safe_obj[
                         CompetitionPayloadSchema.CANONICAL_MOTION_FIELD
                     ] = CompetitionPayloadSchema.cast_status_value(
-                        int(float(motion_raw))
+                        int(motion_status_raw)
                     )
                 safe_objects.append(safe_obj)
-            except (KeyError, ValueError, TypeError):
+            except KeyError:
+                self.log.debug("Fallback object dropped: missing bbox fields")
+                continue
+            except (ValueError, TypeError):
+                self.log.debug(
+                    "Fallback object dropped: invalid status fields "
+                    f"(landing={obj.get('landing_status')}, "
+                    f"motion={obj.get(CompetitionPayloadSchema.CANONICAL_MOTION_FIELD)})"
+                )
                 continue
 
         return {

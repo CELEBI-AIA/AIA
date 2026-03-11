@@ -1128,6 +1128,82 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         self.assertIn("motion_status", sent_obj)
         self.assertNotIn("movement_status", sent_obj)
 
+    def test_safe_fallback_normalizes_cls_numeric_formats(self):
+        payload = {
+            "id": "f-fallback-formats",
+            "user": "u",
+            "frame": "f-fallback-formats",
+            "detected_objects": [
+                {
+                    "cls": "2.0",
+                    "landing_status": "1.0",
+                    "motion_status": "-1.0",
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 20,
+                    "bottom_right_y": 30,
+                },
+                {
+                    "cls": "3",
+                    "landing_status": "0",
+                    "motion_status": "1",
+                    "top_left_x": 3,
+                    "top_left_y": 4,
+                    "bottom_right_x": 21,
+                    "bottom_right_y": 31,
+                },
+                {
+                    "cls": 3,
+                    "landing_status": 1,
+                    "motion_status": 0,
+                    "top_left_x": 5,
+                    "top_left_y": 6,
+                    "bottom_right_x": 25,
+                    "bottom_right_y": 35,
+                },
+                {
+                    "cls": 3.0,
+                    "landing_status": "nan",
+                    "motion_status": "1",
+                    "top_left_x": 7,
+                    "top_left_y": 8,
+                    "bottom_right_x": 27,
+                    "bottom_right_y": 38,
+                },
+                {
+                    "cls": "9",
+                    "landing_status": "1",
+                    "motion_status": "0",
+                    "top_left_x": 1,
+                    "top_left_y": 2,
+                    "bottom_right_x": 20,
+                    "bottom_right_y": 30,
+                },
+                {
+                    "cls": "1",
+                    "landing_status": "0",
+                    "motion_status": "1",
+                    "top_left_x": 10,
+                    "top_left_y": 10,
+                    "bottom_right_x": 10,
+                    "bottom_right_y": 20,
+                },
+            ],
+            "detected_translations": [
+                {
+                    "translation_x": "1.0",
+                    "translation_y": "2",
+                    "translation_z": 3,
+                }
+            ],
+            "detected_undefined_objects": [],
+        }
+
+        out = self.net._build_safe_fallback_payload(payload)
+
+        self.assertEqual(len(out["detected_objects"]), 3)
+        self.assertEqual([obj["cls"] for obj in out["detected_objects"]], [2, 3, 3])
+
     def test_preflight_rejects_uap_uai_without_landing_status(self):
         self.net.session = Mock()
         self.net.session.post = Mock(return_value=_Response(200))
