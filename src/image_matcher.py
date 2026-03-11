@@ -203,8 +203,26 @@ class ImageMatcher:
                 self._reference_lifecycle[object_id] = "received"
 
                 label = ref_data.get("label", f"ref_{object_id}")
-                if "image" in ref_data and ref_data["image"] is not None:
-                    image = ref_data["image"]
+                if "image" in ref_data:
+                    image = ref_data.get("image")
+                    if image is None:
+                        self._last_load_stats["quarantined"] += 1
+                        self.log.warn(
+                            f"event=task3_ref_quarantined reason=image_none object_id={object_id} index={idx}"
+                        )
+                        continue
+                    if not isinstance(image, np.ndarray):
+                        self._last_load_stats["quarantined"] += 1
+                        self.log.warn(
+                            f"event=task3_ref_quarantined reason=invalid_image_type object_id={object_id} index={idx}"
+                        )
+                        continue
+                    if image.ndim not in (2, 3):
+                        self._last_load_stats["quarantined"] += 1
+                        self.log.warn(
+                            f"event=task3_ref_quarantined reason=invalid_image_ndim object_id={object_id} index={idx} ndim={image.ndim}"
+                        )
+                        continue
                 elif "path" in ref_data and os.path.isfile(ref_data["path"]):
                     image = cv2.imread(ref_data["path"])
                     if image is None:
@@ -216,7 +234,7 @@ class ImageMatcher:
                     self.log.warn(f"Reference #{object_id} has no valid image source")
                     continue
 
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
                 keypoints, descriptors = self._extract_features(gray, self.detector)
                 fallback_keypoints: list = []
                 fallback_descriptors = None

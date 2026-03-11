@@ -66,6 +66,8 @@ def build_task3_reference_source(
 
     image = ref_data.get("image")
     if image is not None:
+        if not isinstance(image, np.ndarray):
+            return None, "invalid_image_type"
         return {"object_id": object_id, "image": image, "label": label}, "image"
 
     return None, "missing_image_source"
@@ -178,4 +180,3 @@ def canonicalize_task3_references(
         id_integrity_reason_code,
         duplicate_critical,
     )
-
