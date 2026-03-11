@@ -99,3 +99,22 @@ def test_len_fallback_when_video_metadata_missing():
 
     assert count == 4
     assert len(loader) == 4
+
+
+def test_zero_frame_video_metadata_fallback_results_in_empty_iteration():
+    loader = DatasetLoader.__new__(DatasetLoader)
+    loader.log = Mock()
+    loader._frames = []
+    loader._video_capture = FakeVideoCapture(frame_count=0, reset_success=True)
+    loader._video_total_frames = 0
+    loader._index = 0
+    loader._mode = "vid"
+    loader._sequence_name = "fake"
+
+    count = loader._estimate_video_frame_count()
+    loader._video_total_frames = count
+
+    assert count == 0
+    assert loader.is_ready is False
+    assert len(loader) == 0
+    assert list(loader) == []
