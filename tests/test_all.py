@@ -1049,6 +1049,48 @@ class TestNetworkPayloadGuard(unittest.TestCase):
         self.assertTrue(rej)
         self.assertFalse(clip)
 
+    def test_fallback_payload_translation_sanitizes_unknown_and_none(self):
+        payload = self.net._build_safe_fallback_payload(
+            {
+                "id": "f-unknown-none",
+                "user": "u",
+                "frame": "f-unknown-none",
+                "detected_translations": [
+                    {
+                        "translation_x": "unknown",
+                        "translation_y": None,
+                        "translation_z": "0.5",
+                    }
+                ],
+                "detected_objects": [],
+            }
+        )
+        trans = payload["detected_translations"][0]
+        self.assertEqual(trans["translation_x"], 0.0)
+        self.assertEqual(trans["translation_y"], 0.0)
+        self.assertEqual(trans["translation_z"], 0.5)
+
+    def test_fallback_payload_translation_sanitizes_non_finite_values(self):
+        payload = self.net._build_safe_fallback_payload(
+            {
+                "id": "f-non-finite",
+                "user": "u",
+                "frame": "f-non-finite",
+                "detected_translations": [
+                    {
+                        "translation_x": "NaN",
+                        "translation_y": "inf",
+                        "translation_z": "-inf",
+                    }
+                ],
+                "detected_objects": [],
+            }
+        )
+        trans = payload["detected_translations"][0]
+        self.assertEqual(trans["translation_x"], 0.0)
+        self.assertEqual(trans["translation_y"], 0.0)
+        self.assertEqual(trans["translation_z"], 0.0)
+
     def test_4xx_then_fallback_200_returns_fallback_acked(self):
         self.net.session = Mock()
         self.net.session.post = Mock(side_effect=[_Response(400), _Response(200)])
@@ -1152,6 +1194,27 @@ class TestNetworkPayloadGuard(unittest.TestCase):
             frame_shape=(1080, 1920, 3),
         )
         self.assertEqual(status, SendResultStatus.FALLBACK_ACKED)
+
+    def test_preflight_reject_path_sanitizes_unknown_and_none_translation(self):
+        self.net.session = Mock()
+        self.net.session.post = Mock(return_value=_Response(200))
+        status = self.net.send_result(
+            frame_id="f-preflight-unknown-none",
+            detected_objects=[{"cls": "invalid", "confidence": 0.9}],
+            detected_translation={
+                "translation_x": "unknown",
+                "translation_y": None,
+                "translation_z": "1.2",
+            },
+            frame_data={"id": "f-preflight-unknown-none", "user": "u", "url": "frame-url"},
+            frame_shape=(1080, 1920, 3),
+        )
+        self.assertEqual(status, SendResultStatus.FALLBACK_ACKED)
+        sent_payload = self.net.session.post.call_args.kwargs["json"]
+        trans = sent_payload["detected_translations"][0]
+        self.assertEqual(trans["translation_x"], 0.0)
+        self.assertEqual(trans["translation_y"], 0.0)
+        self.assertEqual(trans["translation_z"], 1.2)
 
 
 class TestCompetitionPayloadSchema(unittest.TestCase):

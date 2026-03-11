@@ -807,9 +807,13 @@ class NetworkManager:
         if isinstance(translations, list) and len(translations) > 0:
             first_trans = translations[0]
             if isinstance(first_trans, dict):
-                tx = float(first_trans.get("translation_x", 0.0))
-                ty = float(first_trans.get("translation_y", 0.0))
-                tz = float(first_trans.get("translation_z", 0.0))
+                tx = NetworkManager._safe_float(first_trans.get("translation_x", 0.0))
+                ty = NetworkManager._safe_float(first_trans.get("translation_y", 0.0))
+                tz = NetworkManager._safe_float(first_trans.get("translation_z", 0.0))
+
+        tx = NetworkManager._safe_float(tx)
+        ty = NetworkManager._safe_float(ty)
+        tz = NetworkManager._safe_float(tz)
 
         safe_objects = []
         for obj in payload.get("detected_objects", []):
@@ -1089,7 +1093,10 @@ class NetworkManager:
     @staticmethod
     def _safe_float(val: Any) -> float:
         try:
-            return float(val)
+            casted = float(val)
+            if not math.isfinite(casted):
+                return 0.0
+            return casted
         except (TypeError, ValueError):
             return 0.0
 
