@@ -203,10 +203,34 @@ class DatasetLoader:
                 self._video_capture = None
                 return
             self._video_total_frames = int(self._video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if self._video_total_frames <= 0:
+                self.log.warn(
+                    "Video metadata frame count bilgisi yok/bozuk. "
+                    "Tutarlılık için kare sayısı manuel olarak hesaplanıyor."
+                )
+                self._video_total_frames = self._estimate_video_frame_count()
             self.log.info(f"Sekans: {self._sequence_name} (Video: ~{self._video_total_frames} kare)")
         else:
             self._frames = chosen["files"]
             self.log.info(f"Sekans: {self._sequence_name} (Resim dizisi: {len(self._frames)} kare)")
+
+    def _estimate_video_frame_count(self) -> int:
+        """Fallback frame-count strategy for videos with missing metadata."""
+        if self._video_capture is None:
+            return 0
+
+        # Start from the beginning to keep __len__ and iterator semantics aligned.
+        self._video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_count = 0
+        while True:
+            ret, _ = self._video_capture.read()
+            if not ret:
+                break
+            frame_count += 1
+
+        # Best-effort rewind for subsequent iterations.
+        self._video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return frame_count
 
     def _load_detection_images(self, all_images: List[str]) -> None:
         """Tüm görüntülerden rastgele örnek al."""
@@ -225,7 +249,21 @@ class DatasetLoader:
         return len(self._frames)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
+        """Reset iteration cursor.
+
+        For video sources we best-effort seek to frame 0. If seek fails, iteration
+        continues from the current decoder position and may stop immediately when
+        the stream is already at EOF.
+        """
         self._index = 0
+        if self._video_capture is not None:
+            reset_ok = self._video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            current_pos = self._video_capture.get(cv2.CAP_PROP_POS_FRAMES)
+            if (not reset_ok) or current_pos > 0.5:
+                self.log.warn(
+                    "Video akışı başa sarılamadı (CAP_PROP_POS_FRAMES=0). "
+                    "Iterator mevcut pozisyondan devam edecek."
+                )
         return self
 
     def __next__(self) -> Dict[str, Any]:
