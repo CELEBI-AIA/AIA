@@ -558,6 +558,18 @@ class TestTask3ReferenceValidation(unittest.TestCase):
         self.assertEqual(reason, "reference_quarantined_non_duplicate")
         self.assertFalse(disabled)
 
+    def test_invalid_image_type_is_quarantined(self):
+        refs = [{"object_id": 99, "image": "not-an-ndarray"}]
+        canonical, stats, mode, reason, disabled = (
+            main_module._validate_task3_references(main_module.Logger("Test"), refs)
+        )
+        self.assertEqual(canonical, [])
+        self.assertEqual(stats["valid"], 0)
+        self.assertEqual(stats["quarantined"], 1)
+        self.assertEqual(mode, "degraded")
+        self.assertEqual(reason, "reference_quarantined_non_duplicate")
+        self.assertFalse(disabled)
+
 
 @unittest.skipUnless(ImageMatcher is not None, "image matcher deps missing")
 class TestImageMatcherIdIntegrity(unittest.TestCase):
@@ -591,6 +603,20 @@ class TestImageMatcherIdIntegrity(unittest.TestCase):
         self.assertEqual(self.matcher.reference_count, 1)
         self.assertEqual(self.matcher.last_load_stats["duplicate"], 1)
         self.assertEqual(self.matcher.last_load_stats["quarantined"], 1)
+
+    def test_load_references_skips_invalid_image_variants(self):
+        refs = [
+            {"object_id": 11, "image": None},
+            {"object_id": 12, "image": "invalid-image"},
+            {"object_id": 13, "image": np.zeros((1, 2, 3, 4), dtype=np.uint8)},
+            {"object_id": 14, "image": np.zeros((16, 16, 3), dtype=np.uint8)},
+        ]
+        loaded = self.matcher.load_references(refs)
+        self.assertEqual(loaded, 1)
+        self.assertEqual(self.matcher.reference_count, 1)
+        self.assertEqual(self.matcher.last_load_stats["quarantined"], 3)
+        self.assertEqual(self.matcher.last_load_stats["valid"], 1)
+        self.assertEqual(self.matcher.references[0].object_id, 14)
 
     def test_match_output_never_contains_duplicate_id(self):
         refs = [

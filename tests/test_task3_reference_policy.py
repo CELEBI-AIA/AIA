@@ -1,6 +1,8 @@
 import unittest
 
-from src.task3_reference_policy import normalize_task3_object_id
+from src.task3_reference_policy import build_task3_reference_source, normalize_task3_object_id
+
+import numpy as np
 
 
 class TestNormalizeTask3ObjectId(unittest.TestCase):
@@ -58,3 +60,21 @@ class TestNormalizeTask3ObjectId(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestTask3ReferenceSource(unittest.TestCase):
+    def test_build_source_rejects_invalid_image_type(self):
+        source, reason = build_task3_reference_source(
+            {"label": "x", "image": "not-ndarray"},
+            object_id=5,
+        )
+        self.assertIsNone(source)
+        self.assertEqual(reason, "invalid_image_type")
+
+    def test_build_source_accepts_ndarray_image(self):
+        source, reason = build_task3_reference_source(
+            {"label": "x", "image": np.zeros((8, 8, 3), dtype=np.uint8)},
+            object_id=5,
+        )
+        self.assertIsNotNone(source)
+        self.assertEqual(reason, "image")
