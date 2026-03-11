@@ -68,6 +68,8 @@ from src.competition_contract import (
 from src.payload import CompetitionPayloadSchema, PayloadAdapter
 from src.class_contract import CompetitionClassContract
 from src.utils import Logger, log_json_to_disk, _sanitize_log_component, _prune_old_logs, normalize_gps_health, GPS_HEALTH_UNKNOWN, GPS_HEALTH_HEALTHY, GPS_HEALTH_UNHEALTHY
+
+from src.data_loader import get_available_sequences
 from main import run_simulation
 
 
@@ -2327,3 +2329,31 @@ class TestNormalizeGpsHealth(unittest.TestCase):
     def test_normalize_gps_health_both_none(self):
         self.assertEqual(normalize_gps_health(None, None), (None, GPS_HEALTH_UNKNOWN))
         self.assertEqual(normalize_gps_health(None), (None, GPS_HEALTH_UNKNOWN))
+
+def test_get_available_sequences_keeps_duplicate_basename_entries(tmp_path, monkeypatch):
+    datasets_dir = tmp_path / "datasets"
+    first = datasets_dir / "city_a" / "seq01"
+    second = datasets_dir / "city_b" / "seq01"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    for index in range(2):
+        (first / f"frame_{index:02d}.jpg").write_bytes(b"x")
+        (second / f"frame_{index:02d}.jpg").write_bytes(b"x")
+
+    monkeypatch.setattr(Settings, "DATASETS_DIR", str(datasets_dir))
+
+    sequences = get_available_sequences()
+
+    seq_entries = [
+        (key, value)
+        for key, value in sequences.items()
+        if value["type"] == "image_sequence" and value.get("label") == "seq01"
+    ]
+
+    assert len(seq_entries) == 2
+    keys = {key for key, _ in seq_entries}
+    assert keys == {"img:city_a/seq01", "img:city_b/seq01"}
+    for _, value in seq_entries:
+        assert "seq01" in value.get("aliases", [])
+
