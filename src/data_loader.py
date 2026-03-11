@@ -43,6 +43,46 @@ def _group_by_directory(paths: List[str]) -> Dict[str, List[str]]:
     return dict(groups)
 
 
+def _build_available_sequences_from_lists(
+    datasets_dir: str,
+    all_images: List[str],
+    all_videos: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Build sequence metadata from pre-collected image/video path lists."""
+    groups = _group_by_directory(all_images)
+    sequences: Dict[str, Dict[str, Any]] = {}
+
+    for directory, image_files in groups.items():
+        if len(image_files) < 2:
+            continue
+
+        rel_key = os.path.relpath(directory, datasets_dir).replace(os.sep, "/")
+        name = os.path.basename(directory)
+        sequence_key = f"img:{rel_key}"
+        sequences[sequence_key] = {
+            "type": "image_sequence",
+            "path": directory,
+            "count": len(image_files),
+            "files": sorted(image_files),
+            "label": name,
+            "aliases": [name],
+        }
+
+    for video_path in all_videos:
+        rel_key = os.path.relpath(video_path, datasets_dir).replace(os.sep, "/")
+        name = os.path.basename(video_path)
+        sequence_key = f"vid:{rel_key}"
+        sequences[sequence_key] = {
+            "type": "video",
+            "path": video_path,
+            "count": "vid_file",
+            "label": name,
+            "aliases": [name],
+        }
+
+    return sequences
+
+
 def get_available_sequences() -> Dict[str, Dict[str, Any]]:
     """Scan datasets/ for image sequences (folders with >=2 images) and video files."""
     datasets_dir = Settings.DATASETS_DIR
@@ -63,36 +103,7 @@ def get_available_sequences() -> Dict[str, Dict[str, Any]]:
             elif ext.endswith(vid_exts):
                 videos.append(os.path.join(dirpath, f))
 
-    groups = _group_by_directory(all_images)
-    sequences = {}
-
-    for k, v in groups.items():
-        if len(v) >= 2:
-            rel_key = os.path.relpath(k, datasets_dir).replace(os.sep, "/")
-            name = os.path.basename(k)
-            sequence_key = f"img:{rel_key}"
-            sequences[sequence_key] = {
-                "type": "image_sequence",
-                "path": k,
-                "count": len(v),
-                "files": sorted(v),
-                "label": name,
-                "aliases": [name],
-            }
-
-    for v in videos:
-        rel_key = os.path.relpath(v, datasets_dir).replace(os.sep, "/")
-        name = os.path.basename(v)
-        sequence_key = f"vid:{rel_key}"
-        sequences[sequence_key] = {
-            "type": "video",
-            "path": v,
-            "count": "vid_file",
-            "label": name,
-            "aliases": [name],
-        }
-
-    return sequences
+    return _build_available_sequences_from_lists(datasets_dir, all_images, videos)
 
 
 class DatasetLoader:
@@ -137,8 +148,18 @@ class DatasetLoader:
             random.seed(seed)
             self.log.info(f"Deterministik mod: seed={seed}")
 
+        available_sequences = _build_available_sequences_from_lists(
+            datasets_dir,
+            all_images,
+            all_videos,
+        )
+
         if prefer_vid:
-            self._load_video_sequence(all_images, sequence=sequence)
+            self._load_video_sequence(
+                all_images,
+                sequence=sequence,
+                available_sequences=available_sequences,
+            )
         else:
             self._load_detection_images(all_images)
 
@@ -149,9 +170,14 @@ class DatasetLoader:
                 f"{'Sekans: ' + self._sequence_name if self._sequence_name else ''}"
             )
 
-    def _load_video_sequence(self, all_images: List[str], sequence: Optional[str] = None) -> None:
+    def _load_video_sequence(
+        self,
+        all_images: List[str],
+        sequence: Optional[str] = None,
+        available_sequences: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
         """Belirtilen dizi adını veya en çok görüntü içeren klasörü sekans olarak seç, veya bir video dosyası aç."""
-        available = get_available_sequences()
+        available = available_sequences if available_sequences is not None else get_available_sequences()
         
         if not available:
             self.log.warn("Sıralı sekans (görüntü/video) bulunamadı, DET moduna geçiliyor")
