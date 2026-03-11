@@ -68,12 +68,29 @@ def get_available_sequences() -> Dict[str, Dict[str, Any]]:
 
     for k, v in groups.items():
         if len(v) >= 2:
+            rel_key = os.path.relpath(k, datasets_dir).replace(os.sep, "/")
             name = os.path.basename(k)
-            sequences[name] = {"type": "image_sequence", "path": k, "count": len(v), "files": sorted(v)}
+            sequence_key = f"img:{rel_key}"
+            sequences[sequence_key] = {
+                "type": "image_sequence",
+                "path": k,
+                "count": len(v),
+                "files": sorted(v),
+                "label": name,
+                "aliases": [name],
+            }
 
     for v in videos:
+        rel_key = os.path.relpath(v, datasets_dir).replace(os.sep, "/")
         name = os.path.basename(v)
-        sequences[name] = {"type": "video", "path": v, "count": "vid_file"}
+        sequence_key = f"vid:{rel_key}"
+        sequences[sequence_key] = {
+            "type": "video",
+            "path": v,
+            "count": "vid_file",
+            "label": name,
+            "aliases": [name],
+        }
 
     return sequences
 
@@ -144,10 +161,28 @@ class DatasetLoader:
         chosen_key = None
         if sequence is not None and sequence in available:
             chosen_key = sequence
-        else:
+        elif sequence is not None:
+            alias_matches = []
+            for key, sequence_info in available.items():
+                aliases = sequence_info.get("aliases", [])
+                if sequence in aliases:
+                    alias_matches.append(key)
+
+            if len(alias_matches) == 1:
+                chosen_key = alias_matches[0]
+                self.log.warn(
+                    f"Sekans '{sequence}' eski basename alias ile eşleşti, lütfen unique key kullanın: {chosen_key}"
+                )
+            elif len(alias_matches) > 1:
+                self.log.warn(
+                    "Birden fazla sekans aynı alias ile eşleşti "
+                    f"('{sequence}'): {', '.join(alias_matches)}. Unique key kullanın."
+                )
+
+        if chosen_key is None:
             if sequence is not None:
                 self.log.warn(f"Sekans '{sequence}' bulunamadı.")
-            
+
             # Sequence name is not provided or not valid, pick the largest image sequence, or first video
             img_seqs = [(k, v) for k, v in available.items() if v["type"] == "image_sequence"]
             if img_seqs:
@@ -157,7 +192,7 @@ class DatasetLoader:
                 chosen_key = list(available.keys())[0]
 
         chosen = available[chosen_key]
-        self._sequence_name = chosen_key
+        self._sequence_name = chosen.get("label", chosen_key)
         self._mode = "vid"
 
         if chosen["type"] == "video":
