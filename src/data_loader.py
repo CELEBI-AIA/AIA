@@ -245,7 +245,7 @@ class DatasetLoader:
 
     def __len__(self) -> int:
         if self._video_capture is not None:
-            return max(1, self._video_total_frames)
+            return int(max(0, self._video_total_frames))
         return len(self._frames)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
@@ -325,7 +325,7 @@ class DatasetLoader:
     @property
     def is_ready(self) -> bool:
         if self._video_capture is not None:
-            return self._video_capture.isOpened()
+            return self._video_capture.isOpened() and len(self) > 0
         return len(self._frames) > 0
 
     def __del__(self):
