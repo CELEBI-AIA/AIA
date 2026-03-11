@@ -807,9 +807,9 @@ class NetworkManager:
         if isinstance(translations, list) and len(translations) > 0:
             first_trans = translations[0]
             if isinstance(first_trans, dict):
-                tx = float(first_trans.get("translation_x", 0.0))
-                ty = float(first_trans.get("translation_y", 0.0))
-                tz = float(first_trans.get("translation_z", 0.0))
+                tx = NetworkManager._safe_float(first_trans.get("translation_x", 0.0))
+                ty = NetworkManager._safe_float(first_trans.get("translation_y", 0.0))
+                tz = NetworkManager._safe_float(first_trans.get("translation_z", 0.0))
 
         safe_objects = []
         for obj in payload.get("detected_objects", []):
@@ -1088,10 +1088,19 @@ class NetworkManager:
 
     @staticmethod
     def _safe_float(val: Any) -> float:
+        if val is None:
+            return 0.0
+        if isinstance(val, str):
+            normalized = val.strip().lower()
+            if normalized in {"", "unknown", "none", "null", "nan"}:
+                return 0.0
         try:
-            return float(val)
+            out = float(val)
         except (TypeError, ValueError):
             return 0.0
+        if math.isnan(out) or math.isinf(out):
+            return 0.0
+        return out
 
     @staticmethod
     def _should_log_json(counter: int) -> bool:
